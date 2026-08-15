@@ -49,6 +49,37 @@ pub struct BuiltReport {
     pub rows: Vec<ReportRow>,
 }
 
+fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
+    let mut signals = Vec::new();
+    for session in sessions.iter().filter(|session| !session.is_subagent) {
+        let activity_kind = format!("{}_activity", session.provider);
+        let prompt_kind = format!("{}_prompt", session.provider);
+        let mut push = |timestamp: DateTime<Utc>, model: &str, kind: &str| {
+            signals.push(HumanSignal {
+                timestamp,
+                provider: session.provider.clone(),
+                session_id: session.session_id.clone(),
+                cwd: session.cwd.clone(),
+                repo: session.repo.clone(),
+                root: session.root.clone(),
+                kind: kind.to_string(),
+                model: model.to_string(),
+            });
+        };
+        for point in &session.points {
+            push(point.timestamp, &point.model, &activity_kind);
+        }
+        for interval in &session.exact_intervals {
+            push(interval.start, &interval.model, &activity_kind);
+            push(interval.end, &interval.model, &activity_kind);
+        }
+        for point in &session.human_points {
+            push(point.timestamp, &point.model, &prompt_kind);
+        }
+    }
+    signals
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_report(
     sessions: &[Session],
@@ -58,7 +89,7 @@ pub fn build_report(
     until: Option<DateTime<Utc>>,
     dimensions: &[String],
     human_idle: Duration,
-    isolated_credit: Duration,
+    review_credit: Duration,
 ) -> BuiltReport {
     let intervals: Vec<_> = sessions
         .iter()
@@ -72,22 +103,7 @@ pub fn build_report(
                 && until.is_none_or(|bound| commit.timestamp < bound)
         })
         .collect();
-    let mut human_signals: Vec<_> = sessions
-        .iter()
-        .filter(|session| !session.is_subagent)
-        .flat_map(|session| {
-            session.human_points.iter().map(|point| HumanSignal {
-                timestamp: point.timestamp,
-                provider: session.provider.clone(),
-                session_id: session.session_id.clone(),
-                cwd: session.cwd.clone(),
-                repo: session.repo.clone(),
-                root: session.root.clone(),
-                kind: format!("{}_prompt", session.provider),
-                model: point.model.clone(),
-            })
-        })
-        .collect();
+    let mut human_signals = foreground_human_signals(sessions);
     human_signals.extend(filtered_commits.iter().map(|commit| HumanSignal {
         timestamp: commit.timestamp,
         provider: "git".to_string(),
@@ -106,7 +122,7 @@ pub fn build_report(
         })
         .collect();
     let human_intervals: Vec<_> =
-        build_human_intervals(&filtered_human_signals, human_idle, isolated_credit)
+        build_human_intervals(&filtered_human_signals, human_idle, review_credit)
             .into_iter()
             .filter_map(|interval| clip_interval(&interval, since, until))
             .collect();
@@ -383,6 +399,18 @@ pub fn build_report(
         })
         .collect::<HashSet<_>>()
         .len();
+    let foreground_activity_signal_count = filtered_human_signals
+        .iter()
+        .filter(|signal| signal.kind.ends_with("_activity"))
+        .map(|signal| {
+            (
+                signal.timestamp,
+                signal.kind.as_str(),
+                signal.session_id.as_str(),
+            )
+        })
+        .collect::<HashSet<_>>()
+        .len();
     let commit_signal_count = filtered_human_signals
         .iter()
         .filter(|signal| signal.kind == "commit")
@@ -398,10 +426,10 @@ pub fn build_report(
 
     BuiltReport {
         methodology: Methodology {
-            human_work: "foreground human prompts and authored commits clustered into non-overlapping work blocks",
+            human_work: "foreground agent activity, human prompts, exact foreground interval edges, and authored commits clustered into non-overlapping involvement blocks",
             human_idle_threshold_seconds: duration_seconds(human_idle),
-            isolated_signal_credit_seconds: duration_seconds(isolated_credit),
-            human_estimate_caveat: "an evidence-based estimate, not stopwatch or attendance data",
+            review_credit_seconds: duration_seconds(review_credit),
+            human_estimate_caveat: "a supervision-inclusive estimate that includes likely setup, review, planning, and babysitting time; not stopwatch or attendance data",
             ai_time: "consecutive structural activity signals capped at the idle gap; exact intervals are merged when a source records them",
             deduplication: "headline time is the union of all AI intervals; grouped AI totals may overlap across parallel repos/providers",
             gap_cap_seconds: duration_seconds(gap_cap),
@@ -426,6 +454,7 @@ pub fn build_report(
                 .len(),
             human_signal_count: human_signal_keys.len(),
             prompt_signal_count,
+            foreground_activity_signal_count,
             commit_signal_count,
             deduplicated_active_seconds: round3(union_seconds(&intervals)),
             attributed_active_seconds: round3(agent_seconds),
@@ -574,7 +603,7 @@ fn iso(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ActivityPoint;
+    use crate::model::{ActivityPoint, ExactInterval};
     use crate::timeutil::parse_timestamp;
 
     fn session(
@@ -638,6 +667,80 @@ mod tests {
                 .map(|row| row.human_estimated_seconds)
                 .sum::<f64>()
         );
+    }
+
+    #[test]
+    fn foreground_agent_activity_counts_as_human_involvement() {
+        let sessions = vec![session(
+            "supervised",
+            "repo",
+            vec![point("2026-01-01T10:00:00Z"), point("2026-01-01T10:30:00Z")],
+            vec![],
+        )];
+        let report = build_report(
+            &sessions,
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        assert_eq!(3600.0, report.summary.human_estimated_seconds);
+        assert_eq!(2, report.summary.foreground_activity_signal_count);
+        assert_eq!(0, report.summary.prompt_signal_count);
+    }
+
+    #[test]
+    fn exact_foreground_edges_count_but_subagents_do_not() {
+        let mut foreground = session("foreground", "repo", vec![], vec![]);
+        foreground.exact_intervals.push(ExactInterval {
+            start: parse_timestamp("2026-01-01T10:00:00Z").unwrap(),
+            end: parse_timestamp("2026-01-01T10:30:00Z").unwrap(),
+            model: "gpt".into(),
+        });
+        let mut subagent = session(
+            "subagent",
+            "repo",
+            vec![point("2026-01-01T12:00:00Z"), point("2026-01-01T13:00:00Z")],
+            vec![],
+        );
+        subagent.is_subagent = true;
+        let report = build_report(
+            &[foreground, subagent],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        assert_eq!(3600.0, report.summary.human_estimated_seconds);
+        assert_eq!(2, report.summary.foreground_activity_signal_count);
+    }
+
+    #[test]
+    fn long_unattended_silence_is_not_human_time() {
+        let sessions = vec![session(
+            "foreground",
+            "repo",
+            vec![point("2026-01-01T10:00:00Z"), point("2026-01-01T12:00:00Z")],
+            vec![],
+        )];
+        let report = build_report(
+            &sessions,
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        assert_eq!(3600.0, report.summary.human_estimated_seconds);
+        assert_eq!(2, report.summary.work_block_count);
     }
 
     #[test]

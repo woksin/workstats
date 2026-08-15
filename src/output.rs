@@ -68,10 +68,10 @@ pub fn print_csv(report: &Report) -> Result<()> {
 
 pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
     let summary = &report.summary;
-    println!("WORKSTATS  human work across local projects");
+    println!("WORKSTATS  human involvement across local projects");
     println!("{}", "═".repeat(94));
     println!(
-        "  Estimated hands-on work  {}",
+        "  Estimated human work  {}",
         hours(summary.human_estimated_seconds)
     );
     println!(
@@ -83,8 +83,9 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         hours(summary.average_human_seconds_per_active_day)
     );
     println!(
-        "  Work blocks             {}  ({} prompts + {} commits observed)",
+        "  Work blocks          {}  ({} foreground activity marks + {} prompts + {} commits)",
         number(summary.work_block_count),
+        number(summary.foreground_activity_signal_count),
         number(summary.prompt_signal_count),
         number(summary.commit_signal_count)
     );
@@ -148,7 +149,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
 
     let title = report.group_by.join(" × ");
-    println!("By {title}  (hands-on estimate first; AI wall clock shown as context)");
+    println!("By {title}  (human involvement first; AI wall clock shown as context)");
     println!(
         "  {:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10}",
         "Work area", "Human", "Days", "Avg/day", "Commits", "AI wall", "Agent work"
@@ -203,12 +204,12 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
     println!();
     println!(
-        "Hands-on estimate: foreground prompts + authored commits; {}m idle ends a work block; isolated signals receive {}m.",
+        "Human estimate: foreground AI activity + prompts + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
         compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
-        compact_number(report.methodology.isolated_signal_credit_seconds / 60.0)
+        compact_number(report.methodology.review_credit_seconds / 60.0)
     );
     println!(
-        "This is a conservative activity estimate, not timesheet, attendance, or literal keyboard time."
+        "This supervision-inclusive estimate covers likely planning, review, waiting, and babysitting; it is not a timesheet."
     );
     println!(
         "AI wall removes overlap within each row; rows can overlap each other. Agent work sums parallel sessions."

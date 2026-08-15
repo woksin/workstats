@@ -16,11 +16,16 @@ fn run(arguments: &[&str]) -> Output {
 fn native_cli_reports_version_and_rejects_conflicting_calendar_dimensions() {
     let version = run(&["--version"]);
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).contains("workstats 0.5.1"));
+    assert!(String::from_utf8_lossy(&version.stdout).contains("workstats 0.6.0"));
 
     let invalid = run(&["--no-ai", "--no-git", "--group-by", "day,month"]);
     assert_eq!(Some(2), invalid.status.code());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("alternative calendar groupings"));
+
+    let help = run(&["--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--review-credit"));
+    assert!(help.contains("--isolated-credit"));
 }
 
 #[test]
@@ -47,6 +52,11 @@ fn missing_inputs_still_produce_a_complete_json_report() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(report.get("methodology").is_some());
     assert!(report.get("diagnostics").is_some());
+    assert_eq!(
+        3600.0,
+        report["methodology"]["human_idle_threshold_seconds"]
+    );
+    assert_eq!(1800.0, report["methodology"]["review_credit_seconds"]);
     assert!(output.stderr.is_empty());
 }
 

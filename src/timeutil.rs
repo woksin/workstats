@@ -224,15 +224,19 @@ fn interval_for_session(
 pub fn build_human_intervals(
     signals: &[HumanSignal],
     idle_threshold: Duration,
-    isolated_credit: Duration,
+    block_credit: Duration,
 ) -> Vec<Interval> {
     if signals.is_empty() {
         return Vec::new();
     }
-    let priority = |kind: &str| match kind {
-        "claude_prompt" | "codex_prompt" => 3,
-        "commit" => 1,
-        _ => 0,
+    let priority = |kind: &str| {
+        if kind.ends_with("_prompt") {
+            3
+        } else if kind == "commit" {
+            2
+        } else {
+            1
+        }
     };
     let mut by_timestamp: BTreeMap<DateTime<Utc>, &HumanSignal> = BTreeMap::new();
     for signal in signals {
@@ -258,7 +262,7 @@ pub fn build_human_intervals(
         blocks.push(current);
     }
 
-    let edge = isolated_credit / 2;
+    let edge = block_credit / 2;
     let mut intervals = Vec::new();
     for (block_index, block) in blocks.into_iter().enumerate() {
         let first_day = local_midnight(block[0].timestamp.with_timezone(&Local).date_naive());

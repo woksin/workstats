@@ -129,7 +129,7 @@ struct RecordedEvent {
     name = "workstats",
     version,
     about = "Measures local Git output and active AI-assisted work across supported CLIs, IDEs, and API event logs. Transcript text is never emitted and no network APIs are used.",
-    after_help = "Human work is an estimate from foreground prompts and authored commits, not a stopwatch. Local history is retention-dependent; work on other machines is not visible."
+    after_help = "Human work is a supervision-inclusive estimate from foreground agent activity, prompts, and authored commits, not a stopwatch. Local history is retention-dependent; work on other machines is not visible."
 )]
 struct Arguments {
     #[command(subcommand)]
@@ -155,20 +155,25 @@ struct Arguments {
     since: Option<String>,
     #[arg(short = 'u', long, help = "Inclusive YYYY-MM or YYYY-MM-DD")]
     until: Option<String>,
-    #[arg(long, default_value = "5m", help = "Idle gap cap: 30s, 5m, 1h")]
-    gap_cap: String,
-    #[arg(
-        long,
-        default_value = "15m",
-        help = "Start a new hands-on work block after this idle gap"
-    )]
-    human_idle: String,
     #[arg(
         long,
         default_value = "5m",
-        help = "Time credited to an isolated human signal"
+        help = "Agent activity gap cap: 30s, 5m, 1h"
     )]
-    isolated_credit: String,
+    gap_cap: String,
+    #[arg(
+        long,
+        default_value = "1h",
+        help = "Silent gap that ends a human-involvement block"
+    )]
+    human_idle: String,
+    #[arg(
+        long = "review-credit",
+        visible_alias = "isolated-credit",
+        default_value = "30m",
+        help = "Setup and review time credited around each work block"
+    )]
+    review_credit: String,
     #[arg(
         long = "group-by",
         visible_alias = "by",
@@ -272,7 +277,7 @@ fn main() {
 fn run(arguments: Arguments) -> Result<()> {
     let gap_cap = parse_duration(&arguments.gap_cap)?;
     let human_idle = parse_duration(&arguments.human_idle)?;
-    let isolated_credit = parse_duration(&arguments.isolated_credit)?;
+    let review_credit = parse_duration(&arguments.review_credit)?;
     let since = parse_bound(arguments.since.as_deref(), false)?;
     let until = parse_bound(arguments.until.as_deref(), true)?;
     let mut dimensions: Vec<String> = arguments
@@ -509,7 +514,7 @@ fn run(arguments: Arguments) -> Result<()> {
         arguments.repo.as_deref(),
         arguments.repo_exact.as_deref(),
     );
-    progress.set("Calculating work blocks");
+    progress.set("Estimating human involvement");
     let built = build_report(
         &sessions,
         &commits,
@@ -518,7 +523,7 @@ fn run(arguments: Arguments) -> Result<()> {
         until,
         &dimensions,
         human_idle,
-        isolated_credit,
+        review_credit,
     );
     let report = Report {
         methodology: built.methodology,
@@ -556,7 +561,7 @@ fn run(arguments: Arguments) -> Result<()> {
             repo_filter: arguments.repo,
             repo_exact_filter: arguments.repo_exact,
             human_idle: arguments.human_idle,
-            isolated_credit: arguments.isolated_credit,
+            review_credit: arguments.review_credit,
             cache: transcript_cache
                 .as_ref()
                 .map(|cache| cache.path().to_string_lossy().into_owned()),

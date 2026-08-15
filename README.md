@@ -24,11 +24,11 @@ wrapper a tiny open event format—without uploading anything.
 ```text
   ⠼ Discovering local AI activity  0.8s
 
-WORKSTATS  human work across local projects
+WORKSTATS  human involvement across local projects
 ══════════════════════════════════════════════════════════════════════════════
-  Estimated hands-on work  6h 42m
+  Estimated human work    10h 24m
   Active work days         2
-  Work blocks              9  (184 prompts + 31 commits observed)
+  Work blocks              6  (1,248 foreground activity marks + 184 prompts + 31 commits)
   Git lines                +8,421 / -2,107
 
 AI activity  (context only — these are not human hours)
@@ -39,21 +39,23 @@ AI activity  (context only — these are not human hours)
 By repo
   Work area                         Human  Days   Avg/day  Commits   AI wall
   ───────────────────────────────────────────────────────────────────────────
-  api                               3h 51m     2    1h 55m       18    6h 20m
-  web                               2h 17m     2    1h 08m       11    4h 14m
-  cli                               0h 34m     1    0h 34m        2    0h 44m
+  api                               5h 50m     2    2h 55m       18    6h 20m
+  web                               3h 39m     2    1h 49m       11    4h 14m
+  cli                               0h 55m     1    0h 55m        2    0h 44m
 ```
 
 ## The useful distinction
 
-Agent runtime is not human work. Lines changed are not time. A session left open
-overnight is not an eight-hour day.
+Agent runtime is not automatically human work. Lines changed are not time. A
+session left open overnight is not automatically an eight-hour day. Foreground
+activity is, however, useful evidence that somebody may be planning, reviewing,
+waiting on, or supervising the agent.
 
 `workstats` keeps those ideas separate:
 
 | Signal | What it answers | How it is treated |
 |---|---|---|
-| **Hands-on estimate** | “How much focused work is evidenced here?” | Foreground prompts and authored commits form non-overlapping work blocks. |
+| **Human-work estimate** | “How much time was plausibly spent developing or supervising?” | Foreground agent activity, prompts, and authored commits form non-overlapping involvement blocks with setup/review credit. |
 | **Git output** | “What changed?” | Commits, files, additions, deletions, and ignored generated/vendor lines. |
 | **Agent wall clock** | “How long was any agent active?” | Overlapping agent intervals count once. |
 | **Parallel agent work** | “How much automation ran?” | Concurrent sessions are summed, so this can exceed wall time. |
@@ -261,26 +263,30 @@ runs parse only what changed.
 
 ## How the estimate works
 
-1. Foreground human prompts from supported histories and open event logs become
-   activity signals. Tool results, compact summaries, sidechains, and subagent
-   prompts do not.
-2. Authored Git commits add evidence for work performed away from an AI chat.
-3. Signals no more than 15 minutes apart form a work block. The time between
-   them is attributed to the nearest signal's work area.
-4. An isolated signal receives five minutes for preparation and review, clamped
-   to its local calendar day.
+1. Structural activity from foreground AI sessions becomes an involvement
+   signal. This captures likely planning, code review, waiting, and babysitting
+   without reading prompt or response text.
+2. Foreground human prompts and authored Git commits add direct evidence. Meta
+   messages, sidechains, and subagent sessions do not add human time.
+3. Signals no more than one hour apart form a work block. The intervening time
+   counts because development often continues through reading, testing, review,
+   and agent execution.
+4. Each block receives 30 minutes total for setup and follow-up review, split
+   around its first and last signal and clamped to local calendar boundaries.
 5. All human intervals form one global union. Ten concurrent agents cannot make
-   a ten-hour human hour.
+   ten simultaneous human hours.
 
 Tune the assumptions when your workflow needs it:
 
 ```bash
-workstats --human-idle 20m --isolated-credit 8m --gap-cap 10m
+workstats --human-idle 90m --review-credit 45m  # more generous
+workstats --human-idle 30m --review-credit 10m  # more conservative
 ```
 
-The estimate intentionally misses meetings, reading, thinking away from a
-session, uncommitted manual work, deleted history, and work performed on another
-machine. Treat it as local evidence, never payroll data.
+`--gap-cap` controls AI wall-clock estimation only. The human estimate can still
+miss meetings, thinking away from a recorded session, deleted history, and work
+performed on another machine. Treat it as a realistic local heuristic, never
+payroll data.
 
 ## Privacy boundary
 

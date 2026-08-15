@@ -144,7 +144,7 @@ impl Diagnostics {
 pub struct Methodology {
     pub human_work: &'static str,
     pub human_idle_threshold_seconds: f64,
-    pub isolated_signal_credit_seconds: f64,
+    pub review_credit_seconds: f64,
     pub human_estimate_caveat: &'static str,
     pub ai_time: &'static str,
     pub deduplication: &'static str,
@@ -166,6 +166,7 @@ pub struct Summary {
     pub work_block_count: usize,
     pub human_signal_count: usize,
     pub prompt_signal_count: usize,
+    pub foreground_activity_signal_count: usize,
     pub commit_signal_count: usize,
     pub deduplicated_active_seconds: f64,
     pub attributed_active_seconds: f64,
@@ -225,7 +226,7 @@ pub struct Inputs {
     pub repo_filter: Option<String>,
     pub repo_exact_filter: Option<String>,
     pub human_idle: String,
-    pub isolated_credit: String,
+    pub review_credit: String,
     pub cache: Option<String>,
 }
 
