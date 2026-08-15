@@ -1076,13 +1076,28 @@ mod tests {
         let project = root.path().join("project");
         fs::create_dir(&project).unwrap();
         let path = project.join("session.jsonl");
+        let records = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "cwd": project,
+                "message": {"content": "real"}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-01-01T00:01:00Z",
+                "cwd": project,
+                "isMeta": true,
+                "message": {"content": "automatic"}
+            }),
+        ];
         fs::write(
             &path,
-            format!(
-                "{{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"{}\",\"message\":{{\"content\":\"real\"}}}}\n{{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:01:00Z\",\"cwd\":\"{}\",\"isMeta\":true,\"message\":{{\"content\":\"automatic\"}}}}\n",
-                project.display(),
-                project.display()
-            ),
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
         )
         .unwrap();
         let parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
@@ -1096,24 +1111,55 @@ mod tests {
         fs::create_dir(&second).unwrap();
         let path = root.path().join("rollout-test.jsonl");
         let records = [
-            format!(
-                "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"s\",\"cwd\":\"{}\"}}}}",
-                root.path().display()
-            ),
-            format!(
-                "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-a\",\"cwd\":\"{}\"}}}}",
-                root.path().display()
-            ),
-            "{\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"}}".into(),
-            "{\"timestamp\":\"2026-01-01T00:01:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}".into(),
-            format!(
-                "{{\"timestamp\":\"2026-01-01T00:02:00Z\",\"type\":\"turn_context\",\"payload\":{{\"model\":\"gpt-b\",\"cwd\":\"{}\"}}}}",
-                second.display()
-            ),
-            "{\"timestamp\":\"2026-01-01T00:02:00Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\"}}".into(),
-            "{\"timestamp\":\"2026-01-01T00:03:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"item_completed\",\"started_at_ms\":1767225720000,\"completed_at_ms\":1767225780000}}".into(),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "s", "cwd": root.path()}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-a", "cwd": root.path()}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "response_item",
+                "payload": {"type": "reasoning"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:01:00Z",
+                "type": "response_item",
+                "payload": {"type": "message"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:02:00Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-b", "cwd": second}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:02:00Z",
+                "type": "response_item",
+                "payload": {"type": "reasoning"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:03:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "started_at_ms": 1767225720000_i64,
+                    "completed_at_ms": 1767225780000_i64
+                }
+            }),
         ];
-        fs::write(&path, records.join("\n")).unwrap();
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
         let parsed = parse_codex_file(&path, &CodexMetadataIndex::default(), MAX_JSONL_LINE_BYTES);
         assert_eq!(2, parsed.sessions.len());
         let mut resolver = PathResolver::with_home(Vec::new(), root.path().to_path_buf());
