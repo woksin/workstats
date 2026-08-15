@@ -218,8 +218,9 @@ pub struct ReportRow {
 #[derive(Debug, Serialize)]
 pub struct Inputs {
     pub git_root: String,
-    pub claude_root: String,
-    pub codex_root: String,
+    pub history_sources: BTreeMap<String, Vec<String>>,
+    pub included_providers: Vec<String>,
+    pub excluded_providers: Vec<String>,
     pub author: String,
     pub repo_filter: Option<String>,
     pub repo_exact_filter: Option<String>,

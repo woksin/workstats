@@ -402,10 +402,10 @@ pub fn build_report(
             human_idle_threshold_seconds: duration_seconds(human_idle),
             isolated_signal_credit_seconds: duration_seconds(isolated_credit),
             human_estimate_caveat: "an evidence-based estimate, not stopwatch or attendance data",
-            ai_time: "consecutive transcript activity intervals capped at the idle gap; exact Codex task intervals are merged when available",
+            ai_time: "consecutive structural activity signals capped at the idle gap; exact intervals are merged when a source records them",
             deduplication: "headline time is the union of all AI intervals; grouped AI totals may overlap across parallel repos/providers",
             gap_cap_seconds: duration_seconds(gap_cap),
-            scope: "local retained transcripts and locally available Git repositories only",
+            scope: "local retained histories, explicit event logs, and locally available Git repositories only",
         },
         observed: Observed {
             first_seen: all_times.iter().min().copied().map(iso),

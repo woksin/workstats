@@ -6,30 +6,36 @@ mod model;
 mod output;
 mod paths;
 mod progress;
+mod sources;
 mod timeutil;
 
+use std::collections::BTreeSet;
 use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
-use clap::{Parser, ValueEnum};
+use anyhow::{Context, Result, bail};
+use chrono::Utc;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
 
 use aggregate::{DIMENSIONS, build_report};
-use ai::{read_claude_sessions_indexed, read_codex_sessions_indexed};
+use ai::{
+    read_claude_sessions_indexed, read_codex_sessions_indexed, read_copilot_sessions_indexed,
+    read_event_sessions_indexed, read_gemini_sessions_indexed, read_opencode_sessions_indexed,
+};
 use cache::TranscriptCache;
 use git::{default_git_author, read_git_commits};
 use model::{Diagnostics, Inputs, Report, Session};
 use output::{print_csv, print_json, print_table};
-use paths::{PathResolver, configured_rules, default_cache_path, home_dir, load_config};
+use paths::{PathResolver, configured_rules, default_cache_path, load_config};
 use progress::Progress;
-use timeutil::{parse_bound, parse_duration};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum Provider {
-    All,
-    Codex,
-    Claude,
-}
+use sources::{
+    default_codex_database, default_events_path, default_history_paths, normalize_provider,
+    parse_history_overrides, resolve_opencode_database, source_inventory,
+};
+use timeutil::{parse_bound, parse_duration, parse_timestamp};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -38,19 +44,101 @@ enum OutputFormat {
     Csv,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EventKind {
+    Activity,
+    Prompt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EventRole {
+    Foreground,
+    Subagent,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Show supported and automatically detected local histories
+    Sources(SourcesArguments),
+    /// Append one content-free event for a CLI, IDE, script, or API wrapper
+    #[command(visible_alias = "event")]
+    Record(RecordArguments),
+}
+
+#[derive(Debug, Args)]
+struct SourcesArguments {
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
+    output_format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct RecordArguments {
+    #[arg(long, help = "Tool or API name, for example cursor or openai-api")]
+    provider: String,
+    #[arg(long, help = "Stable session, request-group, or task identifier")]
+    session: String,
+    #[arg(long, help = "Model identifier (content is never accepted)")]
+    model: Option<String>,
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Working directory (default: current directory)"
+    )]
+    cwd: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = EventKind::Activity)]
+    kind: EventKind,
+    #[arg(long, value_enum, default_value_t = EventRole::Foreground)]
+    role: EventRole,
+    #[arg(long, help = "RFC 3339 signal time (default: now)")]
+    timestamp: Option<String>,
+    #[arg(
+        long,
+        requires = "completed_at",
+        help = "RFC 3339 exact interval start"
+    )]
+    started_at: Option<String>,
+    #[arg(long, requires = "started_at", help = "RFC 3339 exact interval end")]
+    completed_at: Option<String>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Event log (default: platform data directory; '-' writes stdout)"
+    )]
+    output: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+struct RecordedEvent {
+    timestamp: String,
+    provider: String,
+    session_id: String,
+    cwd: String,
+    model: String,
+    event: EventKind,
+    role: EventRole,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "workstats",
     version,
-    about = "Measures local Git output and active AI-assisted work from retained Codex and Claude Code transcripts. No transcript text is emitted and no network APIs are used.",
+    about = "Measures local Git output and active AI-assisted work across supported CLIs, IDEs, and API event logs. Transcript text is never emitted and no network APIs are used.",
     after_help = "Human work is an estimate from foreground prompts and authored commits, not a stopwatch. Local history is retention-dependent; work on other machines is not visible."
 )]
 struct Arguments {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(
         short = 'd',
         long = "dir",
         value_name = "DIR",
-        help = "Git repositories root"
+        help = "Git repository or directory to scan (default: current directory)"
     )]
     directory: Option<PathBuf>,
     #[arg(short = 'a', long, help = "Git author regex")]
@@ -84,14 +172,20 @@ struct Arguments {
     #[arg(
         long = "group-by",
         visible_alias = "by",
-        default_value = "root",
+        default_value = "repo",
         help = "Comma-separated: root,repo,cwd,provider,model,day,month"
     )]
     group_by: String,
     #[arg(long, value_parser = ["day", "month"], help = "Append a calendar grouping")]
     period: Option<String>,
-    #[arg(long, value_enum, default_value_t = Provider::All)]
-    provider: Provider,
+    #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append, help = "Include provider(s); repeatable/comma-separated (default: all)")]
+    provider: Vec<String>,
+    #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append, help = "Exclude provider(s); repeatable/comma-separated")]
+    exclude_provider: Vec<String>,
+    #[arg(long, value_name = "PROVIDER=PATH", action = clap::ArgAction::Append, help = "Override a built-in history location; repeatable")]
+    history: Vec<String>,
+    #[arg(long, value_name = "FILE", action = clap::ArgAction::Append, help = "Add a Workstats Events JSONL file or directory; repeatable")]
+    events: Vec<PathBuf>,
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
     output_format: OutputFormat,
     #[arg(long, default_value_t = 30, help = "Maximum table rows (0 means all)")]
@@ -100,15 +194,15 @@ struct Arguments {
     no_git: bool,
     #[arg(long, help = "Skip all AI histories")]
     no_ai: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     no_codex: bool,
-    #[arg(long)]
+    #[arg(long, hide = true)]
     no_claude: bool,
-    #[arg(long, value_name = "CODEX_DIR")]
+    #[arg(long, value_name = "CODEX_DIR", hide = true)]
     codex_dir: Option<PathBuf>,
-    #[arg(long, value_name = "CODEX_DB")]
+    #[arg(long, value_name = "CODEX_DB", hide = true)]
     codex_db: Option<PathBuf>,
-    #[arg(long, value_name = "CLAUDE_DIR")]
+    #[arg(long, value_name = "CLAUDE_DIR", hide = true)]
     claude_dir: Option<PathBuf>,
     #[arg(long, help = "JSON config (default: platform config directory)")]
     config: Option<PathBuf>,
@@ -164,7 +258,12 @@ fn main() {
         eprintln!("gitstats is now workstats; running the combined dashboard.");
     }
     let arguments = Arguments::parse();
-    if let Err(error) = run(arguments) {
+    let result = match arguments.command.as_ref() {
+        Some(Command::Sources(command)) => print_sources(command),
+        Some(Command::Record(command)) => record_event(command),
+        None => run(arguments),
+    };
+    if let Err(error) = result {
         eprintln!("workstats: {error:#}");
         std::process::exit(2);
     }
@@ -218,12 +317,12 @@ fn run(arguments: Arguments) -> Result<()> {
         !arguments.no_color && env::var_os("NO_COLOR").is_none(),
     );
     progress.set("Loading configuration");
-    let home = home_dir();
     let directory = arguments.directory.clone().unwrap_or_else(|| {
         env::var_os("WORKSTATS_DIR")
             .or_else(|| env::var_os("GITSTATS_DIR"))
             .map(PathBuf::from)
-            .unwrap_or_else(|| home.join("src/repos"))
+            .or_else(|| env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
     });
     let author = arguments.author.clone().unwrap_or_else(|| {
         env::var("WORKSTATS_AUTHOR")
@@ -235,18 +334,61 @@ fn run(arguments: Arguments) -> Result<()> {
     if !arguments.no_git && author.is_empty() {
         bail!("Git author is not configured; set git config --global user.email or pass --author");
     }
-    let codex_dir = arguments
-        .codex_dir
-        .clone()
-        .unwrap_or_else(|| home.join(".codex/sessions"));
+    let mut history_paths = default_history_paths();
+    history_paths.retain(|provider, paths| {
+        paths.iter().any(|path| {
+            if provider == "opencode" {
+                resolve_opencode_database(path).is_file()
+            } else {
+                path.is_dir()
+            }
+        })
+    });
+    if let Some(path) = &arguments.codex_dir {
+        history_paths.insert("codex".to_string(), vec![path.clone()]);
+    }
+    if let Some(path) = &arguments.claude_dir {
+        history_paths.insert("claude".to_string(), vec![path.clone()]);
+    }
+    for (provider, paths) in parse_history_overrides(&arguments.history)? {
+        history_paths.insert(provider, paths);
+    }
     let codex_db = arguments
         .codex_db
         .clone()
-        .unwrap_or_else(|| home.join(".codex/state_5.sqlite"));
-    let claude_dir = arguments
-        .claude_dir
-        .clone()
-        .unwrap_or_else(|| home.join(".claude/projects"));
+        .unwrap_or_else(default_codex_database);
+    let mut event_paths = arguments.events.clone();
+    event_paths.extend(history_paths.remove("events").unwrap_or_default());
+    let default_events = default_events_path();
+    if event_paths.is_empty() && default_events.is_file() {
+        event_paths.push(default_events);
+    }
+    let mut included: BTreeSet<String> = arguments
+        .provider
+        .iter()
+        .map(|provider| normalize_provider(provider))
+        .collect();
+    if included.remove("all") {
+        included.clear();
+    }
+    let mut excluded: BTreeSet<String> = arguments
+        .exclude_provider
+        .iter()
+        .map(|provider| normalize_provider(provider))
+        .collect();
+    if included
+        .iter()
+        .chain(excluded.iter())
+        .any(|provider| !valid_provider_identifier(provider, true))
+    {
+        bail!("provider filters must use letters, numbers, '.', '/', or '-'");
+    }
+    if arguments.no_codex {
+        excluded.insert("codex".to_string());
+    }
+    if arguments.no_claude {
+        excluded.insert("claude".to_string());
+    }
     let mut diagnostics = Diagnostics::default();
     let config = load_config(arguments.config.as_deref(), &mut diagnostics);
     let rules = configured_rules(config, &arguments.source_rule)?;
@@ -296,30 +438,72 @@ fn run(arguments: Arguments) -> Result<()> {
 
     let mut sessions = Vec::new();
     if !arguments.no_ai {
-        if !arguments.no_claude && matches!(arguments.provider, Provider::All | Provider::Claude) {
-            progress.set("Loading Claude activity");
-            sessions.extend(read_claude_sessions_indexed(
-                &claude_dir,
-                &mut resolver,
-                &mut diagnostics,
-                transcript_cache.as_mut(),
-                since,
-                until,
-            ));
+        for (provider, paths) in &history_paths {
+            if !provider_enabled(provider, &included, &excluded) {
+                continue;
+            }
+            progress.set(format!("Loading {provider} activity"));
+            for path in paths {
+                let loaded = match provider.as_str() {
+                    "claude" => read_claude_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        &mut diagnostics,
+                        transcript_cache.as_mut(),
+                        since,
+                        until,
+                    ),
+                    "codex" => read_codex_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        &mut diagnostics,
+                        Some(&codex_db),
+                        transcript_cache.as_mut(),
+                        since,
+                        until,
+                    ),
+                    "copilot" => read_copilot_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        &mut diagnostics,
+                        transcript_cache.as_mut(),
+                        since,
+                        until,
+                    ),
+                    "gemini" => read_gemini_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        &mut diagnostics,
+                        transcript_cache.as_mut(),
+                        since,
+                        until,
+                    ),
+                    "opencode" => read_opencode_sessions_indexed(
+                        &resolve_opencode_database(path),
+                        &mut resolver,
+                        &mut diagnostics,
+                        transcript_cache.as_mut(),
+                        since,
+                        until,
+                    ),
+                    _ => Vec::new(),
+                };
+                sessions.extend(loaded);
+            }
         }
-        if !arguments.no_codex && matches!(arguments.provider, Provider::All | Provider::Codex) {
-            progress.set("Loading Codex activity");
-            sessions.extend(read_codex_sessions_indexed(
-                &codex_dir,
+        for path in &event_paths {
+            progress.set("Loading open event activity");
+            sessions.extend(read_event_sessions_indexed(
+                path,
                 &mut resolver,
                 &mut diagnostics,
-                Some(&codex_db),
                 transcript_cache.as_mut(),
                 since,
                 until,
             ));
         }
     }
+    sessions.retain(|session| provider_enabled(&session.provider, &included, &excluded));
     filter_sessions(
         &mut sessions,
         arguments.repo.as_deref(),
@@ -345,8 +529,29 @@ fn run(arguments: Arguments) -> Result<()> {
         diagnostics: diagnostics.clone(),
         inputs: Inputs {
             git_root: directory.to_string_lossy().into_owned(),
-            claude_root: claude_dir.to_string_lossy().into_owned(),
-            codex_root: codex_dir.to_string_lossy().into_owned(),
+            history_sources: history_paths
+                .iter()
+                .map(|(provider, paths)| {
+                    (
+                        provider.clone(),
+                        paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                    )
+                })
+                .chain((!event_paths.is_empty()).then(|| {
+                    (
+                        "events".to_string(),
+                        event_paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                    )
+                }))
+                .collect(),
+            included_providers: included.into_iter().collect(),
+            excluded_providers: excluded.into_iter().collect(),
             author,
             repo_filter: arguments.repo,
             repo_exact_filter: arguments.repo_exact,
@@ -374,6 +579,153 @@ fn run(arguments: Arguments) -> Result<()> {
         OutputFormat::Csv => print_csv(&report)?,
         OutputFormat::Table => print_table(&report, &diagnostics, arguments.top, arguments.raw),
     }
+    Ok(())
+}
+
+fn provider_enabled(
+    provider: &str,
+    included: &BTreeSet<String>,
+    excluded: &BTreeSet<String>,
+) -> bool {
+    let provider = normalize_provider(provider);
+    !excluded.contains("all")
+        && !excluded.contains(&provider)
+        && (included.is_empty() || included.contains(&provider))
+}
+
+fn valid_provider_identifier(provider: &str, allow_all: bool) -> bool {
+    !provider.is_empty()
+        && (allow_all || provider != "all")
+        && provider.len() <= 64
+        && provider.as_bytes()[0].is_ascii_alphanumeric()
+        && provider
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-'))
+}
+
+fn print_sources(arguments: &SourcesArguments) -> Result<()> {
+    let inventory = source_inventory();
+    match arguments.output_format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&inventory)?),
+        OutputFormat::Csv => {
+            let mut writer = csv::Writer::from_writer(io::stdout());
+            for item in inventory {
+                writer.serialize(item)?;
+            }
+            writer.flush()?;
+        }
+        OutputFormat::Table => {
+            println!("AI HISTORY SOURCES\n");
+            println!(
+                "{:<4} {:<12} {:<22} {:<24} {:<12} PATH",
+                "", "ID", "SOURCE", "FORMAT", "SUPPORT"
+            );
+            for item in inventory {
+                println!(
+                    "{:<4} {:<12} {:<22} {:<24} {:<12} {}",
+                    if item.detected { "●" } else { "○" },
+                    item.id,
+                    item.name,
+                    item.format,
+                    item.support,
+                    item.path
+                );
+            }
+            println!(
+                "\n● detected  ○ not found  · add any other tool with `workstats record` or `--events`"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn record_event(arguments: &RecordArguments) -> Result<()> {
+    let provider = normalize_provider(&arguments.provider);
+    if !valid_provider_identifier(&provider, false) {
+        bail!("--provider must be a short identifier using letters, numbers, '.', '/', or '-'");
+    }
+    if arguments.session.trim().is_empty()
+        || arguments.session.len() > 256
+        || arguments.session.chars().any(char::is_control)
+    {
+        bail!("--session must be a non-empty identifier of at most 256 bytes");
+    }
+    if let Some(model) = arguments.model.as_deref()
+        && (!model.is_ascii()
+            || model.is_empty()
+            || model.len() > 128
+            || !model.as_bytes()[0].is_ascii_alphanumeric()
+            || !model.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'.' | b'_' | b':' | b'/' | b'+' | b'<' | b'>' | b'-')
+            }))
+    {
+        bail!("--model must be a short model identifier, not message content");
+    }
+    let timestamp = arguments
+        .timestamp
+        .as_deref()
+        .map(|value| parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --timestamp")))
+        .transpose()?;
+    let started_at = arguments
+        .started_at
+        .as_deref()
+        .map(|value| parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --started-at")))
+        .transpose()?;
+    let completed_at = arguments
+        .completed_at
+        .as_deref()
+        .map(|value| {
+            parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --completed-at"))
+        })
+        .transpose()?;
+    if started_at
+        .zip(completed_at)
+        .is_some_and(|(start, end)| end <= start)
+    {
+        bail!("--completed-at must be later than --started-at");
+    }
+    let cwd = arguments
+        .cwd
+        .clone()
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let event = RecordedEvent {
+        timestamp: timestamp
+            .or(completed_at)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339(),
+        provider,
+        session_id: arguments.session.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        model: arguments
+            .model
+            .clone()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string()),
+        event: arguments.kind,
+        role: arguments.role,
+        started_at: started_at.map(|value| value.to_rfc3339()),
+        completed_at: completed_at.map(|value| value.to_rfc3339()),
+    };
+    let mut encoded = serde_json::to_vec(&event)?;
+    encoded.push(b'\n');
+    let output = arguments.output.clone().unwrap_or_else(default_events_path);
+    if output.as_os_str() == "-" {
+        io::stdout().write_all(&encoded)?;
+        return Ok(());
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create event directory {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&output)
+        .with_context(|| format!("cannot open event log {}", output.display()))?;
+    file.write_all(&encoded)?;
+    eprintln!("Recorded content-free event → {}", output.display());
     Ok(())
 }
 

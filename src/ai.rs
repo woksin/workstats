@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
@@ -35,6 +35,119 @@ pub struct CodexMetadata {
 pub struct CodexMetadataIndex {
     pub by_path: HashMap<String, CodexMetadata>,
     pub by_id: HashMap<String, CodexMetadata>,
+}
+
+#[derive(Deserialize)]
+struct GeminiRecord {
+    #[serde(rename = "type")]
+    record_type: Option<String>,
+    timestamp: Option<String>,
+    model: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(rename = "startTime")]
+    start_time: Option<String>,
+    #[serde(rename = "lastUpdated")]
+    last_updated: Option<String>,
+    kind: Option<String>,
+    #[serde(default)]
+    messages: Vec<GeminiMessage>,
+}
+
+#[derive(Deserialize)]
+struct GeminiMessage {
+    #[serde(rename = "type")]
+    record_type: Option<String>,
+    timestamp: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct CopilotRecord {
+    #[serde(rename = "type")]
+    record_type: Option<String>,
+    timestamp: Option<String>,
+    #[serde(rename = "agentId")]
+    agent_id: Option<String>,
+    #[serde(default)]
+    data: CopilotData,
+}
+
+#[derive(Default, Deserialize)]
+struct CopilotData {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    context: Option<CopilotContext>,
+    cwd: Option<String>,
+    #[serde(rename = "selectedModel")]
+    selected_model: Option<String>,
+    #[serde(rename = "newModel")]
+    new_model: Option<String>,
+    model: Option<String>,
+    #[serde(
+        rename = "durationMs",
+        deserialize_with = "deserialize_maybe_number",
+        default
+    )]
+    duration_ms: Option<f64>,
+    #[serde(rename = "toolCallId")]
+    tool_call_id: Option<String>,
+    #[serde(rename = "parentAgentTaskId")]
+    parent_agent_task_id: Option<String>,
+    #[serde(rename = "copilotVersion")]
+    copilot_version: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CopilotContext {
+    cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkstatsEvent {
+    timestamp: String,
+    provider: String,
+    session_id: String,
+    cwd: String,
+    #[serde(default = "unknown_model")]
+    model: String,
+    #[serde(default = "activity_event")]
+    event: String,
+    #[serde(default = "foreground_role")]
+    role: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
+    #[serde(
+        default,
+        rename = "content",
+        alias = "prompt",
+        alias = "response",
+        alias = "input",
+        alias = "output",
+        alias = "api_key",
+        deserialize_with = "deserialize_sensitive_payload"
+    )]
+    sensitive_payload: bool,
+}
+
+fn deserialize_sensitive_payload<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IgnoredAny::deserialize(deserializer)?;
+    Ok(true)
+}
+
+fn unknown_model() -> String {
+    "unknown".to_string()
+}
+
+fn activity_event() -> String {
+    "activity".to_string()
+}
+
+fn foreground_role() -> String {
+    "foreground".to_string()
 }
 
 #[derive(Deserialize)]
@@ -411,7 +524,7 @@ pub fn read_claude_sessions_indexed(
         diagnostics,
         cache,
         "claude",
-        "claude-v1",
+        |_| "claude-v1".to_string(),
         since,
         until,
         |path| parse_claude_file(path, root, MAX_JSONL_LINE_BYTES),
@@ -435,47 +548,808 @@ pub fn read_codex_sessions_indexed(
     let metadata = sqlite_path
         .map(|path| read_codex_sqlite_metadata(path, diagnostics))
         .unwrap_or_default();
-    let context = format!(
-        "codex-v1:{}",
-        sqlite_path
-            .map(crate::cache::file_context)
-            .unwrap_or_else(|| "none".to_string())
-    );
     load_files(
         discover_codex_files_bounded(root, until),
         resolver,
         diagnostics,
         cache,
         "codex",
-        &context,
+        |path| {
+            metadata
+                .by_path
+                .get(&canonical_string(path))
+                .map(|item| {
+                    format!(
+                        "codex-v2:{}:{}:{}",
+                        item.id.as_deref().unwrap_or_default(),
+                        item.cwd.as_deref().unwrap_or_default(),
+                        item.model.as_deref().unwrap_or_default()
+                    )
+                })
+                .unwrap_or_else(|| "codex-v2:none".to_string())
+        },
         since,
         until,
         |path| parse_codex_file(path, &metadata, MAX_JSONL_LINE_BYTES),
     )
 }
 
+pub fn discover_gemini_files(root: &Path) -> Vec<PathBuf> {
+    discover_files(root, |path| {
+        let extension = path.extension().and_then(|value| value.to_str());
+        matches!(extension, Some("json" | "jsonl"))
+            && path
+                .components()
+                .any(|part| part.as_os_str().eq_ignore_ascii_case("chats"))
+    })
+}
+
+pub fn discover_copilot_files(root: &Path) -> Vec<PathBuf> {
+    discover_files(root, |path| {
+        path.file_name()
+            .is_some_and(|value| value.eq_ignore_ascii_case("events.jsonl"))
+    })
+}
+
+pub fn discover_event_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return vec![path.to_path_buf()];
+    }
+    discover_files(path, |candidate| {
+        candidate
+            .extension()
+            .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+    })
+}
+
+pub fn read_gemini_sessions_indexed(
+    root: &Path,
+    resolver: &mut PathResolver,
+    diagnostics: &mut Diagnostics,
+    cache: Option<&mut TranscriptCache>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Vec<Session> {
+    if !root.is_dir() {
+        diagnostics.warn(format!("Gemini CLI history not found: {}", root.display()));
+        return Vec::new();
+    }
+    load_files(
+        discover_gemini_files(root),
+        resolver,
+        diagnostics,
+        cache,
+        "gemini",
+        |_| "gemini-v1".to_string(),
+        since,
+        until,
+        |path| parse_gemini_file(path, root, MAX_JSONL_LINE_BYTES),
+    )
+}
+
+pub fn read_copilot_sessions_indexed(
+    root: &Path,
+    resolver: &mut PathResolver,
+    diagnostics: &mut Diagnostics,
+    cache: Option<&mut TranscriptCache>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Vec<Session> {
+    if !root.is_dir() {
+        diagnostics.warn(format!(
+            "GitHub Copilot CLI history not found: {}",
+            root.display()
+        ));
+        return Vec::new();
+    }
+    load_files(
+        discover_copilot_files(root),
+        resolver,
+        diagnostics,
+        cache,
+        "copilot",
+        |_| "copilot-v2".to_string(),
+        since,
+        until,
+        |path| parse_copilot_file(path, MAX_JSONL_LINE_BYTES),
+    )
+}
+
+pub fn read_opencode_sessions_indexed(
+    database: &Path,
+    resolver: &mut PathResolver,
+    diagnostics: &mut Diagnostics,
+    cache: Option<&mut TranscriptCache>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Vec<Session> {
+    if !database.is_file() {
+        diagnostics.warn(format!(
+            "OpenCode history not found: {}",
+            database.display()
+        ));
+        return Vec::new();
+    }
+    let wal_path = PathBuf::from(format!("{}-wal", database.to_string_lossy()));
+    let context = format!("opencode-v1:{}", crate::cache::file_context(&wal_path));
+    load_files(
+        vec![database.to_path_buf()],
+        resolver,
+        diagnostics,
+        cache,
+        "opencode",
+        |_| context.clone(),
+        since,
+        until,
+        parse_opencode_database,
+    )
+}
+
+pub fn read_event_sessions_indexed(
+    path: &Path,
+    resolver: &mut PathResolver,
+    diagnostics: &mut Diagnostics,
+    cache: Option<&mut TranscriptCache>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Vec<Session> {
+    let files = discover_event_files(path);
+    if files.is_empty() {
+        diagnostics.warn(format!("event history not found: {}", path.display()));
+        return Vec::new();
+    }
+    load_files(
+        files,
+        resolver,
+        diagnostics,
+        cache,
+        "events",
+        |_| "workstats-events-v1".to_string(),
+        since,
+        until,
+        |file| parse_event_file(file, MAX_JSONL_LINE_BYTES),
+    )
+}
+
+pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> ParsedFile {
+    let mut result = ParsedFile::default();
+    let mut session_id = None;
+    let mut kind = None;
+    let mut version = None;
+    let mut messages = Vec::new();
+    if path
+        .extension()
+        .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+    {
+        for_json_lines(
+            path,
+            max_line_bytes,
+            &mut result.diagnostics,
+            |record: GeminiRecord| {
+                if session_id.is_none() {
+                    session_id = record.session_id;
+                }
+                if kind.is_none() {
+                    kind = record.kind;
+                }
+                if record.record_type.is_some() {
+                    messages.push(GeminiMessage {
+                        record_type: record.record_type,
+                        timestamp: record.timestamp,
+                        model: record.model,
+                    });
+                }
+            },
+        );
+    } else {
+        let parsed = File::open(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|file| serde_json::from_reader::<_, GeminiRecord>(file).map_err(Into::into));
+        match parsed {
+            Ok(record) => {
+                session_id = record.session_id;
+                kind = record.kind;
+                version = record
+                    .last_updated
+                    .or(record.start_time)
+                    .map(|_| "legacy-json".to_string());
+                messages = record.messages;
+            }
+            Err(error) => {
+                result.diagnostics.unreadable_files += 1;
+                result.diagnostics.warn(format!(
+                    "invalid Gemini session skipped: {}: {error}",
+                    path.display()
+                ));
+                return result;
+            }
+        }
+    }
+    let mut current_model = "unknown".to_string();
+    let mut points = Vec::new();
+    let mut human_points = Vec::new();
+    let is_subagent = kind.as_deref() == Some("subagent")
+        || path
+            .file_name()
+            .is_some_and(|name| !name.to_string_lossy().starts_with("session-"));
+    for message in messages {
+        let Some(message_type) = message.record_type.as_deref() else {
+            continue;
+        };
+        if !matches!(message_type, "user" | "gemini") {
+            continue;
+        }
+        if let Some(model) = message.model {
+            current_model = safe_model(&model);
+        }
+        let Some(timestamp) = message.timestamp.as_deref().and_then(parse_timestamp) else {
+            continue;
+        };
+        let point = ActivityPoint {
+            timestamp,
+            model: current_model.clone(),
+        };
+        points.push(point.clone());
+        if message_type == "user" && !is_subagent {
+            human_points.push(point);
+        }
+    }
+    if points.is_empty() {
+        result.diagnostics.skipped_sessions += 1;
+        return result;
+    }
+    let nearest = nearest_models(&points);
+    points = nearest.clone();
+    let models_at: BTreeMap<_, _> = nearest
+        .into_iter()
+        .map(|point| (point.timestamp, point.model))
+        .collect();
+    for point in &mut human_points {
+        if let Some(model) = models_at.get(&point.timestamp) {
+            point.clone_from(&ActivityPoint {
+                timestamp: point.timestamp,
+                model: model.clone(),
+            });
+        }
+    }
+    let project_root = gemini_project_root(path);
+    let approximate_cwd = project_root.is_none();
+    let cwd = project_root
+        .unwrap_or_else(|| path.parent().unwrap_or(root).to_string_lossy().into_owned());
+    let relative = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    result.sessions.push(RawSession {
+        provider: "gemini".to_string(),
+        session_id: format!(
+            "{}:{relative}",
+            session_id.unwrap_or_else(|| file_stem(path))
+        ),
+        source_file: path.to_path_buf(),
+        cwd,
+        points,
+        exact_intervals: Vec::new(),
+        human_points,
+        is_subagent,
+        approximate_cwd,
+        version,
+    });
+    result
+}
+
+pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
+    let mut result = ParsedFile::default();
+    let mut session_id = None;
+    let mut version = None;
+    let mut cwd = None;
+    let mut current_model = "unknown".to_string();
+    let mut points_by_cwd: BTreeMap<Option<String>, Vec<ActivityPoint>> = BTreeMap::new();
+    let mut human_by_cwd: BTreeMap<Option<String>, Vec<ActivityPoint>> = BTreeMap::new();
+    let mut subagent_intervals: Vec<(String, String, ExactInterval)> = Vec::new();
+    for_json_lines(
+        path,
+        max_line_bytes,
+        &mut result.diagnostics,
+        |record: CopilotRecord| {
+            let Some(record_type) = record.record_type.as_deref() else {
+                return;
+            };
+            if record_type == "session.start" {
+                session_id = record.data.session_id.or(session_id.take());
+                cwd = record
+                    .data
+                    .context
+                    .and_then(|context| context.cwd)
+                    .or(cwd.take());
+                if let Some(model) = record.data.selected_model {
+                    current_model = safe_model(&model);
+                }
+                version = record.data.copilot_version;
+                return;
+            }
+            if record_type == "session.context_changed" {
+                cwd = record.data.cwd.or(cwd.take());
+            }
+            if record_type == "session.model_change"
+                && let Some(model) = record.data.new_model
+            {
+                current_model = safe_model(&model);
+            }
+            if let Some(model) = record.data.model.as_deref() {
+                current_model = safe_model(model);
+            }
+            let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) else {
+                return;
+            };
+            if record_type == "subagent.completed"
+                && let Some(duration_ms) = record.data.duration_ms
+                && duration_ms.is_finite()
+                && duration_ms > 0.0
+                && duration_ms <= 7.0 * 24.0 * 60.0 * 60.0 * 1000.0
+            {
+                let duration = chrono::Duration::milliseconds(duration_ms.round() as i64);
+                let model = record
+                    .data
+                    .model
+                    .as_deref()
+                    .map(safe_model)
+                    .unwrap_or_else(|| current_model.clone());
+                subagent_intervals.push((
+                    record
+                        .data
+                        .tool_call_id
+                        .unwrap_or_else(|| format!("subagent-{}", timestamp.timestamp_micros())),
+                    cwd.clone().unwrap_or_default(),
+                    ExactInterval {
+                        start: timestamp - duration,
+                        end: timestamp,
+                        model,
+                    },
+                ));
+                return;
+            }
+            let is_agent_event =
+                record.agent_id.is_some() || record.data.parent_agent_task_id.is_some();
+            if is_agent_event {
+                return;
+            }
+            if matches!(
+                record_type,
+                "user.message"
+                    | "assistant.message"
+                    | "assistant.turn_start"
+                    | "assistant.turn_end"
+                    | "tool.execution_start"
+                    | "tool.execution_complete"
+            ) {
+                let point = ActivityPoint {
+                    timestamp,
+                    model: current_model.clone(),
+                };
+                points_by_cwd
+                    .entry(cwd.clone())
+                    .or_default()
+                    .push(point.clone());
+                if record_type == "user.message" {
+                    human_by_cwd.entry(cwd.clone()).or_default().push(point);
+                }
+            }
+        },
+    );
+    let base_id = session_id.unwrap_or_else(|| {
+        path.parent()
+            .and_then(Path::file_name)
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file_stem(path))
+    });
+    let multiple = points_by_cwd.len() > 1;
+    for (cwd_key, points) in points_by_cwd {
+        if points.is_empty() {
+            continue;
+        }
+        let approximate_cwd = cwd_key.is_none();
+        let human_points = human_by_cwd.remove(&cwd_key).unwrap_or_default();
+        let resolved_cwd =
+            cwd_key.unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned());
+        result.sessions.push(RawSession {
+            provider: "copilot".to_string(),
+            session_id: if multiple {
+                format!("{base_id}:{resolved_cwd}")
+            } else {
+                base_id.clone()
+            },
+            source_file: path.to_path_buf(),
+            cwd: resolved_cwd,
+            points,
+            exact_intervals: Vec::new(),
+            human_points,
+            is_subagent: false,
+            approximate_cwd,
+            version: version.clone(),
+        });
+    }
+    for (subagent_id, subagent_cwd, interval) in subagent_intervals {
+        let approximate_cwd = subagent_cwd.is_empty();
+        result.sessions.push(RawSession {
+            provider: "copilot".to_string(),
+            session_id: format!("{base_id}:subagent:{subagent_id}"),
+            source_file: path.to_path_buf(),
+            cwd: if approximate_cwd {
+                path.parent().unwrap_or(path).to_string_lossy().into_owned()
+            } else {
+                subagent_cwd
+            },
+            points: Vec::new(),
+            exact_intervals: vec![interval],
+            human_points: Vec::new(),
+            is_subagent: true,
+            approximate_cwd,
+            version: version.clone(),
+        });
+    }
+    if result.sessions.is_empty() {
+        result.diagnostics.skipped_sessions += 1;
+    }
+    result
+}
+
+pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
+    let mut result = ParsedFile::default();
+    type EventKey = (String, String, String, bool);
+    let mut sessions: BTreeMap<EventKey, RawSession> = BTreeMap::new();
+    let mut sensitive_records = 0_u64;
+    for_json_lines(
+        path,
+        max_line_bytes,
+        &mut result.diagnostics,
+        |record: WorkstatsEvent| {
+            if record.sensitive_payload {
+                sensitive_records += 1;
+                return;
+            }
+            let Some(timestamp) = parse_timestamp(&record.timestamp) else {
+                return;
+            };
+            let provider = safe_provider(&record.provider);
+            if provider == "unknown"
+                || record.session_id.trim().is_empty()
+                || record.cwd.trim().is_empty()
+            {
+                return;
+            }
+            let is_subagent = record.role.eq_ignore_ascii_case("subagent");
+            let model = safe_model(&record.model);
+            let key = (
+                provider.clone(),
+                record.session_id.clone(),
+                record.cwd.clone(),
+                is_subagent,
+            );
+            let session = sessions.entry(key).or_insert_with(|| RawSession {
+                provider,
+                session_id: record.session_id,
+                source_file: path.to_path_buf(),
+                cwd: record.cwd,
+                points: Vec::new(),
+                exact_intervals: Vec::new(),
+                human_points: Vec::new(),
+                is_subagent,
+                approximate_cwd: false,
+                version: Some("workstats-events-v1".to_string()),
+            });
+            let point = ActivityPoint {
+                timestamp,
+                model: model.clone(),
+            };
+            session.points.push(point.clone());
+            if record.event.eq_ignore_ascii_case("prompt") && !is_subagent {
+                session.human_points.push(point);
+            }
+            if let (Some(start), Some(end)) = (
+                record.started_at.as_deref().and_then(parse_timestamp),
+                record.completed_at.as_deref().and_then(parse_timestamp),
+            ) && end > start
+            {
+                session
+                    .exact_intervals
+                    .push(ExactInterval { start, end, model });
+            }
+        },
+    );
+    if sensitive_records > 0 {
+        result.diagnostics.malformed_lines += sensitive_records;
+        result.diagnostics.warn(format!(
+            "{sensitive_records} content-bearing event record(s) skipped: {}",
+            path.display()
+        ));
+    }
+    result.sessions = sessions.into_values().collect();
+    if result.sessions.is_empty() {
+        result.diagnostics.skipped_sessions += 1;
+    }
+    result
+}
+
+#[derive(Default)]
+struct OpenCodeSession {
+    id: String,
+    cwd: String,
+    model: String,
+    version: Option<String>,
+    is_subagent: bool,
+    points: Vec<ActivityPoint>,
+    human_points: Vec<ActivityPoint>,
+}
+
+pub fn parse_opencode_database(path: &Path) -> ParsedFile {
+    let mut result = ParsedFile::default();
+    let parsed = (|| -> rusqlite::Result<Vec<RawSession>> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if !sqlite_table_exists(&connection, "session")? {
+            return Ok(Vec::new());
+        }
+        let columns = sqlite_columns(&connection, "session")?;
+        let expression = |name: &str, fallback: &str| {
+            if columns.contains(name) {
+                format!("\"{name}\"")
+            } else {
+                fallback.to_string()
+            }
+        };
+        let query = format!(
+            "SELECT {}, {}, {}, {}, {} FROM session",
+            expression("id", "''"),
+            expression("directory", "''"),
+            expression("parent_id", "NULL"),
+            expression("version", "NULL"),
+            expression("model", "NULL")
+        );
+        let mut statement = connection.prepare(&query)?;
+        let mut rows = statement.query([])?;
+        let mut sessions: BTreeMap<String, OpenCodeSession> = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let cwd: String = row.get(1)?;
+            if id.is_empty() || cwd.is_empty() {
+                continue;
+            }
+            let parent: Option<String> = row.get(2).unwrap_or(None);
+            let version: Option<String> = row.get(3).unwrap_or(None);
+            let encoded_model: Option<String> = row.get(4).unwrap_or(None);
+            sessions.insert(
+                id.clone(),
+                OpenCodeSession {
+                    id,
+                    cwd,
+                    model: encoded_model
+                        .as_deref()
+                        .map(json_model)
+                        .unwrap_or_else(unknown_model),
+                    version,
+                    is_subagent: parent.is_some(),
+                    ..OpenCodeSession::default()
+                },
+            );
+        }
+
+        let mut current_session_ids = BTreeSet::new();
+        if sqlite_table_exists(&connection, "session_message")? {
+            let columns = sqlite_columns(&connection, "session_message")?;
+            if columns.contains("session_id")
+                && columns.contains("type")
+                && columns.contains("time_created")
+            {
+                let data = if columns.contains("data") {
+                    "data"
+                } else {
+                    "NULL"
+                };
+                let query = format!(
+                    "SELECT session_id, type, time_created, {data} FROM session_message ORDER BY time_created"
+                );
+                let mut statement = connection.prepare(&query)?;
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    let session_id: String = row.get(0)?;
+                    let message_type: String = row.get(1)?;
+                    let milliseconds: i64 = row.get(2)?;
+                    let data: Option<String> = row.get(3).unwrap_or(None);
+                    let Some(session) = sessions.get_mut(&session_id) else {
+                        continue;
+                    };
+                    let Some(timestamp) = parse_epoch_milliseconds(milliseconds as f64) else {
+                        continue;
+                    };
+                    current_session_ids.insert(session_id);
+                    let model = data
+                        .as_deref()
+                        .map(json_model)
+                        .filter(|value| value != "unknown")
+                        .unwrap_or_else(|| session.model.clone());
+                    let point = ActivityPoint { timestamp, model };
+                    session.points.push(point.clone());
+                    if message_type == "user" && !session.is_subagent {
+                        session.human_points.push(point);
+                    }
+                }
+            }
+        }
+
+        if sqlite_table_exists(&connection, "message")? {
+            let columns = sqlite_columns(&connection, "message")?;
+            if columns.contains("session_id")
+                && columns.contains("time_created")
+                && columns.contains("data")
+            {
+                let mut statement = connection.prepare(
+                    "SELECT session_id, time_created, data FROM message ORDER BY time_created",
+                )?;
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    let session_id: String = row.get(0)?;
+                    if current_session_ids.contains(&session_id) {
+                        continue;
+                    }
+                    let milliseconds: i64 = row.get(1)?;
+                    let data: String = row.get(2)?;
+                    let Some(session) = sessions.get_mut(&session_id) else {
+                        continue;
+                    };
+                    let Some(timestamp) = parse_epoch_milliseconds(milliseconds as f64) else {
+                        continue;
+                    };
+                    let value: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
+                    let message_type = value
+                        .get("role")
+                        .or_else(|| value.get("type"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let parsed_model = json_model(&data);
+                    let model = if parsed_model == "unknown" {
+                        session.model.clone()
+                    } else {
+                        parsed_model
+                    };
+                    let point = ActivityPoint { timestamp, model };
+                    session.points.push(point.clone());
+                    if message_type == "user" && !session.is_subagent {
+                        session.human_points.push(point);
+                    }
+                }
+            }
+        }
+
+        Ok(sessions
+            .into_values()
+            .filter(|session| !session.points.is_empty())
+            .map(|session| RawSession {
+                provider: "opencode".to_string(),
+                session_id: session.id,
+                source_file: path.to_path_buf(),
+                cwd: session.cwd,
+                points: session.points,
+                exact_intervals: Vec::new(),
+                human_points: session.human_points,
+                is_subagent: session.is_subagent,
+                approximate_cwd: false,
+                version: session.version,
+            })
+            .collect())
+    })();
+    match parsed {
+        Ok(sessions) => {
+            result.sessions = sessions;
+            if result.sessions.is_empty() {
+                result.diagnostics.skipped_sessions += 1;
+            }
+        }
+        Err(error) => {
+            result.diagnostics.unreadable_files += 1;
+            result.diagnostics.warn(format!(
+                "OpenCode database ignored: {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    result
+}
+
+fn sqlite_table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+        [table],
+        |row| row.get(0),
+    )
+}
+
+fn sqlite_columns(connection: &Connection, table: &str) -> rusqlite::Result<BTreeSet<String>> {
+    let safe_table = table.replace('"', "\"\"");
+    let mut statement = connection.prepare(&format!("PRAGMA table_info(\"{safe_table}\")"))?;
+    Ok(statement
+        .query_map([], |row| row.get(1))?
+        .filter_map(Result::ok)
+        .collect())
+}
+
+fn json_model(encoded: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(encoded) else {
+        return safe_model(encoded);
+    };
+    let provider = value
+        .get("providerID")
+        .or_else(|| value.get("provider_id"))
+        .and_then(serde_json::Value::as_str);
+    let model = value
+        .get("modelID")
+        .or_else(|| value.get("model_id"))
+        .or_else(|| value.get("model"))
+        .or_else(|| value.get("id"))
+        .and_then(serde_json::Value::as_str);
+    match (provider, model) {
+        (Some(provider), Some(model)) => safe_model(&format!("{provider}/{model}")),
+        (_, Some(model)) => safe_model(model),
+        _ => "unknown".to_string(),
+    }
+}
+
+fn gemini_project_root(path: &Path) -> Option<String> {
+    for ancestor in path.ancestors() {
+        let marker = ancestor.join(".project_root");
+        if !marker.is_file() {
+            continue;
+        }
+        let bytes = fs::read(marker).ok()?;
+        if bytes.len() > 32 * 1024 {
+            return None;
+        }
+        let value = String::from_utf8(bytes).ok()?;
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn safe_provider(value: &str) -> String {
+    let normalized = crate::sources::normalize_provider(value);
+    let valid = !normalized.is_empty()
+        && normalized != "all"
+        && normalized.len() <= 64
+        && normalized.as_bytes()[0].is_ascii_alphanumeric()
+        && normalized
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'/' | b'-'));
+    if valid {
+        normalized
+    } else {
+        "unknown".to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn load_files<F>(
+fn load_files<F, C>(
     paths: Vec<PathBuf>,
     resolver: &mut PathResolver,
     diagnostics: &mut Diagnostics,
     mut cache: Option<&mut TranscriptCache>,
     provider: &str,
-    context: &str,
+    context_for: C,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
     parser: F,
 ) -> Vec<Session>
 where
     F: Fn(&Path) -> ParsedFile + Sync,
+    C: Fn(&Path) -> String,
 {
+    let contexts: Vec<_> = paths.iter().map(|path| context_for(path)).collect();
     let mut slots: Vec<Option<ParsedFile>> = (0..paths.len()).map(|_| None).collect();
     let mut pending_stamps: Vec<Option<FileStamp>> = vec![None; paths.len()];
     let mut misses = Vec::new();
     for (index, path) in paths.iter().enumerate() {
         let stamp = file_stamp(path);
         let lookup = cache.as_deref_mut().and_then(|cache| {
-            stamp.map(|stamp| cache.lookup(path, provider, context, stamp, since, until))
+            stamp.map(|stamp| cache.lookup(path, provider, &contexts[index], stamp, since, until))
         });
         match lookup {
             Some(Ok(CacheLookup::Hit(parsed))) => {
@@ -521,7 +1395,7 @@ where
         if let (Some(cache), Some(stamp)) = (cache.as_deref_mut(), pending_stamps[index])
             && item.diagnostics.unreadable_files == 0
         {
-            match cache.put(&paths[index], provider, context, stamp, &item) {
+            match cache.put(&paths[index], provider, &contexts[index], stamp, &item) {
                 Ok(()) => diagnostics.cache_writes += 1,
                 Err(error) => diagnostics.warn(format!(
                     "transcript cache write ignored for {}: {error}",
@@ -1184,5 +2058,213 @@ mod tests {
                 .map(crate::model::Interval::seconds)
                 .sum::<f64>()
         );
+    }
+
+    #[test]
+    fn gemini_jsonl_uses_project_marker_without_reading_message_content() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("workspace/example");
+        let storage = root.path().join("hash");
+        let chats = storage.join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            storage.join(".project_root"),
+            project.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let path = chats.join("session-2026-test.jsonl");
+        let records = [
+            serde_json::json!({
+                "sessionId": "gemini-session",
+                "projectHash": "hash",
+                "startTime": "2026-01-01T00:00:00Z",
+                "lastUpdated": "2026-01-01T00:01:00Z",
+                "kind": "main"
+            }),
+            serde_json::json!({
+                "id": "one",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "content": "not parsed"
+            }),
+            serde_json::json!({
+                "id": "two",
+                "type": "gemini",
+                "timestamp": "2026-01-01T00:01:00Z",
+                "model": "gemini-test",
+                "content": "not parsed"
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_gemini_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.sessions.len());
+        assert_eq!(project.to_string_lossy(), parsed.sessions[0].cwd);
+        assert_eq!(2, parsed.sessions[0].points.len());
+        assert_eq!(1, parsed.sessions[0].human_points.len());
+        assert_eq!("gemini-test", parsed.sessions[0].human_points[0].model);
+    }
+
+    #[test]
+    fn copilot_events_track_foreground_work_and_exact_subagents() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let records = [
+            serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {"sessionId": "copilot-session", "selectedModel": "gpt-test", "context": {"cwd": root.path()}}
+            }),
+            serde_json::json!({
+                "type": "user.message",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {"content": "not parsed"}
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-01-01T00:01:00Z",
+                "data": {"model": "gpt-test", "content": "not parsed"}
+            }),
+            serde_json::json!({
+                "type": "subagent.completed",
+                "timestamp": "2026-01-01T00:02:00Z",
+                "data": {"toolCallId": "agent-one", "model": "gpt-test", "durationMs": 30000}
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        assert_eq!(2, parsed.sessions.len());
+        let foreground = parsed
+            .sessions
+            .iter()
+            .find(|session| !session.is_subagent)
+            .unwrap();
+        assert_eq!(1, foreground.human_points.len());
+        let subagent = parsed
+            .sessions
+            .iter()
+            .find(|session| session.is_subagent)
+            .unwrap();
+        assert_eq!(
+            30.0,
+            (subagent.exact_intervals[0].end - subagent.exact_intervals[0].start).num_seconds()
+                as f64
+        );
+    }
+
+    #[test]
+    fn open_events_accept_arbitrary_providers_and_exact_intervals() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let records = [
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "provider": "cursor",
+                "session_id": "task-one",
+                "cwd": root.path(),
+                "model": "model-a",
+                "event": "prompt",
+                "role": "foreground"
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:01:00Z",
+                "provider": "cursor",
+                "session_id": "task-one",
+                "cwd": root.path(),
+                "model": "model-a",
+                "event": "activity",
+                "started_at": "2026-01-01T00:00:30Z",
+                "completed_at": "2026-01-01T00:01:00Z"
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:02:00Z",
+                "provider": "unsafe-export",
+                "session_id": "must-be-skipped",
+                "cwd": root.path(),
+                "content": "a prompt body does not belong in Workstats Events"
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_event_file(&path, MAX_JSONL_LINE_BYTES);
+        assert_eq!("cursor", parsed.sessions[0].provider);
+        assert_eq!(1, parsed.sessions.len());
+        assert_eq!(1, parsed.sessions[0].human_points.len());
+        assert_eq!(1, parsed.sessions[0].exact_intervals.len());
+        assert_eq!(1, parsed.diagnostics.malformed_lines);
+    }
+
+    #[test]
+    fn opencode_database_is_read_structurally_and_read_only() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("opencode.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT NOT NULL,
+                    parent_id TEXT,
+                    version TEXT,
+                    model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    data TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session(id, directory, version, model) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "session-one",
+                    root.path().to_string_lossy(),
+                    "test",
+                    r#"{"providerID":"openai","id":"gpt-test"}"#
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_message(id, session_id, type, time_created, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params!["message-one", "session-one", "user", 1_767_225_600_000_i64, "{}"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let parsed = parse_opencode_database(&path);
+        assert_eq!(1, parsed.sessions.len());
+        assert_eq!(1, parsed.sessions[0].human_points.len());
+        assert_eq!("openai/gpt-test", parsed.sessions[0].points[0].model);
     }
 }

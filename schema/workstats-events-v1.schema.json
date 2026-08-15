@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/woksin/workstats/blob/main/schema/workstats-events-v1.schema.json",
+  "title": "Workstats Events v1 record",
+  "description": "A content-free structural activity record for local AI tools and API wrappers. Store one object per JSONL line.",
+  "type": "object",
+  "required": ["timestamp", "provider", "session_id", "cwd"],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "cwd": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model": {
+      "type": "string",
+      "default": "unknown",
+      "maxLength": 128
+    },
+    "event": {
+      "type": "string",
+      "enum": ["activity", "prompt"],
+      "default": "activity"
+    },
+    "role": {
+      "type": "string",
+      "enum": ["foreground", "subagent"],
+      "default": "foreground"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "dependentRequired": {
+    "started_at": ["completed_at"],
+    "completed_at": ["started_at"]
+  },
+  "allOf": [
+    {"not": {"required": ["content"]}},
+    {"not": {"required": ["prompt"]}},
+    {"not": {"required": ["response"]}},
+    {"not": {"required": ["input"]}},
+    {"not": {"required": ["output"]}},
+    {"not": {"required": ["api_key"]}}
+  ],
+  "additionalProperties": true
+}

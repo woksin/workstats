@@ -12,15 +12,17 @@
 
 **See where the work happened—without sending your work anywhere.**
 
-`workstats` turns local Git history and retained Codex/Claude Code metadata into
-an honest view of focused human work, code output, and parallel agent activity.
+`workstats` turns local Git history and retained AI-tool metadata into an honest
+view of focused human work, code output, and parallel agent activity. It
+auto-detects supported histories and gives every other CLI, IDE, script, and API
+wrapper a tiny open event format—without uploading anything.
 
 </div>
 
 ---
 
 ```text
-  ⠼ Loading Codex activity  0.8s
+  ⠼ Discovering local AI activity  0.8s
 
 WORKSTATS  human work across local projects
 ══════════════════════════════════════════════════════════════════════════════
@@ -37,9 +39,9 @@ AI activity  (context only — these are not human hours)
 By repo
   Work area                         Human  Days   Avg/day  Commits   AI wall
   ───────────────────────────────────────────────────────────────────────────
-  studio/api                        3h 51m     2    1h 55m       18    6h 20m
-  studio/web                        2h 17m     2    1h 08m       11    4h 14m
-  lab/cli                           0h 34m     1    0h 34m        2    0h 44m
+  api                               3h 51m     2    1h 55m       18    6h 20m
+  web                               2h 17m     2    1h 08m       11    4h 14m
+  cli                               0h 34m     1    0h 34m        2    0h 44m
 ```
 
 ## The useful distinction
@@ -58,6 +60,27 @@ overnight is not an eight-hour day.
 
 That makes the dashboard useful without pretending it is a stopwatch, an
 attendance system, or a universal productivity score.
+
+## Bring your whole AI stack
+
+```text
+  ● claude       Claude Code            built-in
+  ● codex        OpenAI Codex           built-in
+  ● gemini       Google Gemini CLI      built-in
+  ● copilot      GitHub Copilot CLI     best-effort
+  ● opencode     OpenCode               best-effort
+  ● events       any CLI / IDE / API    stable open JSONL
+```
+
+Run `workstats sources` to see what is detected on the current machine. Native
+adapters read structural fields from documented or inspectable local histories.
+The open event bridge covers tools such as editor agents, internal assistants,
+SDK calls, and proprietary workflows without making `workstats` depend on every
+vendor's private database schema.
+
+There is no credential discovery and no attempt to sign in to providers. A
+history adapter is enabled only when its local source exists; everything remains
+optional.
 
 ## Install
 
@@ -128,18 +151,80 @@ explicit, and install the backward-compatible `gitstats` alias too.
 ## Start here
 
 ```bash
-workstats                                  # the dashboard
-workstats --group-by repo                  # one row per repository
+workstats sources                          # supported + detected AI histories
+workstats                                  # dashboard for the current repository
+workstats --dir ~/projects                 # discover repositories below a directory
 workstats --group-by month,repo            # recent work by month and repo
 workstats --period day --group-by root     # daily trend by source root
 workstats --since 2026-07 --until 2026-08  # inclusive local calendar bounds
-workstats --provider codex --group-by model
+workstats --provider codex,gemini --group-by model
+workstats --exclude-provider copilot
 workstats --repo-exact my-project
 workstats --show-agent-work                # provider/model detail
 ```
 
 Your Git author defaults to `git config --global user.email`, falling back to
 `user.name`. Override it with `--author REGEX` or `WORKSTATS_AUTHOR`.
+
+### Add any tool or API
+
+`workstats record` appends one content-free signal to the platform event log.
+It intentionally has no prompt, response, token, or API-key argument.
+
+```bash
+# A foreground prompt from an editor or internal CLI
+workstats record \
+  --provider cursor \
+  --session issue-184 \
+  --model sonnet-4.5 \
+  --kind prompt
+
+# An exact interval measured by an API wrapper
+workstats record \
+  --provider openai-api \
+  --session nightly-refactor \
+  --model model-x \
+  --role subagent \
+  --started-at 2026-08-15T09:30:00Z \
+  --completed-at 2026-08-15T09:31:12Z
+```
+
+The default event log is loaded automatically. Use `--output FILE` to choose a
+log or `--output -` to emit JSONL to stdout. Existing logs can be added directly:
+
+```bash
+workstats --events ./activity.jsonl
+workstats --events ./team-export/ --provider openai-api,internal-agent
+```
+
+The [v1 JSON Schema](schema/workstats-events-v1.schema.json) is deliberately
+small and forward-compatible; unknown structural fields are ignored:
+
+```json
+{"timestamp":"2026-08-15T09:30:00Z","provider":"openai-api","session_id":"task-42","cwd":"/workspace/project","model":"model-x","event":"prompt","role":"foreground"}
+```
+
+`event` is `prompt` or `activity`; `role` is `foreground` or `subagent`.
+Optional RFC 3339 `started_at` and `completed_at` fields provide an exact agent
+interval. On Windows, JSON paths use normal JSON escaping—using `workstats
+record` handles that automatically. Records containing common payload fields
+such as `content`, `prompt`, `response`, `input`, `output`, or `api_key` are
+rejected instead of indexed.
+
+### Move or filter histories
+
+Provider choices are names, not a closed enum. Values can be repeated or
+comma-separated, and aliases such as `claude-code`, `gemini-cli`, and
+`github-copilot` are normalized.
+
+```bash
+workstats --history gemini=/mnt/archive/gemini
+workstats --history codex=D:\agent-history\sessions
+workstats --provider gemini --exclude-provider internal-agent
+```
+
+`--history PROVIDER=PATH` supports the native adapters shown by `workstats
+sources`. For any other provider name, use `--events` or `workstats record`.
 
 ### Reports made for pipes
 
@@ -177,8 +262,9 @@ runs parse only what changed.
 
 ## How the estimate works
 
-1. Foreground human prompts from Codex and Claude Code become activity signals.
-   Tool results, compact summaries, sidechains, and subagent prompts do not.
+1. Foreground human prompts from supported histories and open event logs become
+   activity signals. Tool results, compact summaries, sidechains, and subagent
+   prompts do not.
 2. Authored Git commits add evidence for work performed away from an AI chat.
 3. Signals no more than 15 minutes apart form a work block. The time between
    them is attributed to the nearest signal's work area.
@@ -204,7 +290,9 @@ machine. Treat it as local evidence, never payroll data.
 - no network API calls;
 - no telemetry or update checks;
 - no prompt or response bodies in reports or the cache;
-- Codex's optional SQLite metadata database is opened read-only;
+- Codex and OpenCode SQLite databases are opened read-only;
+- known credential files such as `auth.json`, `secrets.json`, `.env`, and key
+  stores are never discovery targets;
 - malformed and oversized transcript records degrade safely;
 - CSV cells are neutralized against spreadsheet formula injection.
 
@@ -222,15 +310,22 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 | Codex sessions | `~/.codex/sessions` |
 | Codex metadata | `~/.codex/state_5.sqlite` |
 | Claude Code projects | `~/.claude/projects` |
-| Git repositories | `~/src/repos` or `--dir PATH` |
+| Gemini CLI sessions | `~/.gemini/tmp/*/chats` |
+| GitHub Copilot CLI sessions | `~/.copilot/session-state/*/events.jsonl` |
+| OpenCode sessions | `~/.local/share/opencode/opencode.db` |
+| Workstats Events | platform data directory (shown by `workstats sources`) |
+| Git repositories | current directory or `--dir PATH` |
 
-All inputs are optional (`--no-git`, `--no-ai`, `--no-codex`,
-`--no-claude`). The transcript index defaults to:
+All inputs are optional (`--no-git`, `--no-ai`, `--provider`, and
+`--exclude-provider`). Missing default histories are silently skipped; explicit
+missing `--history` and `--events` paths appear in diagnostics. The structural
+index defaults to:
 
-| Platform | Cache | Config |
-|---|---|---|
-| macOS / Linux | `$XDG_CACHE_HOME/workstats/index.sqlite3` or `~/.cache/workstats/index.sqlite3` | `$XDG_CONFIG_HOME/workstats/config.json` or `~/.config/workstats/config.json` |
-| Windows | `%LOCALAPPDATA%\workstats\cache\index.sqlite3` | `%APPDATA%\workstats\config.json` |
+| Platform | Cache | Config | Event log |
+|---|---|---|---|
+| macOS | `~/.cache/workstats/index.sqlite3` | `~/.config/workstats/config.json` | `~/Library/Application Support/workstats/events.jsonl` |
+| Linux | `$XDG_CACHE_HOME/workstats/index.sqlite3` or `~/.cache/workstats/index.sqlite3` | `$XDG_CONFIG_HOME/workstats/config.json` or `~/.config/workstats/config.json` | `$XDG_DATA_HOME/workstats/events.jsonl` or `~/.local/share/workstats/events.jsonl` |
+| Windows | `%LOCALAPPDATA%\workstats\cache\index.sqlite3` | `%APPDATA%\workstats\config.json` | `%LOCALAPPDATA%\workstats\events.jsonl` |
 
 ```bash
 workstats --rebuild-cache       # rebuild every indexed entry
@@ -238,8 +333,12 @@ workstats --no-cache            # one uncached invocation
 workstats --cache /safe/path.db # choose another index
 ```
 
-`WORKSTATS_CACHE`, `WORKSTATS_CONFIG`, and `WORKSTATS_GIT` provide explicit
-overrides.
+`WORKSTATS_CACHE`, `WORKSTATS_CONFIG`, `WORKSTATS_EVENTS`, and `WORKSTATS_GIT`
+provide explicit overrides.
+
+Copilot CLI and OpenCode are marked best-effort because their vendors may evolve
+the internal event/database schema. The readers check tables and fields before
+querying, stay read-only, and degrade to diagnostics instead of guessing.
 
 ## Grouping and filtering
 

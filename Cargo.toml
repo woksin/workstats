@@ -1,14 +1,14 @@
 [package]
 name = "workstats"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Local Git, Codex, and Claude Code work activity statistics"
+description = "Local Git and AI-assisted work activity statistics across tools"
 license = "MIT"
 repository = "https://github.com/woksin/workstats"
 homepage = "https://github.com/woksin/workstats"
 readme = "README.md"
-keywords = ["productivity", "git", "codex", "claude", "cli"]
+keywords = ["productivity", "git", "ai", "analytics", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]

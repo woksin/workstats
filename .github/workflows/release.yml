@@ -18,14 +18,14 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: version
         shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           if [[ "$GITHUB_REF_TYPE" != "tag" || "$tag" != v* ]]; then
-            echo 'Run this workflow from a v-prefixed tag, for example v0.4.0.' >&2
+            echo 'Run this workflow from a v-prefixed tag, for example v0.5.0.' >&2
             exit 1
           fi
           version="${tag#v}"
@@ -69,7 +69,7 @@ jobs:
             exe: .exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust target
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}

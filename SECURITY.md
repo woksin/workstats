@@ -9,8 +9,13 @@ local filesystem information.
 
 ## Data boundary
 
-`workstats` reads local Git history and structural metadata from locally retained
-Codex and Claude Code transcripts. It does not make network requests, deserialize
-message bodies into the reporting model, or place prompt/response text in its
-cache. JSON and CSV reports can contain repository names and working-directory
-paths; review them before sharing.
+`workstats` reads local Git history and structural metadata from supported local
+AI histories or explicit Workstats Events logs. It does not make network
+requests, discover provider credentials, deserialize message bodies into the
+reporting model, or place prompt/response text in its cache.
+
+Native SQLite adapters open databases read-only and query only session/message
+tables. Credential stores—including `auth.json`, `secrets.json`, `.env`, private
+keys, and OS keychains—are never discovery targets. JSON and CSV reports can
+contain repository names and working-directory paths; review them before
+sharing.

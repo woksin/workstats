@@ -159,26 +159,6 @@ impl PathResolver {
                 return result;
             }
         }
-        let parts = path_parts(Path::new(&canonical));
-        if let Some(index) = parts
-            .iter()
-            .rposition(|part| part.eq_ignore_ascii_case("repos"))
-        {
-            return if index + 2 < parts.len() {
-                format!("repos/{}", parts[index + 1])
-            } else {
-                "repos/local".to_string()
-            };
-        }
-        if parts
-            .iter()
-            .any(|part| part.eq_ignore_ascii_case("sourcecode"))
-        {
-            return "sourcecode/(other)".to_string();
-        }
-        if Path::new(&canonical).starts_with(&self.home) {
-            return "local (~)".to_string();
-        }
         let system_temporary = env::temp_dir();
         let temporary = canonicalize_path(&system_temporary);
         if Path::new(&canonical).starts_with(&system_temporary)
@@ -189,33 +169,29 @@ impl PathResolver {
         {
             return "tmp/scratch".to_string();
         }
-        "other".to_string()
+        let path = Path::new(&canonical);
+        if let Ok(relative) = path.strip_prefix(&self.home) {
+            return relative
+                .components()
+                .find_map(|part| match part {
+                    Component::Normal(value) => Some(format!("~/{}", value.to_string_lossy())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "~".to_string());
+        }
+        path.parent()
+            .and_then(Path::file_name)
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "filesystem".to_string())
     }
 
     pub fn repo_label(&self, repo: &str) -> String {
         let path = Path::new(repo);
-        let parts = path_parts(path);
-        if let Some(index) = parts
-            .iter()
-            .rposition(|part| part.eq_ignore_ascii_case("repos"))
+        if let Ok(relative) = path.strip_prefix(&self.home)
+            && relative.as_os_str().is_empty()
         {
-            let remainder = &parts[index + 1..];
-            if !remainder.is_empty() {
-                return remainder
-                    .iter()
-                    .take(2)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("/");
-            }
-        }
-        if let Ok(relative) = path.strip_prefix(&self.home) {
-            let text = relative.to_string_lossy();
-            return if text.is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{}", text)
-            };
+            return "~".to_string();
         }
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -312,15 +288,6 @@ pub fn lossy_claude_cwd(project_dir: &Path) -> String {
     }
 }
 
-fn path_parts(path: &Path) -> Vec<String> {
-    path.components()
-        .filter_map(|part| match part {
-            Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect()
-}
-
 fn expand_path(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
         return home.to_path_buf();
@@ -364,20 +331,12 @@ fn normalize_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn source_root_defaults_and_custom_rule_match_reference() {
-        let temporary = tempdir().unwrap();
-        let home = temporary.path().join("home/test");
-        let project = temporary.path().join("sourcecode/repos/studio/widget");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&project).unwrap();
-        let resolver = PathResolver::with_home(Vec::new(), home);
-        assert_eq!(
-            "repos/studio",
-            resolver.source_root(&project.to_string_lossy())
-        );
+        let project = PathBuf::from("/work/sourcecode/repos/studio/widget");
+        let resolver = PathResolver::with_home(Vec::new(), PathBuf::from("/home/test"));
+        assert_eq!("studio", resolver.source_root(&project.to_string_lossy()));
         let rule = SourceRule::new(r"^/work/clients/([^/]+)/.*", r"client/\1").unwrap();
         assert_eq!(
             Some("client/acme".into()),
