@@ -64,7 +64,7 @@ enum Command {
     Sources(SourcesArguments),
     /// Append one content-free event for a CLI, IDE, script, or API wrapper
     #[command(visible_alias = "event")]
-    Record(RecordArguments),
+    Record(Box<RecordArguments>),
 }
 
 #[derive(Debug, Args)]
