@@ -365,3 +365,20 @@ fn spark(values: &[f64]) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spreadsheet_formula_cells_are_neutralized() {
+        assert_eq!("'=2+2", neutralize_formula("=2+2".into()));
+        assert_eq!("safe", neutralize_formula("safe".into()));
+    }
+
+    #[test]
+    fn calendar_months_have_readable_labels() {
+        assert_eq!(Some("May 2026".into()), named_month("2026-05"));
+        assert_eq!(None, named_month("not-a-month"));
+    }
+}

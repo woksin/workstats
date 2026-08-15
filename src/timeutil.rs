@@ -482,6 +482,31 @@ mod tests {
     }
 
     #[test]
+    fn human_edge_credit_stops_at_local_midnight() {
+        let timestamp = Local
+            .with_ymd_and_hms(2026, 1, 1, 23, 58, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let signal = HumanSignal {
+            timestamp,
+            provider: "git".into(),
+            session_id: "commit".into(),
+            cwd: "/repo".into(),
+            repo: "repo".into(),
+            root: "root".into(),
+            kind: "commit".into(),
+            model: "—".into(),
+        };
+        let intervals =
+            build_human_intervals(&[signal], Duration::minutes(30), Duration::minutes(10));
+        assert_eq!(
+            local_midnight(NaiveDate::from_ymd_opt(2026, 1, 2).unwrap()),
+            intervals[0].end
+        );
+    }
+
+    #[test]
     fn cross_month_interval_is_split() {
         let boundary = parse_bound(Some("2026-01"), true).unwrap().unwrap();
         let interval = Interval {

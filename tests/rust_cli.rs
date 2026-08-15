@@ -16,7 +16,7 @@ fn run(arguments: &[&str]) -> Output {
 fn native_cli_reports_version_and_rejects_conflicting_calendar_dimensions() {
     let version = run(&["--version"]);
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).contains("workstats 0.5.0"));
+    assert!(String::from_utf8_lossy(&version.stdout).contains("workstats 0.5.1"));
 
     let invalid = run(&["--no-ai", "--no-git", "--group-by", "day,month"]);
     assert_eq!(Some(2), invalid.status.code());

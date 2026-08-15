@@ -759,3 +759,30 @@ fn csv_globs(values: &[String]) -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_repo_filter_does_not_match_similar_names() {
+        assert!(exact_repo(
+            "studio/widget",
+            "/repos/studio/widget",
+            "widget"
+        ));
+        assert!(!exact_repo(
+            "misc/widget-tools",
+            "/repos/misc/widget-tools",
+            "widget"
+        ));
+    }
+
+    #[test]
+    fn repeated_and_comma_separated_globs_are_normalized() {
+        assert_eq!(
+            vec!["src/**", "tests/**", "docs/**"],
+            csv_globs(&["src/**, tests/**".into(), "docs/**".into()])
+        );
+    }
+}

@@ -251,11 +251,10 @@ Transcript files can be enormous, so the hot path is deliberately boring:
 An illustrative one-day report over roughly 6.8 GB of retained transcripts on
 an Apple silicon laptop:
 
-| Implementation | Time | Peak memory |
+| Mode | Time | Peak memory |
 |---|---:|---:|
-| Original Python implementation | 24.7 s | 270 MiB |
-| Rust, index disabled | 2.7 s | 172 MiB |
-| Rust, warm index | **1.05 s** | **54 MiB** |
+| Index disabled | 2.7 s | 172 MiB |
+| Warm index | **1.05 s** | **54 MiB** |
 
 Different histories and disks will vary; the architectural win is that normal
 runs parse only what changed.
@@ -387,8 +386,7 @@ cargo test --locked
 cargo build --release --locked
 ```
 
-The original Python implementation remains under `src/workstats` as a
-behavioral oracle. It is not needed to build or run the Rust CLI.
+The repository, installers, tests, and release artifacts are Rust-only.
 
 A `v<version>` tag matching `Cargo.toml` triggers the release workflow. It builds
 six native artifacts, executes every runnable binary, generates SHA-256

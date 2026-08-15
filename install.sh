@@ -35,7 +35,7 @@ done
 
 mkdir -p "$destination"
 destination=$(cd -P "$destination" && pwd)
-chmod +x "$root/bin/workstats" "$root/bin/gitstats" "$root/legacy/gitstats"
+chmod +x "$root/bin/workstats" "$root/bin/gitstats"
 
 cargo_path=$(type -P cargo || true)
 [[ -n "$cargo_path" ]] || { printf '%s\n' 'install.sh: cargo not found; install Rust from https://rustup.rs' >&2; exit 1; }
@@ -67,5 +67,4 @@ install_file() {
 
 install_file "$native_binary" workstats
 install_file "$native_binary" gitstats
-install_file "$root/legacy/gitstats" gitstats-legacy
-printf 'Installed workstats, gitstats, and gitstats-legacy in %s\n' "$destination"
+printf 'Installed workstats and gitstats in %s\n' "$destination"

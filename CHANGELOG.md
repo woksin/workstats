@@ -2,6 +2,12 @@
 
 All notable changes to `workstats` are documented here.
 
+## 0.5.1 — 2026-08-15
+
+- Removed the retired reference implementation, its project metadata, and its test suite.
+- Moved the remaining behavioral checks into the native Rust test suite.
+- Removed the obsolete `gitstats-legacy` installer payload; `gitstats` remains a native alias.
+
 ## 0.5.0 — 2026-08-15
 
 - Added automatic local-history discovery with `workstats sources`.

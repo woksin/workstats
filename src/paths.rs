@@ -31,7 +31,7 @@ impl SourceRule {
             bail!("source rule is outside the safe path-regex subset");
         }
         let compiled = Regex::new(&pattern).context("invalid source-rule regex")?;
-        let replacement = python_replacement_to_rust(&replacement);
+        let replacement = normalize_backreferences(&replacement);
         Ok(Self {
             replacement,
             compiled,
@@ -48,7 +48,7 @@ impl SourceRule {
     }
 }
 
-fn python_replacement_to_rust(value: &str) -> String {
+fn normalize_backreferences(value: &str) -> String {
     let backref = Regex::new(r"\\([1-9])").expect("static regex");
     backref.replace_all(value, "$$${1}").into_owned()
 }
