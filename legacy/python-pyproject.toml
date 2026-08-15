@@ -1,0 +1,10 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workstats-python-reference"
+version = "0.2.0"
+description = "Pre-Rust behavioral reference for workstats"
+requires-python = ">=3.10"
+dependencies = []

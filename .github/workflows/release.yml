@@ -1,0 +1,144 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$GITHUB_REF_TYPE" != "tag" || "$tag" != v* ]]; then
+            echo 'Run this workflow from a v-prefixed tag, for example v0.4.0.' >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          declared=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          [[ "$version" == "$declared" ]] || {
+            echo "Tag $tag does not match Cargo.toml version $declared" >&2
+            exit 1
+          }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: ${{ matrix.asset }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: linux-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-x86_64
+            exe: .exe
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            asset: windows-x86
+            exe: .exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check executable
+        if: matrix.target != 'x86_64-apple-darwin'
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          EXECUTABLE: target/${{ matrix.target }}/release/workstats${{ matrix.exe }}
+        run: |
+          reported=$("./$EXECUTABLE" --version | tr -d '\r')
+          echo "$reported"
+          [[ "$reported" == "workstats $VERSION" ]]
+
+      - name: Package
+        env:
+          BUILT: target/${{ matrix.target }}/release/workstats${{ matrix.exe }}
+          NAME: workstats-${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.exe }}" ]]; then
+            cp "$BUILT" "${NAME}.exe"
+            asset="${NAME}.exe"
+          else
+            tar -czf "${NAME}.tar.gz" -C "$(dirname "$BUILT")" workstats
+            asset="${NAME}.tar.gz"
+          fi
+          if command -v shasum >/dev/null; then
+            digest=$(shasum -a 256 "$asset" | cut -d' ' -f1)
+          else
+            digest=$(sha256sum "$asset" | cut -d' ' -f1)
+          fi
+          printf '%s  %s\n' "$digest" "$asset" > "${asset}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workstats-${{ matrix.asset }}
+          path: |
+            workstats-*.tar.gz
+            workstats-*.exe
+            workstats-*.sha256
+
+  publish:
+    name: Publish GitHub release
+    needs: [verify, binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect checksums
+        run: |
+          cat artifacts/*.sha256 > artifacts/SHA256SUMS
+          rm artifacts/*.sha256
+          cat artifacts/SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.exe
+            artifacts/SHA256SUMS

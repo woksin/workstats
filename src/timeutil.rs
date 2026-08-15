@@ -1,0 +1,513 @@
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
+
+use anyhow::{Result, bail};
+use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Utc};
+use regex::Regex;
+
+use crate::model::{ActivityPoint, HumanSignal, Interval, Session};
+
+pub fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+pub fn parse_epoch_milliseconds(value: f64) -> Option<DateTime<Utc>> {
+    if !value.is_finite() {
+        return None;
+    }
+    let micros = (value * 1000.0).round() as i64;
+    DateTime::from_timestamp_micros(micros)
+}
+
+pub fn parse_duration(value: &str) -> Result<Duration> {
+    let expression = Regex::new(r"(?i)^(\d+(?:\.\d+)?)(s|m|h)$").expect("static regex");
+    let Some(captures) = expression.captures(value.trim()) else {
+        bail!("duration must look like 30s, 5m, or 1h");
+    };
+    let amount: f64 = captures[1].parse()?;
+    if amount <= 0.0 {
+        bail!("duration must be greater than zero");
+    }
+    let factor = match captures[2].to_ascii_lowercase().as_str() {
+        "s" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        _ => unreachable!(),
+    };
+    Ok(Duration::microseconds(
+        (amount * factor * 1_000_000.0).round() as i64,
+    ))
+}
+
+pub fn parse_bound(value: Option<&str>, until: bool) -> Result<Option<DateTime<Utc>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let month = Regex::new(r"^\d{4}-\d{2}$").expect("static regex");
+    let day = Regex::new(r"^\d{4}-\d{2}-\d{2}$").expect("static regex");
+    let date = if month.is_match(value) {
+        let mut pieces = value.split('-');
+        let year: i32 = pieces.next().unwrap().parse()?;
+        let month: u32 = pieces.next().unwrap().parse()?;
+        let start = NaiveDate::from_ymd_opt(year, month, 1)
+            .ok_or_else(|| anyhow::anyhow!("date must be YYYY-MM or YYYY-MM-DD"))?;
+        if until {
+            if month == 12 {
+                NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
+            } else {
+                NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
+            }
+        } else {
+            start
+        }
+    } else if day.is_match(value) {
+        let start = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .map_err(|_| anyhow::anyhow!("date must be YYYY-MM or YYYY-MM-DD"))?;
+        if until {
+            start.succ_opt().unwrap()
+        } else {
+            start
+        }
+    } else {
+        bail!("date must be YYYY-MM or YYYY-MM-DD");
+    };
+    Ok(Some(local_midnight(date)))
+}
+
+pub fn nearest_models(points: &[ActivityPoint]) -> Vec<ActivityPoint> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let mut ordered = points.to_vec();
+    ordered.sort_by_key(|point| point.timestamp);
+    let mut future = vec!["unknown".to_string(); ordered.len()];
+    let mut next_known = "unknown".to_string();
+    for index in (0..ordered.len()).rev() {
+        if ordered[index].model != "unknown" {
+            next_known.clone_from(&ordered[index].model);
+        }
+        future[index].clone_from(&next_known);
+    }
+    let mut current = "unknown".to_string();
+    for (index, point) in ordered.iter_mut().enumerate() {
+        if point.model != "unknown" {
+            current.clone_from(&point.model);
+        }
+        if current != "unknown" {
+            point.model.clone_from(&current);
+        } else {
+            point.model.clone_from(&future[index]);
+        }
+    }
+    ordered
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeapEntry {
+    known: bool,
+    start_micros: i64,
+    index: usize,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.known, self.start_micros, self.index).cmp(&(
+            other.known,
+            other.start_micros,
+            other.index,
+        ))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub fn build_session_intervals(session: &Session, gap_cap: Duration) -> Vec<Interval> {
+    let points = nearest_models(&session.points);
+    let mut ranges = Vec::with_capacity(points.len() + session.exact_intervals.len());
+    for pair in points.windows(2) {
+        let current = &pair[0];
+        let following = &pair[1];
+        if following.timestamp <= current.timestamp {
+            continue;
+        }
+        ranges.push((
+            current.timestamp,
+            following.timestamp.min(current.timestamp + gap_cap),
+            current.model.clone(),
+        ));
+    }
+    ranges.extend(
+        session
+            .exact_intervals
+            .iter()
+            .map(|item| (item.start, item.end, item.model.clone())),
+    );
+
+    let mut events: BTreeMap<DateTime<Utc>, Vec<(bool, usize)>> = BTreeMap::new();
+    for (index, (start, end, _)) in ranges.iter().enumerate() {
+        if end <= start {
+            continue;
+        }
+        events.entry(*start).or_default().push((true, index));
+        events.entry(*end).or_default().push((false, index));
+    }
+    let mut active: HashSet<usize> = HashSet::new();
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::new();
+    let mut result: Vec<Interval> = Vec::new();
+    let mut previous = None;
+    for (moment, changes) in events {
+        while heap
+            .peek()
+            .is_some_and(|entry| !active.contains(&entry.index))
+        {
+            heap.pop();
+        }
+        if let (Some(start), Some(entry)) = (previous, heap.peek())
+            && moment > start
+        {
+            let model = ranges[entry.index].2.clone();
+            if let Some(prior) = result.last_mut() {
+                if prior.end == start && prior.model == model {
+                    prior.end = moment;
+                } else {
+                    result.push(interval_for_session(session, start, moment, model));
+                }
+            } else {
+                result.push(interval_for_session(session, start, moment, model));
+            }
+        }
+        for (starting, index) in &changes {
+            if !starting {
+                active.remove(index);
+            }
+        }
+        for (starting, index) in changes {
+            if starting {
+                active.insert(index);
+                let (start, _, model) = &ranges[index];
+                heap.push(HeapEntry {
+                    known: model != "unknown",
+                    start_micros: start.timestamp_micros(),
+                    index,
+                });
+            }
+        }
+        previous = Some(moment);
+    }
+    result
+}
+
+fn interval_for_session(
+    session: &Session,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    model: String,
+) -> Interval {
+    Interval {
+        start,
+        end,
+        provider: session.provider.clone(),
+        model,
+        session_id: session.session_id.clone(),
+        cwd: session.cwd.clone(),
+        repo: session.repo.clone(),
+        root: session.root.clone(),
+    }
+}
+
+pub fn build_human_intervals(
+    signals: &[HumanSignal],
+    idle_threshold: Duration,
+    isolated_credit: Duration,
+) -> Vec<Interval> {
+    if signals.is_empty() {
+        return Vec::new();
+    }
+    let priority = |kind: &str| match kind {
+        "claude_prompt" | "codex_prompt" => 3,
+        "commit" => 1,
+        _ => 0,
+    };
+    let mut by_timestamp: BTreeMap<DateTime<Utc>, &HumanSignal> = BTreeMap::new();
+    for signal in signals {
+        match by_timestamp.get(&signal.timestamp) {
+            Some(existing) if priority(&existing.kind) >= priority(&signal.kind) => {}
+            _ => {
+                by_timestamp.insert(signal.timestamp, signal);
+            }
+        }
+    }
+    let ordered: Vec<&HumanSignal> = by_timestamp.into_values().collect();
+    let mut blocks: Vec<Vec<&HumanSignal>> = Vec::new();
+    let mut current = Vec::new();
+    for signal in ordered {
+        if current.last().is_some_and(|previous: &&HumanSignal| {
+            signal.timestamp - previous.timestamp > idle_threshold
+        }) {
+            blocks.push(std::mem::take(&mut current));
+        }
+        current.push(signal);
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+
+    let edge = isolated_credit / 2;
+    let mut intervals = Vec::new();
+    for (block_index, block) in blocks.into_iter().enumerate() {
+        let first_day = local_midnight(block[0].timestamp.with_timezone(&Local).date_naive());
+        let next_day = local_midnight(
+            block
+                .last()
+                .unwrap()
+                .timestamp
+                .with_timezone(&Local)
+                .date_naive()
+                .succ_opt()
+                .unwrap(),
+        );
+        let mut left = (block[0].timestamp - edge).max(first_day);
+        for (index, signal) in block.iter().enumerate() {
+            let right = if let Some(next) = block.get(index + 1) {
+                signal.timestamp + (next.timestamp - signal.timestamp) / 2
+            } else {
+                (signal.timestamp + edge).min(next_day)
+            };
+            if right > left {
+                intervals.push(Interval {
+                    start: left,
+                    end: right,
+                    provider: signal.provider.clone(),
+                    model: signal.model.clone(),
+                    session_id: format!("work-block:{block_index}"),
+                    cwd: signal.cwd.clone(),
+                    repo: signal.repo.clone(),
+                    root: signal.root.clone(),
+                });
+            }
+            left = right;
+        }
+    }
+    intervals
+}
+
+pub fn clip_interval(
+    interval: &Interval,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Option<Interval> {
+    let start = since.map_or(interval.start, |bound| interval.start.max(bound));
+    let end = until.map_or(interval.end, |bound| interval.end.min(bound));
+    (end > start).then(|| Interval {
+        start,
+        end,
+        ..interval.clone()
+    })
+}
+
+pub fn union_seconds(intervals: &[Interval]) -> f64 {
+    let mut ranges: Vec<_> = intervals
+        .iter()
+        .filter(|item| item.end > item.start)
+        .map(|item| (item.start, item.end))
+        .collect();
+    ranges.sort();
+    let mut total = 0.0;
+    let mut current: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+    for (start, end) in ranges {
+        match current {
+            Some((first, last)) if start <= last => current = Some((first, last.max(end))),
+            Some((first, last)) => {
+                total += duration_seconds(last - first);
+                current = Some((start, end));
+            }
+            None => current = Some((start, end)),
+        }
+    }
+    if let Some((first, last)) = current {
+        total += duration_seconds(last - first);
+    }
+    total
+}
+
+pub fn split_interval(interval: &Interval, dimension: &str) -> Vec<(String, Interval)> {
+    if dimension != "day" && dimension != "month" {
+        return Vec::new();
+    }
+    let mut pieces = Vec::new();
+    let mut cursor = interval.start;
+    while cursor < interval.end {
+        let local = cursor.with_timezone(&Local);
+        let date = local.date_naive();
+        let (key, boundary_date) = if dimension == "day" {
+            (
+                date.format("%Y-%m-%d").to_string(),
+                date.succ_opt().unwrap(),
+            )
+        } else {
+            let next = if date.month() == 12 {
+                NaiveDate::from_ymd_opt(date.year() + 1, 1, 1).unwrap()
+            } else {
+                NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1).unwrap()
+            };
+            (date.format("%Y-%m").to_string(), next)
+        };
+        let end = interval.end.min(local_midnight(boundary_date));
+        pieces.push((
+            key,
+            Interval {
+                start: cursor,
+                end,
+                ..interval.clone()
+            },
+        ));
+        cursor = end;
+    }
+    pieces
+}
+
+pub fn calendar_days(first: Option<DateTime<Utc>>, last: Option<DateTime<Utc>>) -> usize {
+    match (first, last) {
+        (Some(first), Some(last)) => {
+            (last.with_timezone(&Local).date_naive() - first.with_timezone(&Local).date_naive())
+                .num_days()
+                .max(0) as usize
+                + 1
+        }
+        _ => 0,
+    }
+}
+
+pub fn local_date(value: DateTime<Utc>) -> String {
+    value.with_timezone(&Local).date_naive().to_string()
+}
+
+pub fn local_month(value: DateTime<Utc>) -> String {
+    value.with_timezone(&Local).format("%Y-%m").to_string()
+}
+
+pub fn duration_seconds(value: Duration) -> f64 {
+    value.num_microseconds().unwrap_or(0) as f64 / 1_000_000.0
+}
+
+fn local_midnight(date: NaiveDate) -> DateTime<Utc> {
+    let naive = date.and_hms_opt(0, 0, 0).unwrap();
+    let local = match Local.from_local_datetime(&naive) {
+        LocalResult::Single(value) => value,
+        LocalResult::Ambiguous(first, _) => first,
+        LocalResult::None => {
+            let noon = date.and_hms_opt(12, 0, 0).unwrap();
+            Local.from_local_datetime(&noon).earliest().unwrap()
+        }
+    };
+    local.with_timezone(&Utc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(points: Vec<ActivityPoint>) -> Session {
+        Session {
+            provider: "codex".into(),
+            session_id: "s".into(),
+            cwd: "/x".into(),
+            repo: "x".into(),
+            root: "root".into(),
+            points,
+            exact_intervals: vec![],
+            human_points: vec![],
+            is_subagent: false,
+        }
+    }
+
+    #[test]
+    fn gap_cap_and_union_match_reference() {
+        let base = parse_timestamp("2026-01-01T10:00:00Z").unwrap();
+        let value = session(
+            [0, 2, 20]
+                .into_iter()
+                .map(|minute| ActivityPoint {
+                    timestamp: base + Duration::minutes(minute),
+                    model: "m".into(),
+                })
+                .collect(),
+        );
+        let intervals = build_session_intervals(&value, Duration::minutes(5));
+        assert_eq!(420.0, intervals.iter().map(Interval::seconds).sum::<f64>());
+        assert_eq!(420.0, union_seconds(&intervals));
+    }
+
+    #[test]
+    fn inclusive_bounds_match_reference() {
+        let february = parse_bound(Some("2026-02"), true).unwrap().unwrap();
+        assert_eq!("2026-03-01", local_date(february));
+        let day = parse_bound(Some("2026-02-01"), true).unwrap().unwrap();
+        assert_eq!("2026-02-02", local_date(day));
+    }
+
+    #[test]
+    fn human_blocks_are_non_overlapping_and_attributed() {
+        let signal = |timestamp: &str, provider: &str, repo: &str, kind: &str| HumanSignal {
+            timestamp: parse_timestamp(timestamp).unwrap(),
+            provider: provider.into(),
+            session_id: repo.into(),
+            cwd: format!("/{repo}"),
+            repo: repo.into(),
+            root: "root".into(),
+            kind: kind.into(),
+            model: "model".into(),
+        };
+        let intervals = build_human_intervals(
+            &[
+                signal("2026-01-01T10:00:00Z", "claude", "a", "claude_prompt"),
+                signal("2026-01-01T10:20:00Z", "codex", "b", "codex_prompt"),
+                signal("2026-01-01T12:00:00Z", "git", "c", "commit"),
+            ],
+            Duration::minutes(30),
+            Duration::minutes(10),
+        );
+        assert_eq!(2400.0, intervals.iter().map(Interval::seconds).sum::<f64>());
+        assert_eq!(2400.0, union_seconds(&intervals));
+        assert_eq!(
+            HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()]),
+            intervals.iter().map(|item| item.repo.clone()).collect()
+        );
+    }
+
+    #[test]
+    fn cross_month_interval_is_split() {
+        let boundary = parse_bound(Some("2026-01"), true).unwrap().unwrap();
+        let interval = Interval {
+            start: boundary - Duration::minutes(1),
+            end: boundary + Duration::minutes(1),
+            provider: "codex".into(),
+            model: "m".into(),
+            session_id: "s".into(),
+            cwd: "/x".into(),
+            repo: "x".into(),
+            root: "root".into(),
+        };
+        let pieces = split_interval(&interval, "month");
+        assert_eq!(
+            vec!["2026-01", "2026-02"],
+            pieces
+                .iter()
+                .map(|item| item.0.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec![60.0, 60.0],
+            pieces
+                .iter()
+                .map(|item| item.1.seconds())
+                .collect::<Vec<_>>()
+        );
+    }
+}

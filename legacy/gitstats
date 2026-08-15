@@ -1,0 +1,389 @@
+#!/bin/bash
+# gitstats — summarize one author's contribution across many git repos.
+#
+# Dedupes by commit SHA, so multiple clones / git worktrees of the same repo
+# (and GitHub repo renames) are counted exactly once. Merge commits excluded.
+# Stats are bucketed by commit *author* date.
+#
+# "Lines added/removed" come from `git diff --numstat`: purely line-based, so a
+# modified line counts as 1 removed + 1 added, and whole new/generated files
+# count in full. To keep counts meaningful this tool, BY DEFAULT, ignores
+# generated/vendored paths (node_modules, dist/build, bin/obj, wwwroot bundles,
+# *.min.*, *.map, snapshots, lockfiles, …) in every stat — disable with
+# --no-ignore, extend with -P GLOB. What was ignored is shown in its own section.
+# It also reports:
+#   * Summary   — commits, files touched, active days, tenure, avg commit size
+#   * Surviving — (with --blame) lines you authored that still exist in HEAD
+
+set -uo pipefail
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+export PATH
+
+# ---- defaults (override via flags or env) ----------------------------------
+BASE_DIR="${GITSTATS_DIR:-$HOME/src/repos}"
+CONFIGURED_AUTHOR=$(git config --global --get user.email 2>/dev/null || git config --global --get user.name 2>/dev/null || true)
+AUTHOR="${GITSTATS_AUTHOR:-$CONFIGURED_AUTHOR}"
+EXCLUDE="${GITSTATS_EXCLUDE:-(^|/)(node_modules|dist|build|out|obj|bin|vendor|coverage|\.next|\.nuxt|\.svelte-kit|__snapshots__|Pods)/|wwwroot/.*\.(js|css|map)$|\.(min\.js|min\.css|map|snap)$|(^|/)([^/]*\.lock|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|composer\.lock|Cargo\.lock|poetry\.lock|Gemfile\.lock|go\.sum)$}"
+SINCE=""; UNTIL=""; BY_REPO=0; MATRIX=0; BLAME=0; DEPTH=4; COLOR=auto; REPO_FILTER=""
+PATH_INC=""; PATH_EXC=""; BY_DIR=0; DIR_DEPTH=2; DIR_TOP=40; NO_IGNORE=0
+
+usage() {
+cat <<EOF
+gitstats — author contribution stats across all git repos under a directory.
+
+Usage: gitstats [options]
+
+Options:
+  -d, --dir DIR        Base directory to scan        (default: \$GITSTATS_DIR or ~/src/repos)
+  -a, --author REGEX   Author match for 'git -i --author'
+                       (default: global Git email/name — override with \$GITSTATS_AUTHOR)
+  -R, --repo PATTERN   Only scan repos whose name matches (case-insensitive ERE;
+                       comma-separated or repeatable). Speeds runs up a lot.
+                       e.g.  -R api,web   or   -R '^cli$'
+  -s, --since YYYY-MM  Only include months >= this
+  -u, --until YYYY-MM  Only include months <= this
+  -r, --by-repo        Also print a per-month -> per-repo breakdown
+  -m, --matrix         Also print a repo x month matrix (net lines per cell)
+  -D, --by-dir         Also print a per-directory breakdown (repo/dir)
+      --dir-depth N    Directory components to group by     (default: 2)
+      --dir-top N      Max directories to list              (default: 40)
+      --path GLOB      Only count files matching GLOB(s)   (comma-sep/repeatable)
+  -P, --path-exclude GLOB
+                       ADD GLOB(s) to the ignore list      (comma-sep/repeatable)
+                       e.g.  -P 'docs/**,**/*.snap'   --path 'src/**'
+      --blame          Also compute surviving lines via 'git blame' (slow)
+      --no-ignore      Count everything (disable the default + -P ignore list)
+  -x, --exclude REGEX  Override the default ignore ERE (advanced; \$GITSTATS_EXCLUDE)
+      --depth N        find(1) maxdepth when locating repos   (default: 4)
+      --no-color       Disable colored output
+  -h, --help           Show this help
+
+Counts are deduped by commit SHA: clones, worktrees and renamed repos count once.
+By default, generated/vendored paths (node_modules, dist, build, bin, obj, vendor,
+wwwroot bundles, *.min.*, *.map, snapshots, lockfiles, …) are IGNORED in every
+stat; --no-ignore counts them, and the "Ignored paths" section shows what was cut.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--dir)      BASE_DIR="$2"; shift 2;;
+    -a|--author)   AUTHOR="$2";   shift 2;;
+    -R|--repo)     REPO_FILTER="${REPO_FILTER:+$REPO_FILTER|}$(printf '%s' "$2" | tr ',' '|')"; shift 2;;
+    --path)        PATH_INC="${PATH_INC:+$PATH_INC,}$2"; shift 2;;
+    -P|--path-exclude) PATH_EXC="${PATH_EXC:+$PATH_EXC,}$2"; shift 2;;
+    -D|--by-dir)   BY_DIR=1; shift;;
+    --dir-depth)   DIR_DEPTH="$2"; shift 2;;
+    --dir-top)     DIR_TOP="$2"; shift 2;;
+    -s|--since)    SINCE="$2";    shift 2;;
+    -u|--until)    UNTIL="$2";    shift 2;;
+    -r|--by-repo)  BY_REPO=1;     shift;;
+    -m|--matrix)   MATRIX=1;      shift;;
+    --blame)       BLAME=1;       shift;;
+    -x|--exclude)  EXCLUDE="$2";  shift 2;;
+    --no-ignore|--no-exclude) EXCLUDE=""; NO_IGNORE=1; shift;;
+    --depth)       DEPTH="$2";    shift 2;;
+    --no-color)    COLOR=0;       shift;;
+    -h|--help)     usage; exit 0;;
+    *) echo "gitstats: unknown option: $1" >&2; usage >&2; exit 2;;
+  esac
+done
+
+[[ -n "$AUTHOR" ]] || {
+  echo "gitstats: Git author is not configured; set git config --global user.email or pass --author" >&2
+  exit 2
+}
+
+[[ "$COLOR" == auto ]] && { [[ -t 1 ]] && COLOR=1 || COLOR=0; }
+if [[ "$COLOR" == 1 ]]; then
+  B=$'\e[1m'; D=$'\e[2m'; G=$'\e[32m'; R=$'\e[31m'; C=$'\e[36m'; Y=$'\e[33m'; Z=$'\e[0m'
+else B=""; D=""; G=""; R=""; C=""; Y=""; Z=""; fi
+
+[[ -n "$REPO_FILTER" ]] && shopt -s nocasematch
+
+# Convert comma-separated shell globs to an ERE alternation matched against paths.
+# ** -> any depth, * -> within a segment, ? -> one char. Matches anywhere in the path.
+glob2ere(){
+  local g part out=""; local -a parts
+  IFS=',' read -r -a parts <<< "$1"
+  for g in "${parts[@]}"; do
+    [[ -z "$g" ]] && continue
+    part=$(printf '%s' "$g" | sed -e 's/[].[(){}^$+|]/\\&/g')
+    part=${part//\*\*/$'\x01'}
+    part=${part//\*/[^/]*}
+    part=${part//$'\x01'/.*}
+    part=${part//\?/[^/]}
+    out="${out:+$out|}(${part})"
+  done
+  printf '%s' "$out"
+}
+PINC=""; PEXC=""
+[[ -n "$PATH_INC" ]] && PINC=$(glob2ere "$PATH_INC")
+[[ -n "$PATH_EXC" ]] && PEXC=$(glob2ere "$PATH_EXC")
+
+# Combined hard-ignore regex applied to ALL stats: default list (EXCLUDE) + -P globs.
+IGN=""
+if [[ "$NO_IGNORE" != 1 ]]; then
+  IGN="$EXCLUDE"
+  [[ -n "$PEXC" ]] && IGN="${IGN:+$IGN|}$PEXC"
+fi
+
+command -v git >/dev/null 2>&1 || { echo "gitstats: git not found in PATH" >&2; exit 1; }
+[[ -d "$BASE_DIR" ]] || { echo "gitstats: directory not found: $BASE_DIR" >&2; exit 1; }
+
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+raw="$work/raw"; mr="$work/mr.tsv"; stat="$work/stat.tsv"; ff="$work/files.tsv"; ig="$work/ignore.tsv"
+
+repo_label() {  # $1 = repo dir -> lowercase short name from remote, else dirname
+  local d="$1" origin
+  origin=$(git -C "$d" config --get remote.origin.url 2>/dev/null || true)
+  if [[ -n "$origin" ]]; then basename "${origin%.git}" | tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cd '[:alnum:]_.@/+:-'
+  else basename "$d" | tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -cd '[:alnum:]_.@/+:-'; fi
+}
+
+# 1) Collect every matching commit (SHA, author day, repo) + numstat.
+while IFS= read -r gitpath; do
+  repodir=$(dirname "$gitpath")
+  short=$(repo_label "$repodir")
+  [[ -n "$REPO_FILTER" && ! "$short" =~ $REPO_FILTER ]] && continue
+  git -C "$repodir" log -i --author="$AUTHOR" --no-merges \
+      --pretty=format:"S %H %ad $short" --date=format:'%Y-%m-%d' --numstat 2>/dev/null || true
+  printf '\n'
+done < <(find "$BASE_DIR" -maxdepth "$DEPTH" -name .git 2>/dev/null | sort) > "$raw"
+
+# 2) Dedup by SHA. Path-include first, then hard-ignore (tracked separately),
+#    aggregate the rest per (month, repo); collect summary.
+awk -F'\t' -v since="$SINCE" -v until="$UNTIL" -v ign="$IGN" -v pinc="$PINC" \
+    -v mrfile="$mr" -v statfile="$stat" -v ffile="$ff" -v igfile="$ig" '
+  function strip(f){ if(match(f," => ")) f=substr(f,RSTART+4); gsub(/[{}]/,"",f); return f }
+  /^S / { n=split($0,a," "); sha=a[2]; day=a[3]; repo=a[4]; mon=substr(day,1,7)
+          if (sha in seen) { skip=1; next } seen[sha]=1; skip=0; next }
+  skip { next }
+  $1 ~ /^[0-9]+$/ {
+    if (since!="" && mon<since) next
+    if (until!="" && mon>until) next
+    file=strip($3)
+    if (pinc!="" && file !~ pinc) next
+    if (ign!="" && file ~ ign) { gadd[repo]+=$1; grem[repo]+=$2; Tga+=$1; Tgs+=$2; next }
+    key=mon"\t"repo
+    radd[key]+=$1; rsub[key]+=$2; Tra+=$1; Trs+=$2
+    fk=repo SUBSEP file; if (!(fk in fseen)) { fseen[fk]=1; nf++ }
+    fa[fk]+=$1; fs[fk]+=$2
+    if (!(day in dseen)) { dseen[day]=1; nd++; if(first==""||day<first)first=day; if(day>last)last=day }
+    cc[sha]=1
+  }
+  END{
+    for (k in radd) printf "%s\t%d\t%d\n", k, radd[k], rsub[k] > mrfile
+    for (k in fa){ split(k,p,SUBSEP); printf "%s\t%s\t%d\t%d\n", p[1], p[2], fa[k], fs[k] > ffile }
+    for (k in gadd) printf "%s\t%d\t%d\n", k, gadd[k], grem[k] > igfile
+    printf "commits\t%d\nfiles\t%d\ndays\t%d\nfirst\t%s\nlast\t%s\nadd\t%d\nsub\t%d\niadd\t%d\nisub\t%d\n", \
+           length(cc), nf, nd, first, last, Tra, Trs, Tga+0, Tgs+0 > statfile
+  }
+' "$raw"
+
+if [[ ! -s "$mr" ]]; then
+  echo "gitstats: no commits matching /$AUTHOR/ under $BASE_DIR${SINCE:+ since $SINCE}${UNTIL:+ until $UNTIL}"
+  exit 0
+fi
+
+# load summary into shell vars (bash 3.2 — no associative arrays)
+sv_commits=0; sv_files=0; sv_days=0; sv_first=""; sv_last=""
+sv_add=0; sv_sub=0; sv_iadd=0; sv_isub=0
+while IFS=$'\t' read -r k v; do
+  case "$k" in
+    commits) sv_commits=$v;; files) sv_files=$v;; days) sv_days=$v;;
+    first) sv_first=$v;; last) sv_last=$v;;
+    add) sv_add=$v;; sub) sv_sub=$v;; iadd) sv_iadd=$v;; isub) sv_isub=$v;;
+  esac
+done < "$stat"
+NREPOS=$(cut -f2 "$mr" | sort -u | wc -l | tr -d ' ')
+
+AWKLIB='
+function comma(x,   s,sign,r,i,n){ sign=""; if(x<0){sign="-";x=-x}; s=sprintf("%d",x); n=length(s); r="";
+  for(i=1;i<=n;i++){ r=r substr(s,i,1); if(((n-i)%3)==0 && i<n) r=r"," } return sign r }
+function sgn(x){ return (x>0?"+":"") comma(x) }
+'
+
+# ---- header ----------------------------------------------------------------
+rng="all time"; [[ -n "$SINCE" || -n "$UNTIL" ]] && rng="${SINCE:-…} → ${UNTIL:-…}"
+printf '%s%s━━ git contribution stats ━━%s\n' "$B" "$C" "$Z"
+printf '  %sdir%s      %s\n' "$D" "$Z" "$BASE_DIR"
+printf '  %sauthor%s   /%s/      %srepos%s %s\n' "$D" "$Z" "$AUTHOR" "$D" "$Z" "$NREPOS"
+printf '  %srange%s    %s\n' "$D" "$Z" "$rng"
+[[ -n "$REPO_FILTER" ]] && printf '  %srepo filter%s /%s/i\n' "$D" "$Z" "$REPO_FILTER"
+[[ -n "$PATH_INC" ]] && printf '  %spath incl%s   %s\n' "$D" "$Z" "$PATH_INC"
+[[ -n "$PATH_EXC" ]] && printf '  %spath excl%s   %s\n' "$D" "$Z" "$PATH_EXC"
+printf '\n'
+
+# ---- summary ---------------------------------------------------------------
+printf '%s%sSummary%s\n' "$B" "$Y" "$Z"
+awk -v G="$G" -v R="$R" -v D="$D" -v Z="$Z" \
+    -v c="$sv_commits" -v nf="$sv_files" -v nd="$sv_days" -v first="$sv_first" -v last="$sv_last" \
+    -v a="$sv_add" -v s="$sv_sub" -v ia="$sv_iadd" -v is="$sv_isub" "$AWKLIB"'
+  BEGIN{
+    printf "  %-18s %s\n","Commits",comma(c)
+    printf "  %-18s %s\n","Files touched",comma(nf)
+    printf "  %-18s %s   %s(%s → %s)%s\n","Active days",comma(nd),D,first,last,Z
+    printf "  %-18s %s%s%s / %s%s%s   net %s%s%s\n","Lines", G,sgn(a),Z, R,sgn(-s),Z, (a-s>=0?G:R),sgn(a-s),Z
+    if(c>0) printf "  %-18s %s / %s\n","Avg / commit", sgn(int(a/c)), sgn(-int(s/c))
+    if(ia>0||is>0){ tot=a+ia; pct=(tot>0? ia*100/tot:0)
+      printf "  %-18s %s%s%s / %s%s%s   %s(%.0f%% of additions — see below)%s\n","Ignored", D,sgn(ia),Z, D,sgn(-is),Z, D,pct,Z }
+  }'
+printf '\n'
+
+# ---- by month --------------------------------------------------------------
+printf '%s%sBy month%s\n' "$B" "$Y" "$Z"
+awk -F'\t' '{a[$1]+=$3; r[$1]+=$4} END{for(m in a) printf "%s\t%d\t%d\n",m,a[m],r[m]}' "$mr" | sort \
+| awk -F'\t' -v G="$G" -v R="$R" -v B="$B" -v Z="$Z" "$AWKLIB"'
+  BEGIN{ printf "%s  %-9s %14s %14s %14s%s\n", B,"Month","Added","Removed","Net",Z }
+  { mm[NR]=$1; ad[NR]=$2; rm[NR]=$3; ta+=$2; tr+=$3 }
+  END{
+    for(i=1;i<=NR;i++){ net=ad[i]-rm[i]; col=(net>=0?G:R)
+      printf "  %-9s %s%14s%s %s%14s%s %s%14s%s\n", mm[i], G,sgn(ad[i]),Z, R,sgn(-rm[i]),Z, col,sgn(net),Z }
+    net=ta-tr; col=(net>=0?G:R)
+    printf "%s  %-9s%s %s%s%14s%s %s%s%14s%s %s%s%14s%s\n", B,"TOTAL",Z,
+      B,G,sgn(ta),Z, B,R,sgn(-tr),Z, B,col,sgn(net),Z }'
+printf '\n'
+
+# ---- by repo ---------------------------------------------------------------
+printf '%s%sBy repo%s\n' "$B" "$Y" "$Z"
+awk -F'\t' '{a[$2]+=$3; r[$2]+=$4} END{for(x in a) printf "%s\t%d\t%d\n",x,a[x],r[x]}' "$mr" | sort -t"$(printf '\t')" -k2,2nr \
+| awk -F'\t' -v G="$G" -v R="$R" -v B="$B" -v Z="$Z" "$AWKLIB"'
+  BEGIN{ printf "%s  %-22s %14s %14s %14s%s\n", B,"Repo","Added","Removed","Net",Z }
+  { nm[NR]=$1; ad[NR]=$2; rm[NR]=$3; ta+=$2; tr+=$3 }
+  END{
+    for(i=1;i<=NR;i++){ net=ad[i]-rm[i]; col=(net>=0?G:R)
+      printf "  %-22s %s%14s%s %s%14s%s %s%14s%s\n", nm[i], G,sgn(ad[i]),Z, R,sgn(-rm[i]),Z, col,sgn(net),Z }
+    net=ta-tr; col=(net>=0?G:R)
+    printf "%s  %-22s%s %s%s%14s%s %s%s%14s%s %s%s%14s%s\n", B,"TOTAL",Z,
+      B,G,sgn(ta),Z, B,R,sgn(-tr),Z, B,col,sgn(net),Z }'
+printf '\n'
+
+# ---- ignored paths (what the default/-P ignore removed) --------------------
+if [[ -s "$ig" ]]; then
+  printf '%s%sIgnored paths%s %s(generated/vendored — excluded from all stats above)%s\n' "$B" "$Y" "$Z" "$D" "$Z"
+  sort -t"$(printf '\t')" -k2,2nr "$ig" \
+  | awk -F'\t' -v G="$G" -v R="$R" -v D="$D" -v B="$B" -v Z="$Z" "$AWKLIB"'
+    BEGIN{ printf "%s  %-22s %14s %14s%s\n", B,"Repo","Ignored +add","Ignored -rem",Z }
+    { nm[NR]=$1; ad[NR]=$2; rm[NR]=$3; ta+=$2; tr+=$3 }
+    END{
+      for(i=1;i<=NR;i++)
+        printf "  %-22s %s%14s%s %s%14s%s\n", nm[i], D,sgn(ad[i]),Z, D,sgn(-rm[i]),Z
+      printf "%s  %-22s%s %s%s%14s%s %s%s%14s%s\n", B,"TOTAL",Z, B,D,sgn(ta),Z, B,D,sgn(-tr),Z }'
+  printf '  %stip: --no-ignore to count these; -P GLOB to ignore more%s\n' "$D" "$Z"
+  printf '\n'
+fi
+
+# ---- by directory (optional) ----------------------------------------------
+if [[ "$BY_DIR" == 1 ]]; then
+  diragg="$work/dir.tsv"
+  awk -F'\t' -v depth="$DIR_DEPTH" '
+    { file=$2; n=split(file,c,"/")
+      if(n<=1) dir="(root)"
+      else { lim=(depth<n-1?depth:n-1); dir=""; for(i=1;i<=lim;i++) dir=dir (i>1?"/":"") c[i] }
+      k=$1"/"dir; ad[k]+=$3; rm[k]+=$4 }
+    END{ for(k in ad) printf "%d\t%d\t%s\n", ad[k], rm[k], k }' "$ff" \
+    | sort -t"$(printf '\t')" -k1,1nr > "$diragg"
+  M=$(wc -l < "$diragg" | tr -d ' ')
+  printf '%s%sBy directory%s %s(repo/dir, depth %s — top %s of %s)%s\n' "$B" "$Y" "$Z" "$D" "$DIR_DEPTH" "$DIR_TOP" "$M" "$Z"
+  head -n "$DIR_TOP" "$diragg" \
+  | awk -F'\t' -v G="$G" -v R="$R" -v B="$B" -v Z="$Z" "$AWKLIB"'
+    BEGIN{ printf "%s  %-50s %13s %13s %13s%s\n", B,"Directory","Added","Removed","Net",Z }
+    { a=$1; s=$2; net=a-s; col=(net>=0?G:R)
+      printf "  %-50s %s%13s%s %s%13s%s %s%13s%s\n", $3, G,sgn(a),Z, R,sgn(-s),Z, col,sgn(net),Z }'
+  [[ "$M" -gt "$DIR_TOP" ]] && printf '  %s… and %d more directories (raise with --dir-top)%s\n' "$D" "$((M-DIR_TOP))" "$Z"
+  printf '\n'
+fi
+
+# ---- repo x month matrix (optional) ---------------------------------------
+if [[ "$MATRIX" == 1 ]]; then
+  months=$(cut -f1 "$mr" | sort -u | tr '\n' ' ')
+  repos=$(awk -F'\t' '{a[$2]+=$3} END{for(r in a) printf "%d\t%s\n",a[r],r}' "$mr" \
+          | sort -t"$(printf '\t')" -k1,1nr | cut -f2 | tr '\n' ' ')
+  printf '%s%sBy repo × month%s %s(net lines)%s\n' "$B" "$Y" "$Z" "$D" "$Z"
+  awk -F'\t' -v months="$months" -v repos="$repos" \
+      -v G="$G" -v R="$R" -v D="$D" -v B="$B" -v Z="$Z" "$AWKLIB"'
+  function cell(key, w,   v,col,s){
+    if(!(key in has)) return D sprintf("%*s", w, "·") Z
+    v=net[key]; col=(v>=0?G:R); s=(v>0?"+"comma(v):comma(v))
+    return col sprintf("%*s", w, s) Z
+  }
+  { net[$2 SUBSEP $1]=$3-$4; has[$2 SUBSEP $1]=1 }
+  END{
+    W=9; RW=17; nm=split(months,M," "); nr=split(repos,RP," ")
+    printf "%s%-*s%s", B, RW, "Repo", Z
+    for(i=1;i<=nm;i++){ if(M[i]=="")continue; printf " %s%*s%s", B, W, substr(M[i],3), Z }
+    printf " %s%*s%s\n", B, W, "Total", Z
+    for(j=1;j<=nr;j++){ r=RP[j]; if(r=="")continue; rtot=0
+      printf "%-*s", RW, r
+      for(i=1;i<=nm;i++){ if(M[i]=="")continue; k=r SUBSEP M[i]
+        printf " %s", cell(k, W)
+        if(k in has){ rtot+=net[k]; ctot[M[i]]+=net[k] } }
+      col=(rtot>=0?G:R); printf " %s%s%*s%s\n", B, col, W, sgn(rtot), Z
+      gtot+=rtot }
+    printf "%s%-*s%s", B, RW, "TOTAL", Z
+    for(i=1;i<=nm;i++){ if(M[i]=="")continue; v=ctot[M[i]]; col=(v>=0?G:R)
+      printf " %s%s%*s%s", B, col, W, sgn(v), Z }
+    col=(gtot>=0?G:R); printf " %s%s%*s%s\n", B, col, W, sgn(gtot), Z
+  }' "$mr"
+  printf '\n'
+fi
+
+# ---- by month -> repo (optional) ------------------------------------------
+if [[ "$BY_REPO" == 1 ]]; then
+  printf '%s%sBy month → repo%s\n' "$B" "$Y" "$Z"
+  sort -t"$(printf '\t')" -k1,1 -k3,3nr "$mr" \
+  | awk -F'\t' -v G="$G" -v R="$R" -v B="$B" -v Z="$Z" "$AWKLIB"'
+    { if($1!=cur){ printf "%s  %s%s\n", B,$1,Z; cur=$1 }
+      printf "    %-22s %s%12s%s %s%12s%s\n", $2, G,sgn($3),Z, R,sgn(-$4),Z }'
+  printf '\n'
+fi
+
+# ---- surviving lines via blame (optional, slow) ---------------------------
+if [[ "$BLAME" == 1 ]]; then
+  printf '%s%sSurviving lines%s %s(git blame on HEAD; generated/vendored excluded) — slow…%s\n' "$B" "$Y" "$Z" "$D" "$Z"
+  pat=$(printf '%s' "${AUTHOR//\\|/|}" | tr '[:upper:]' '[:lower:]')
+  # binary/asset extensions that aren't meaningfully blameable (and break awk)
+  bin='\.(png|jpe?g|gif|bmp|ico|webp|svg|pdf|zip|gz|tgz|tar|7z|rar|woff2?|ttf|eot|otf|mp[34]|mov|avi|mkv|wav|ogg|flac|exe|dll|so|dylib|class|jar|wasm|bin|dat|db|sqlite|pdb|nupkg|snk|keystore|jks|p12|pfx|der|cer|icns|psd|ai|eps|parquet|onnx)$'
+  skip_re="$bin"; [[ -n "$IGN" ]] && skip_re="$IGN|$bin"
+  blame="$work/blame.tsv"; : > "$blame"
+  bseenf="$work/bseen"; : > "$bseenf"
+  while IFS= read -r gitpath; do
+    d=$(dirname "$gitpath")
+    origin=$(git -C "$d" config --get remote.origin.url 2>/dev/null || true)
+    if [[ -n "$origin" ]]; then
+      key=$(printf '%s' "$origin" | sed -E 's#^[a-z]+://[^/]+/##; s#^[^@]+@[^:]+:##; s#\.git$##' | tr '[:upper:]' '[:lower:]')
+    else
+      key=$(git -C "$d" rev-parse --git-common-dir 2>/dev/null)
+      case "$key" in /*) ;; *) key="$d/$key";; esac
+    fi
+    short=$(repo_label "$d")
+    [[ -n "$REPO_FILTER" && ! "$short" =~ $REPO_FILTER ]] && continue
+    grep -qxF -- "$key" "$bseenf" 2>/dev/null && continue
+    printf '%s\n' "$key" >> "$bseenf"
+    printf '  …blaming %s\r' "$short" >&2
+    res=$(git -C "$d" ls-files 2>/dev/null | LC_ALL=C grep -vEi "$skip_re" \
+          | { if [[ -n "$PINC" ]]; then grep -E "$PINC"; else cat; fi; } \
+          | tr '\n' '\0' \
+          | xargs -0 -P4 -I{} git -C "$d" blame --line-porcelain -- {} 2>/dev/null \
+          | LC_ALL=C awk -v re="$pat" '{ l=tolower($0); if(l ~ /^author /){tot++; if(l ~ re) mine++} } END{printf "%d\t%d", mine+0, tot+0}')
+    mine=${res%%$'\t'*}; tot=${res##*$'\t'}
+    [[ "${mine:-0}" -gt 0 ]] && printf '%s\t%s\t%s\n' "$short" "$mine" "$tot" >> "$blame"
+  done < <(find "$BASE_DIR" -maxdepth "$DEPTH" -name .git 2>/dev/null | sort)
+  printf '                                   \r' >&2
+  if [[ -s "$blame" ]]; then
+    sort -t"$(printf '\t')" -k2,2nr "$blame" \
+    | awk -F'\t' -v G="$G" -v B="$B" -v D="$D" -v Z="$Z" "$AWKLIB"'
+      BEGIN{ printf "%s  %-22s %13s %13s %8s%s\n", B,"Repo","Yours","CodebaseTot","Share",Z }
+      { nm[NR]=$1; mi[NR]=$2; to[NR]=$3; tm+=$2; tt+=$3 }
+      END{
+        for(i=1;i<=NR;i++){ sh=(to[i]>0? mi[i]*100/to[i]:0)
+          printf "  %-22s %s%13s%s %13s %s%7.0f%%%s\n", nm[i], G,comma(mi[i]),Z, comma(to[i]), D,sh,Z }
+        sh=(tt>0? tm*100/tt:0)
+        printf "%s  %-22s%s %s%s%13s%s %13s %s%7.0f%%%s\n", B,"TOTAL",Z, B,G,comma(tm),Z, comma(tt), B,sh,Z }'
+  else
+    printf '  (no surviving authored lines found)\n'
+  fi
+  printf '\n'
+fi

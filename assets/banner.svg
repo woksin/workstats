@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="280" viewBox="0 0 1000 280" role="img" aria-labelledby="title description">
+  <title id="title">workstats</title>
+  <description id="description">A local-first view of human work, Git output, and AI agent activity</description>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#08111f"/>
+      <stop offset="0.55" stop-color="#10233a"/>
+      <stop offset="1" stop-color="#092d31"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#86efac"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <pattern id="grid" width="36" height="36" patternUnits="userSpaceOnUse">
+      <path d="M36 0H0V36" fill="none" stroke="#bdebf4" stroke-opacity=".055"/>
+    </pattern>
+  </defs>
+
+  <rect width="1000" height="280" rx="26" fill="url(#background)"/>
+  <rect width="1000" height="280" rx="26" fill="url(#grid)"/>
+  <circle cx="875" cy="-15" r="190" fill="#22d3ee" opacity=".045"/>
+  <circle cx="70" cy="310" r="190" fill="#4ade80" opacity=".04"/>
+
+  <g transform="translate(70 56)">
+    <rect width="168" height="168" rx="34" fill="#0a1829" stroke="#67e8f9" stroke-opacity=".32"/>
+    <path d="M28 121L54 102 76 112 99 65 119 84 142 42" fill="none" stroke="url(#signal)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+    <circle cx="54" cy="102" r="6" fill="#67e8f9"/>
+    <circle cx="99" cy="65" r="6" fill="#7dd3fc"/>
+    <circle cx="142" cy="42" r="7" fill="#86efac"/>
+    <path d="M28 139H142" stroke="#d7f7fa" stroke-opacity=".18" stroke-width="2"/>
+  </g>
+
+  <g transform="translate(278 73)">
+    <text x="0" y="73" fill="#f0fdfa" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="72" font-weight="750" letter-spacing="-4">workstats</text>
+    <text x="3" y="112" fill="#9dd8df" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" letter-spacing="1.5">HUMAN WORK · GIT OUTPUT · AI AGENTS</text>
+    <g transform="translate(3 137)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15">
+      <rect width="330" height="31" rx="15.5" fill="#123344" stroke="#67e8f9" stroke-opacity=".25"/>
+      <circle cx="18" cy="15.5" r="5" fill="#86efac"/>
+      <text x="32" y="21" fill="#c9f6ec">local only · no transcript text</text>
+    </g>
+  </g>
+</svg>
