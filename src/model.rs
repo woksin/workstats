@@ -166,7 +166,7 @@ pub struct Summary {
     pub work_block_count: usize,
     pub human_signal_count: usize,
     pub prompt_signal_count: usize,
-    pub foreground_activity_signal_count: usize,
+    pub foreground_session_edge_signal_count: usize,
     pub commit_signal_count: usize,
     pub deduplicated_active_seconds: f64,
     pub attributed_active_seconds: f64,
@@ -219,6 +219,7 @@ pub struct ReportRow {
 #[derive(Debug, Serialize)]
 pub struct Inputs {
     pub git_root: String,
+    pub git_scan_roots: Vec<String>,
     pub history_sources: BTreeMap<String, Vec<String>>,
     pub included_providers: Vec<String>,
     pub excluded_providers: Vec<String>,

@@ -2,6 +2,13 @@
 
 All notable changes to `workstats` are documented here.
 
+## 0.6.1 — 2026-08-16
+
+- Stopped treating dense autonomous foreground transcript output as continuous human presence.
+- Replaced per-event activity signals with bounded foreground session start/end evidence.
+- Made repository-filtered runs infer locally available Git checkouts from matching AI sessions.
+- Added regression coverage for unattended agent output and Git roots outside `--dir`.
+
 ## 0.6.0 — 2026-08-15
 
 - Made the human-work estimate supervision-inclusive instead of prompt-only.

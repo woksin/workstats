@@ -9,7 +9,7 @@ mod progress;
 mod sources;
 mod timeutil;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -129,7 +129,7 @@ struct RecordedEvent {
     name = "workstats",
     version,
     about = "Measures local Git output and active AI-assisted work across supported CLIs, IDEs, and API event logs. Transcript text is never emitted and no network APIs are used.",
-    after_help = "Human work is a supervision-inclusive estimate from foreground agent activity, prompts, and authored commits, not a stopwatch. Local history is retention-dependent; work on other machines is not visible."
+    after_help = "Human work is a supervision-inclusive estimate from prompts, foreground session boundaries, and authored commits, not a stopwatch. Autonomous agent output does not imply continuous human presence."
 )]
 struct Arguments {
     #[command(subcommand)]
@@ -416,31 +416,6 @@ fn run(arguments: Arguments) -> Result<()> {
         }
     };
 
-    let mut commits = if arguments.no_git {
-        Vec::new()
-    } else {
-        progress.set("Scanning Git repositories");
-        read_git_commits(
-            &directory,
-            &author,
-            &mut resolver,
-            &mut diagnostics,
-            arguments.depth,
-            since,
-            until,
-            arguments
-                .repo
-                .as_deref()
-                .or(arguments.repo_exact.as_deref()),
-            &csv_globs(&arguments.path),
-            &csv_globs(&arguments.path_exclude),
-            arguments.no_ignore,
-        )
-    };
-    if let Some(exact) = &arguments.repo_exact {
-        commits.retain(|commit| exact_repo(&commit.repo, &commit.cwd, exact));
-    }
-
     let mut sessions = Vec::new();
     if !arguments.no_ai {
         for (provider, paths) in &history_paths {
@@ -514,6 +489,51 @@ fn run(arguments: Arguments) -> Result<()> {
         arguments.repo.as_deref(),
         arguments.repo_exact.as_deref(),
     );
+    let repo_filter = arguments
+        .repo
+        .as_deref()
+        .or(arguments.repo_exact.as_deref());
+    let mut git_scan_roots = Vec::new();
+    let mut commits = Vec::new();
+    if !arguments.no_git {
+        git_scan_roots.push(directory.clone());
+        if repo_filter.is_some() {
+            git_scan_roots.extend(inferred_repository_roots(&sessions));
+        }
+        let mut seen_roots = BTreeSet::new();
+        git_scan_roots
+            .retain(|root| seen_roots.insert(root.canonicalize().unwrap_or_else(|_| root.clone())));
+        let configured_root = directory
+            .canonicalize()
+            .unwrap_or_else(|_| directory.clone());
+        progress.set("Scanning Git repositories");
+        for root in &git_scan_roots {
+            let scan_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let depth = if scan_root == configured_root {
+                arguments.depth
+            } else {
+                0
+            };
+            commits.extend(read_git_commits(
+                root,
+                &author,
+                &mut resolver,
+                &mut diagnostics,
+                depth,
+                since,
+                until,
+                repo_filter,
+                &csv_globs(&arguments.path),
+                &csv_globs(&arguments.path_exclude),
+                arguments.no_ignore,
+            ));
+        }
+        let mut seen_commits = HashSet::new();
+        commits.retain(|commit| seen_commits.insert(commit.sha.clone()));
+        if let Some(exact) = &arguments.repo_exact {
+            commits.retain(|commit| exact_repo(&commit.repo, &commit.cwd, exact));
+        }
+    }
     progress.set("Estimating human involvement");
     let built = build_report(
         &sessions,
@@ -534,6 +554,10 @@ fn run(arguments: Arguments) -> Result<()> {
         diagnostics: diagnostics.clone(),
         inputs: Inputs {
             git_root: directory.to_string_lossy().into_owned(),
+            git_scan_roots: git_scan_roots
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
             history_sources: history_paths
                 .iter()
                 .map(|(provider, paths)| {
@@ -755,6 +779,20 @@ fn exact_repo(repo: &str, cwd: &str, exact: &str) -> bool {
             .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(exact))
 }
 
+fn inferred_repository_roots(sessions: &[Session]) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    for session in sessions {
+        let cwd = Path::new(&session.cwd);
+        if !cwd.is_dir() {
+            continue;
+        }
+        if let Some(root) = cwd.ancestors().find(|path| path.join(".git").exists()) {
+            roots.insert(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
+        }
+    }
+    roots.into_iter().collect()
+}
+
 fn csv_globs(values: &[String]) -> Vec<String> {
     values
         .iter()
@@ -788,6 +826,31 @@ mod tests {
         assert_eq!(
             vec!["src/**", "tests/**", "docs/**"],
             csv_globs(&["src/**, tests/**".into(), "docs/**".into()])
+        );
+    }
+
+    #[test]
+    fn repository_roots_are_inferred_from_session_working_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let repository = temporary.path().join("project");
+        let nested = repository.join("src/nested");
+        fs::create_dir_all(repository.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let session = Session {
+            provider: "test".into(),
+            session_id: "session".into(),
+            cwd: nested.to_string_lossy().into_owned(),
+            repo: "project".into(),
+            root: "tmp/scratch".into(),
+            points: Vec::new(),
+            exact_intervals: Vec::new(),
+            human_points: Vec::new(),
+            is_subagent: false,
+        };
+
+        assert_eq!(
+            vec![repository.canonicalize().unwrap()],
+            inferred_repository_roots(&[session])
         );
     }
 }

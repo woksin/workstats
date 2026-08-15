@@ -28,7 +28,7 @@ WORKSTATS  human involvement across local projects
 ══════════════════════════════════════════════════════════════════════════════
   Estimated human work    10h 24m
   Active work days         2
-  Work blocks              6  (1,248 foreground activity marks + 184 prompts + 31 commits)
+  Work blocks              6  (24 foreground session edges + 184 prompts + 31 commits)
   Git lines                +8,421 / -2,107
 
 AI activity  (context only — these are not human hours)
@@ -47,15 +47,15 @@ By repo
 ## The useful distinction
 
 Agent runtime is not automatically human work. Lines changed are not time. A
-session left open overnight is not automatically an eight-hour day. Foreground
-activity is, however, useful evidence that somebody may be planning, reviewing,
-waiting on, or supervising the agent.
+session left open overnight is not automatically an eight-hour day. Prompts and
+commits provide direct evidence; foreground session boundaries add bounded
+setup and review evidence without treating autonomous output as attendance.
 
 `workstats` keeps those ideas separate:
 
 | Signal | What it answers | How it is treated |
 |---|---|---|
-| **Human-work estimate** | “How much time was plausibly spent developing or supervising?” | Foreground agent activity, prompts, and authored commits form non-overlapping involvement blocks with setup/review credit. |
+| **Human-work estimate** | “How much time was plausibly spent developing or supervising?” | Prompts, foreground session boundaries, and authored commits form non-overlapping involvement blocks with setup/review credit. |
 | **Git output** | “What changed?” | Commits, files, additions, deletions, and ignored generated/vendor lines. |
 | **Agent wall clock** | “How long was any agent active?” | Overlapping agent intervals count once. |
 | **Parallel agent work** | “How much automation ran?” | Concurrent sessions are summed, so this can exceed wall time. |
@@ -161,7 +161,7 @@ workstats --period day --group-by root     # daily trend by source root
 workstats --since 2026-07 --until 2026-08  # inclusive local calendar bounds
 workstats --provider codex,gemini --group-by model
 workstats --exclude-provider copilot
-workstats --repo-exact my-project
+workstats --repo-exact my-project             # infer its checkout from matching AI sessions
 workstats --show-agent-work                # provider/model detail
 ```
 
@@ -263,11 +263,11 @@ runs parse only what changed.
 
 ## How the estimate works
 
-1. Structural activity from foreground AI sessions becomes an involvement
-   signal. This captures likely planning, code review, waiting, and babysitting
-   without reading prompt or response text.
-2. Foreground human prompts and authored Git commits add direct evidence. Meta
-   messages, sidechains, and subagent sessions do not add human time.
+1. Foreground human prompts and authored Git commits provide direct evidence of
+   involvement without reading prompt or response text.
+2. The start and end of each foreground session add bounded setup/follow-up
+   evidence. Internal assistant and tool events do not keep a human block alive;
+   meta messages, sidechains, and subagent sessions do not add human time.
 3. Signals no more than one hour apart form a work block. The intervening time
    counts because development often continues through reading, testing, review,
    and agent execution.
@@ -358,6 +358,10 @@ workstats --repo service --path 'src/**' --path-exclude '**/*.generated.*'
 
 `--repo PATTERN` is a broad case-insensitive substring filter.
 `--repo-exact NAME` avoids mixing names such as `api` and `api-tools`.
+When either filter matches retained AI sessions, `workstats` also scans their
+locally available Git checkouts—even when those checkouts are outside `--dir`.
+This keeps Git and AI results aligned without assuming a particular projects
+folder; `--dir` remains the primary Git discovery root.
 
 Source roots are customizable without exposing local paths in the repository:
 

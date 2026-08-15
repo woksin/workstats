@@ -52,7 +52,7 @@ pub struct BuiltReport {
 fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
     let mut signals = Vec::new();
     for session in sessions.iter().filter(|session| !session.is_subagent) {
-        let activity_kind = format!("{}_activity", session.provider);
+        let edge_kind = format!("{}_session_edge", session.provider);
         let prompt_kind = format!("{}_prompt", session.provider);
         let mut push = |timestamp: DateTime<Utc>, model: &str, kind: &str| {
             signals.push(HumanSignal {
@@ -66,15 +66,43 @@ fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
                 model: model.to_string(),
             });
         };
-        for point in &session.points {
-            push(point.timestamp, &point.model, &activity_kind);
-        }
-        for interval in &session.exact_intervals {
-            push(interval.start, &interval.model, &activity_kind);
-            push(interval.end, &interval.model, &activity_kind);
-        }
         for point in &session.human_points {
             push(point.timestamp, &point.model, &prompt_kind);
+        }
+
+        // Foreground transcript activity is mostly autonomous assistant/tool output. Treating
+        // every event as human presence can bridge an entire day while the developer is away.
+        // Session boundaries still provide useful upper-leaning setup/review evidence without
+        // turning dense model output into continuous human time.
+        let mut first: Option<(DateTime<Utc>, String)> = None;
+        let mut last: Option<(DateTime<Utc>, String)> = None;
+        let mut include_edge = |timestamp: DateTime<Utc>, model: &str| {
+            if first.as_ref().is_none_or(|(value, _)| timestamp < *value) {
+                first = Some((timestamp, model.to_string()));
+            }
+            if last.as_ref().is_none_or(|(value, _)| timestamp > *value) {
+                last = Some((timestamp, model.to_string()));
+            }
+        };
+        for point in &session.points {
+            include_edge(point.timestamp, &point.model);
+        }
+        for interval in &session.exact_intervals {
+            include_edge(interval.start, &interval.model);
+            include_edge(interval.end, &interval.model);
+        }
+        for point in &session.human_points {
+            include_edge(point.timestamp, &point.model);
+        }
+        if let Some((timestamp, model)) = &first {
+            push(*timestamp, model, &edge_kind);
+        }
+        if let Some((timestamp, model)) = &last
+            && first
+                .as_ref()
+                .is_none_or(|(first_timestamp, _)| timestamp != first_timestamp)
+        {
+            push(*timestamp, model, &edge_kind);
         }
     }
     signals
@@ -399,9 +427,9 @@ pub fn build_report(
         })
         .collect::<HashSet<_>>()
         .len();
-    let foreground_activity_signal_count = filtered_human_signals
+    let foreground_session_edge_signal_count = filtered_human_signals
         .iter()
-        .filter(|signal| signal.kind.ends_with("_activity"))
+        .filter(|signal| signal.kind.ends_with("_session_edge"))
         .map(|signal| {
             (
                 signal.timestamp,
@@ -426,10 +454,10 @@ pub fn build_report(
 
     BuiltReport {
         methodology: Methodology {
-            human_work: "foreground agent activity, human prompts, exact foreground interval edges, and authored commits clustered into non-overlapping involvement blocks",
+            human_work: "human prompts, foreground session boundaries, and authored commits clustered into non-overlapping involvement blocks",
             human_idle_threshold_seconds: duration_seconds(human_idle),
             review_credit_seconds: duration_seconds(review_credit),
-            human_estimate_caveat: "a supervision-inclusive estimate that includes likely setup, review, planning, and babysitting time; not stopwatch or attendance data",
+            human_estimate_caveat: "a supervision-inclusive estimate with bounded setup/review credit around foreground sessions; autonomous transcript output is not treated as continuous human presence",
             ai_time: "consecutive structural activity signals capped at the idle gap; exact intervals are merged when a source records them",
             deduplication: "headline time is the union of all AI intervals; grouped AI totals may overlap across parallel repos/providers",
             gap_cap_seconds: duration_seconds(gap_cap),
@@ -454,7 +482,7 @@ pub fn build_report(
                 .len(),
             human_signal_count: human_signal_keys.len(),
             prompt_signal_count,
-            foreground_activity_signal_count,
+            foreground_session_edge_signal_count,
             commit_signal_count,
             deduplicated_active_seconds: round3(union_seconds(&intervals)),
             attributed_active_seconds: round3(agent_seconds),
@@ -670,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_agent_activity_counts_as_human_involvement() {
+    fn foreground_session_edges_add_bounded_human_involvement() {
         let sessions = vec![session(
             "supervised",
             "repo",
@@ -688,8 +716,37 @@ mod tests {
             Duration::minutes(30),
         );
         assert_eq!(3600.0, report.summary.human_estimated_seconds);
-        assert_eq!(2, report.summary.foreground_activity_signal_count);
+        assert_eq!(2, report.summary.foreground_session_edge_signal_count);
         assert_eq!(0, report.summary.prompt_signal_count);
+    }
+
+    #[test]
+    fn dense_autonomous_activity_does_not_bridge_unattended_time() {
+        let sessions = vec![session(
+            "autonomous",
+            "repo",
+            vec![
+                point("2026-01-01T10:00:00Z"),
+                point("2026-01-01T10:30:00Z"),
+                point("2026-01-01T11:00:00Z"),
+                point("2026-01-01T11:30:00Z"),
+                point("2026-01-01T12:00:00Z"),
+            ],
+            vec![],
+        )];
+        let report = build_report(
+            &sessions,
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        assert_eq!(3600.0, report.summary.human_estimated_seconds);
+        assert_eq!(2, report.summary.foreground_session_edge_signal_count);
+        assert_eq!(2, report.summary.work_block_count);
     }
 
     #[test]
@@ -718,7 +775,7 @@ mod tests {
             Duration::minutes(30),
         );
         assert_eq!(3600.0, report.summary.human_estimated_seconds);
-        assert_eq!(2, report.summary.foreground_activity_signal_count);
+        assert_eq!(2, report.summary.foreground_session_edge_signal_count);
     }
 
     #[test]

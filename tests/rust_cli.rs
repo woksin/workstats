@@ -12,11 +12,15 @@ fn run(arguments: &[&str]) -> Output {
     Command::new(binary()).args(arguments).output().unwrap()
 }
 
+fn git(arguments: &[&str]) -> Output {
+    Command::new("git").args(arguments).output().unwrap()
+}
+
 #[test]
 fn native_cli_reports_version_and_rejects_conflicting_calendar_dimensions() {
     let version = run(&["--version"]);
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).contains("workstats 0.6.0"));
+    assert!(String::from_utf8_lossy(&version.stdout).contains("workstats 0.6.1"));
 
     let invalid = run(&["--no-ai", "--no-git", "--group-by", "day,month"]);
     assert_eq!(Some(2), invalid.status.code());
@@ -172,4 +176,89 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
     let report: Value = serde_json::from_slice(&report.stdout).unwrap();
     assert_eq!(1, report["summary"]["session_count"]);
     assert_eq!(1, report["summary"]["prompt_signal_count"]);
+}
+
+#[test]
+fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
+    let temporary = tempdir().unwrap();
+    let project = temporary.path().join("project");
+    let unrelated = temporary.path().join("unrelated");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    assert!(git(&["init", project.to_str().unwrap()]).status.success());
+    fs::write(project.join("README.md"), "fixture\n").unwrap();
+    assert!(
+        git(&["-C", project.to_str().unwrap(), "add", "README.md"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&[
+            "-C",
+            project.to_str().unwrap(),
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-m",
+            "fixture",
+        ])
+        .status
+        .success()
+    );
+
+    let events = temporary.path().join("events.jsonl");
+    let recorded = run(&[
+        "record",
+        "--provider",
+        "fixture",
+        "--session",
+        "outside-scan-root",
+        "--cwd",
+        project.to_str().unwrap(),
+        "--kind",
+        "prompt",
+        "--timestamp",
+        "2026-01-01T00:00:00Z",
+        "--output",
+        events.to_str().unwrap(),
+    ]);
+    assert!(recorded.status.success());
+
+    let output = run(&[
+        "--dir",
+        unrelated.to_str().unwrap(),
+        "--author",
+        "fixture@example.com",
+        "--repo-exact",
+        "project",
+        "--provider",
+        "fixture",
+        "--events",
+        events.to_str().unwrap(),
+        "--no-cache",
+        "--no-progress",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(1, report["summary"]["commit_count"]);
+    let expected_root = project
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        report["inputs"]["git_scan_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|root| root.as_str() == Some(&expected_root))
+    );
 }

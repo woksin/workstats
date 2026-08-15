@@ -83,9 +83,9 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         hours(summary.average_human_seconds_per_active_day)
     );
     println!(
-        "  Work blocks          {}  ({} foreground activity marks + {} prompts + {} commits)",
+        "  Work blocks          {}  ({} foreground session edges + {} prompts + {} commits)",
         number(summary.work_block_count),
-        number(summary.foreground_activity_signal_count),
+        number(summary.foreground_session_edge_signal_count),
         number(summary.prompt_signal_count),
         number(summary.commit_signal_count)
     );
@@ -204,12 +204,12 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
     println!();
     println!(
-        "Human estimate: foreground AI activity + prompts + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
+        "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
         compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
         compact_number(report.methodology.review_credit_seconds / 60.0)
     );
     println!(
-        "This supervision-inclusive estimate covers likely planning, review, waiting, and babysitting; it is not a timesheet."
+        "Session edges add bounded setup/review time; autonomous AI output does not imply continuous human presence."
     );
     println!(
         "AI wall removes overlap within each row; rows can overlap each other. Agent work sums parallel sessions."
