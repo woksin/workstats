@@ -124,7 +124,7 @@ jobs:
     needs: [verify, binaries]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
@@ -135,10 +135,14 @@ jobs:
           rm artifacts/*.sha256
           cat artifacts/SHA256SUMS
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            artifacts/*.tar.gz
-            artifacts/*.exe
-            artifacts/SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            artifacts/*.tar.gz \
+            artifacts/*.exe \
+            artifacts/SHA256SUMS \
+            --generate-notes \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME"
