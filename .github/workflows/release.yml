@@ -128,8 +128,11 @@ jobs:
             exit 1
           fi
 
+      # Not --locked: the stamp above just changed Cargo.toml's version without
+      # touching Cargo.lock's matching entry, and --locked refuses to build
+      # against a lock file that disagrees with the manifest.
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       # Checked rather than assumed: a cross-compiled binary that will not run
       # is worth finding here and not in an issue. The macOS x86_64 build is
