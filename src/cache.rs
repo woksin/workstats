@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::ai::{ParsedFile, file_time_range};
 
-const PARSER_VERSION: i64 = 1;
+const PARSER_VERSION: i64 = 2;
 
 type CacheRow = (
     i64,
@@ -158,6 +158,7 @@ impl TranscriptCache {
                 session.points.clear();
                 session.exact_intervals.clear();
                 session.human_points.clear();
+                session.token_events.clear();
             }
             return Ok(CacheLookup::Pruned(parsed));
         }
@@ -183,6 +184,7 @@ impl TranscriptCache {
             session.points.clear();
             session.exact_intervals.clear();
             session.human_points.clear();
+            session.token_events.clear();
         }
         let role_payload = serde_json::to_vec(&roles)?;
         let (minimum, maximum) = file_time_range(&parsed.sessions);
@@ -267,6 +269,7 @@ mod tests {
                 }],
                 exact_intervals: vec![],
                 human_points: vec![],
+                token_events: vec![],
                 is_subagent: true,
                 approximate_cwd: false,
                 version: None,

@@ -17,6 +17,50 @@ pub struct ExactInterval {
     pub model: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_tokens)
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_creation_tokens == 0
+    }
+}
+
+impl std::ops::AddAssign for TokenUsage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(other.cache_creation_tokens);
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TokenEvent {
+    pub timestamp: DateTime<Utc>,
+    pub model: String,
+    pub usage: TokenUsage,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawSession {
     pub provider: String,
@@ -26,6 +70,8 @@ pub struct RawSession {
     pub points: Vec<ActivityPoint>,
     pub exact_intervals: Vec<ExactInterval>,
     pub human_points: Vec<ActivityPoint>,
+    #[serde(default)]
+    pub token_events: Vec<TokenEvent>,
     pub is_subagent: bool,
     pub approximate_cwd: bool,
     pub version: Option<String>,
@@ -41,6 +87,7 @@ pub struct Session {
     pub points: Vec<ActivityPoint>,
     pub exact_intervals: Vec<ExactInterval>,
     pub human_points: Vec<ActivityPoint>,
+    pub token_events: Vec<TokenEvent>,
     pub is_subagent: bool,
 }
 
@@ -183,6 +230,13 @@ pub struct Summary {
     pub active_days: usize,
     pub provider_seconds: BTreeMap<String, f64>,
     pub model_seconds: BTreeMap<String, f64>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
+    pub provider_tokens: BTreeMap<String, u64>,
+    pub model_tokens: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +258,11 @@ pub struct ReportRow {
     pub ignored_additions: u64,
     pub ignored_deletions: u64,
     pub net_lines: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub total_tokens: u64,
     pub active_days: usize,
     pub human_active_days: usize,
     pub calendar_days: usize,

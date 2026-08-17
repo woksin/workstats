@@ -1,44 +1,77 @@
 name: Release
 
+# Cuts a release and attaches binaries for the platforms workstats supports.
+#
+# The version is not kept in the repository. It comes from the label on the
+# merged pull request — `major`, `minor` or `patch` — which the release step
+# turns into the next semantic version and a GitHub release. A merge carrying
+# none of those labels releases nothing, so this can run on every push without
+# a paths filter.
+#
+# Triggering on push rather than on the closed pull request is deliberate: a
+# pull request from a fork runs with a read-only token even when merged, and
+# creating a release would fail with a 403. A push to the default branch
+# always has a full-permission token, and the action finds the merged pull
+# request from the commit.
+#
+# A run with no merged pull request behind it — or one carrying none of those
+# labels — releases nothing. To force a version by hand, run this workflow
+# with an explicit `version`; left at the 0.0.0 placeholder it stays a no-op.
+
 on:
   push:
-    tags: ['v*']
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release. 0.0.0 means: work it out from the merged pull request."
+        required: true
+        default: "0.0.0"
+        type: string
+      release-notes:
+        description: "Release notes. Left empty, GitHub generates them."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
+
+# Releases are cumulative and must not overtake one another, so a run in
+# progress is allowed to finish rather than being cancelled by the next push.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  verify:
-    name: Verify release tag
+  release:
+    name: Work out the version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.release.outputs.should-publish }}
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+
     steps:
       - uses: actions/checkout@v7
-      - id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          if [[ "$GITHUB_REF_TYPE" != "tag" || "$tag" != v* ]]; then
-            echo 'Run this workflow from a v-prefixed tag, for example v0.5.0.' >&2
-            exit 1
-          fi
-          version="${tag#v}"
-          declared=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
-          [[ "$version" == "$declared" ]] || {
-            echo "Tag $tag does not match Cargo.toml version $declared" >&2
-            exit 1
-          }
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # The GitHub release is created by this action's post step, at the end
+      # of this job — so it exists by the time the binaries job starts and has
+      # something to upload to.
+      - name: Release
+        id: release
+        uses: cratis/release-action@v1
+        with:
+          version: ${{ github.event.inputs.version }}
+          release-notes: ${{ github.event.inputs.release-notes }}
 
   binaries:
     name: ${{ matrix.asset }}
-    needs: verify
+    if: needs.release.outputs.publish == 'true'
+    needs: [release]
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -78,19 +111,45 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      # The version lives in the release, not in the repository, so it is
+      # stamped in here rather than committed — the same shape as passing
+      # -p:Version= to a dotnet publish. Without this every downloaded binary
+      # would report the placeholder in Cargo.toml when asked --version.
+      - name: Stamp the version
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          # No /g: only the package's own version, never a dependency's.
+          perl -0pi -e "s/^version = \"[^\"]*\"/version = \"$VERSION\"/m" Cargo.toml
+          stamped="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [[ "$stamped" != "$VERSION" ]]; then
+            echo "Cargo.toml still says $stamped, expected $VERSION" >&2
+            exit 1
+          fi
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # Checked rather than assumed: a cross-compiled binary that will not run
+      # is worth finding here and not in an issue. The macOS x86_64 build is
+      # the one case that cannot be checked, since the runner is arm64.
       - name: Check executable
         if: matrix.target != 'x86_64-apple-darwin'
         env:
-          VERSION: ${{ needs.verify.outputs.version }}
+          VERSION: ${{ needs.release.outputs.version }}
           EXECUTABLE: target/${{ matrix.target }}/release/workstats${{ matrix.exe }}
         run: |
+          set -euo pipefail
           reported=$("./$EXECUTABLE" --version | tr -d '\r')
           echo "$reported"
           [[ "$reported" == "workstats $VERSION" ]]
 
+      # Named for the machine rather than for the Rust target triple that built
+      # it, and the version is deliberately not in the file name either: it
+      # makes `releases/latest/download/workstats-<platform>.tar.gz` a stable
+      # URL. Which version a tarball holds is on the release it hangs off, and
+      # in `workstats --version`.
       - name: Package
         env:
           BUILT: target/${{ matrix.target }}/release/workstats${{ matrix.exe }}
@@ -119,9 +178,10 @@ jobs:
             workstats-*.exe
             workstats-*.sha256
 
-  publish:
-    name: Publish GitHub release
-    needs: [verify, binaries]
+  attach:
+    name: Attach binaries to the release
+    if: needs.release.outputs.publish == 'true'
+    needs: [release, binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
@@ -131,19 +191,137 @@ jobs:
 
       - name: Collect checksums
         run: |
+          set -euo pipefail
           cat artifacts/*.sha256 > artifacts/SHA256SUMS
           rm artifacts/*.sha256
           cat artifacts/SHA256SUMS
 
-      - name: Publish release
+      # The release itself already exists (created by cratis/release-action's
+      # post step in the `release` job), so this uploads assets to it rather
+      # than creating a new one. --clobber makes re-running this job safe.
+      - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          set -euo pipefail
+          gh release upload "${{ needs.release.outputs.tag }}" \
             artifacts/*.tar.gz \
             artifacts/*.exe \
             artifacts/SHA256SUMS \
-            --generate-notes \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME"
+            --clobber
+
+  homebrew:
+    name: Update the Homebrew tap
+    if: needs.release.outputs.publish == 'true'
+    needs: [release, attach]
+    runs-on: ubuntu-latest
+
+    # A deploy key rather than a personal access token: it grants write to the
+    # tap repository and to nothing else, so the worst a leak can do is publish
+    # a bad formula. A PAT would carry every repository the account can reach.
+    env:
+      TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      TAP_REPO: woksin/homebrew-workstats
+      VERSION: ${{ needs.release.outputs.version }}
+      TAG: ${{ needs.release.outputs.tag }}
+
+    steps:
+      # The tap is optional. Cutting a release before it is set up should
+      # publish the binaries and say the tap was skipped, not fail the release
+      # and leave the assets looking broken.
+      - name: Is the tap configured?
+        id: guard
+        run: |
+          if [ -z "${TAP_KEY:-}" ]; then
+            echo "No HOMEBREW_TAP_DEPLOY_KEY secret — skipping the tap." >> "$GITHUB_STEP_SUMMARY"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download artifacts
+        if: steps.guard.outputs.configured == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: Write the formula
+        if: steps.guard.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          sha() { shasum -a 256 "./artifacts/workstats-$1.tar.gz" | cut -d' ' -f1; }
+          base="https://github.com/woksin/workstats/releases/download/${TAG}"
+
+          mkdir -p out
+          cat > out/workstats.rb <<RUBY
+          # Generated by the release workflow in woksin/workstats. Do not edit by hand.
+          class Workstats < Formula
+            desc "See where the work happened, without sending your work anywhere"
+            homepage "https://github.com/woksin/workstats"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "${base}/workstats-macos-arm64.tar.gz"
+                sha256 "$(sha macos-arm64)"
+              end
+              on_intel do
+                url "${base}/workstats-macos-x86_64.tar.gz"
+                sha256 "$(sha macos-x86_64)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/workstats-linux-arm64.tar.gz"
+                sha256 "$(sha linux-arm64)"
+              end
+              on_intel do
+                url "${base}/workstats-linux-x86_64.tar.gz"
+                sha256 "$(sha linux-x86_64)"
+              end
+            end
+
+            def install
+              bin.install "workstats"
+              bin.install_symlink "workstats" => "gitstats"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/workstats --version")
+            end
+          end
+          RUBY
+          cat out/workstats.rb
+
+      - name: Push it to the tap
+        if: steps.guard.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$TAP_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+
+          git clone --depth 1 "git@github.com:${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp out/workstats.rb tap/Formula/workstats.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Staged first, then compared against HEAD. `git diff` alone does not
+          # see a file that does not exist yet, so the very first formula would
+          # look like "no change" and never be pushed.
+          git add Formula/workstats.rb
+          if git diff --cached --quiet; then
+            echo "Formula already at ${VERSION}, nothing to push."
+            exit 0
+          fi
+          git commit -m "workstats ${VERSION}"
+          git push

@@ -5,6 +5,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::model::{
     GitCommit, HumanSignal, Interval, Methodology, Observed, ReportRow, Session, Summary,
+    TokenUsage,
 };
 use crate::timeutil::{
     build_human_intervals, build_session_intervals, calendar_days, clip_interval, local_date,
@@ -36,6 +37,7 @@ struct Bucket {
     deletions: u64,
     ignored_additions: u64,
     ignored_deletions: u64,
+    tokens: TokenUsage,
     first_seen: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
     active_days: HashSet<String>,
@@ -129,6 +131,24 @@ pub fn build_report(
         .filter(|commit| {
             since.is_none_or(|bound| commit.timestamp >= bound)
                 && until.is_none_or(|bound| commit.timestamp < bound)
+        })
+        .collect();
+    let filtered_tokens: Vec<_> = sessions
+        .iter()
+        .flat_map(|session| {
+            session.token_events.iter().map(move |event| TokenRecord {
+                timestamp: event.timestamp,
+                repo: session.repo.clone(),
+                root: session.root.clone(),
+                cwd: session.cwd.clone(),
+                provider: session.provider.clone(),
+                model: event.model.clone(),
+                usage: event.usage,
+            })
+        })
+        .filter(|token| {
+            since.is_none_or(|bound| token.timestamp >= bound)
+                && until.is_none_or(|bound| token.timestamp < bound)
         })
         .collect();
     let mut human_signals = foreground_human_signals(sessions);
@@ -271,6 +291,17 @@ pub fn build_report(
         include_time(row, commit.timestamp, commit.timestamp);
     }
 
+    for token in &filtered_tokens {
+        let key = dimensions
+            .iter()
+            .map(|dimension| safe_value(&token_value(token, dimension)))
+            .collect();
+        let row = bucket(&mut buckets, key, dimensions);
+        row.tokens += token.usage;
+        row.active_days.insert(local_date(token.timestamp));
+        include_time(row, token.timestamp, token.timestamp);
+    }
+
     let mut rows: Vec<_> = buckets
         .into_values()
         .map(|row| {
@@ -294,6 +325,11 @@ pub fn build_report(
                 ignored_additions: row.ignored_additions,
                 ignored_deletions: row.ignored_deletions,
                 net_lines: row.additions as i64 - row.deletions as i64,
+                input_tokens: row.tokens.input_tokens,
+                output_tokens: row.tokens.output_tokens,
+                cache_read_tokens: row.tokens.cache_read_tokens,
+                cache_creation_tokens: row.tokens.cache_creation_tokens,
+                total_tokens: row.tokens.total(),
                 active_days,
                 human_active_days: row.human_days.len(),
                 calendar_days: days,
@@ -393,6 +429,14 @@ pub fn build_report(
     }
     for value in model_seconds.values_mut() {
         *value = round3(*value);
+    }
+    let mut provider_tokens: BTreeMap<String, u64> = BTreeMap::new();
+    let mut model_tokens: BTreeMap<String, u64> = BTreeMap::new();
+    let mut total_tokens = TokenUsage::default();
+    for token in &filtered_tokens {
+        *provider_tokens.entry(token.provider.clone()).or_default() += token.usage.total();
+        *model_tokens.entry(token.model.clone()).or_default() += token.usage.total();
+        total_tokens += token.usage;
     }
     let human_seconds: f64 = human_intervals.iter().map(Interval::seconds).sum();
     let agent_seconds: f64 = intervals.iter().map(Interval::seconds).sum();
@@ -505,6 +549,13 @@ pub fn build_report(
             active_days: active_dates.len(),
             provider_seconds,
             model_seconds,
+            input_tokens: total_tokens.input_tokens,
+            output_tokens: total_tokens.output_tokens,
+            cache_read_tokens: total_tokens.cache_read_tokens,
+            cache_creation_tokens: total_tokens.cache_creation_tokens,
+            total_tokens: total_tokens.total(),
+            provider_tokens,
+            model_tokens,
         },
         group_by: dimensions.to_vec(),
         rows,
@@ -592,6 +643,29 @@ fn commit_value(commit: &GitCommit, dimension: &str) -> String {
     }
 }
 
+struct TokenRecord {
+    timestamp: DateTime<Utc>,
+    repo: String,
+    root: String,
+    cwd: String,
+    provider: String,
+    model: String,
+    usage: TokenUsage,
+}
+
+fn token_value(token: &TokenRecord, dimension: &str) -> String {
+    match dimension {
+        "repo" => token.repo.clone(),
+        "root" => token.root.clone(),
+        "cwd" => token.cwd.clone(),
+        "provider" => token.provider.clone(),
+        "model" => token.model.clone(),
+        "day" => local_date(token.timestamp),
+        "month" => local_month(token.timestamp),
+        _ => String::new(),
+    }
+}
+
 fn include_time(row: &mut Bucket, first: DateTime<Utc>, last: DateTime<Utc>) {
     row.first_seen = Some(row.first_seen.map_or(first, |value| value.min(first)));
     row.last_seen = Some(row.last_seen.map_or(last, |value| value.max(last)));
@@ -631,7 +705,7 @@ fn iso(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ActivityPoint, ExactInterval};
+    use crate::model::{ActivityPoint, ExactInterval, TokenEvent};
     use crate::timeutil::parse_timestamp;
 
     fn session(
@@ -649,6 +723,7 @@ mod tests {
             points,
             exact_intervals: vec![],
             human_points: human,
+            token_events: vec![],
             is_subagent: false,
         }
     }
@@ -843,5 +918,55 @@ mod tests {
             Some(&"2026-05".to_string()),
             report.rows[0].key.get("month")
         );
+    }
+
+    #[test]
+    fn token_usage_is_grouped_by_repo_and_totaled_in_the_summary() {
+        let mut a = session("a", "repo-a", vec![point("2026-01-01T10:00:00Z")], vec![]);
+        a.token_events.push(TokenEvent {
+            timestamp: parse_timestamp("2026-01-01T10:00:00Z").unwrap(),
+            model: "gpt".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_read_tokens: 5,
+                cache_creation_tokens: 1,
+            },
+        });
+        let mut b = session("b", "repo-b", vec![point("2026-01-01T11:00:00Z")], vec![]);
+        b.token_events.push(TokenEvent {
+            timestamp: parse_timestamp("2026-01-01T11:00:00Z").unwrap(),
+            model: "gpt".into(),
+            usage: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 10,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+        });
+        let report = build_report(
+            &[a, b],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+        assert_eq!(186, report.summary.total_tokens);
+        assert_eq!(186, *report.summary.provider_tokens.get("codex").unwrap());
+        let repo_a = report
+            .rows
+            .iter()
+            .find(|row| row.key.get("repo") == Some(&"repo-a".to_string()))
+            .unwrap();
+        assert_eq!(126, repo_a.total_tokens);
+        let repo_b = report
+            .rows
+            .iter()
+            .find(|row| row.key.get("repo") == Some(&"repo-b".to_string()))
+            .unwrap();
+        assert_eq!(60, repo_b.total_tokens);
     }
 }

@@ -35,13 +35,14 @@ AI activity  (context only — these are not human hours)
   Agent wall clock         11h 18m  (overlap removed)
   Parallel agent work      37h 06m  (3.3× concurrency)
   Sessions                 74  (12 foreground, 62 subagents)
+  Tokens                   18.4M  (2.1M in, 640.3k out, 15.7M cached)
 
 By repo
-  Work area                         Human  Days   Avg/day  Commits   AI wall
-  ───────────────────────────────────────────────────────────────────────────
-  api                               5h 50m     2    2h 55m       18    6h 20m
-  web                               3h 39m     2    1h 49m       11    4h 14m
-  cli                               0h 55m     1    0h 55m        2    0h 44m
+  Work area                         Human  Days   Avg/day  Commits   AI wall    Tokens
+  ─────────────────────────────────────────────────────────────────────────────────────
+  api                               5h 50m     2    2h 55m       18    6h 20m     9.8M
+  web                               3h 39m     2    1h 49m       11    4h 14m     6.1M
+  cli                               0h 55m     1    0h 55m        2    0h 44m     2.5M
 ```
 
 ## The useful distinction
@@ -59,6 +60,7 @@ setup and review evidence without treating autonomous output as attendance.
 | **Git output** | “What changed?” | Commits, files, additions, deletions, and ignored generated/vendor lines. |
 | **Agent wall clock** | “How long was any agent active?” | Overlapping agent intervals count once. |
 | **Parallel agent work** | “How much automation ran?” | Concurrent sessions are summed, so this can exceed wall time. |
+| **AI tokens** | “How many tokens did agents use?” | Input, output, cache-read, and cache-creation counts read from local transcripts; not an intervaled/deduplicated metric like wall clock, so grouped totals just sum. |
 
 That makes the dashboard useful without pretending it is a stopwatch, an
 attendance system, or a universal productivity score.
@@ -91,7 +93,16 @@ optional.
 No Rust toolchain is required. Every release includes a `SHA256SUMS` file.
 
 <table>
-<tr><td width="145"><b>macOS</b></td><td>
+<tr><td width="145"><b>Homebrew</b><br><sub>macOS · Linux</sub></td><td>
+
+```bash
+brew tap woksin/workstats
+brew trust woksin/workstats   # Homebrew 6 gates third-party taps
+brew install workstats
+```
+
+</td></tr>
+<tr><td><b>macOS</b></td><td>
 
 ```bash
 # Apple silicon
@@ -149,6 +160,40 @@ explicit, and install the backward-compatible `gitstats` alias too.
 # Windows PowerShell
 ./install.ps1
 ```
+
+## Updating
+
+`workstats` never phones home on a normal run. Checking for or installing a
+new version only ever happens when you ask for it:
+
+```bash
+workstats update            # check, download, verify, and install a newer release
+workstats update --check    # only report whether a newer version exists
+```
+
+`workstats update` fetches the latest release from GitHub, verifies the
+downloaded binary against the release's published `SHA256SUMS`, and replaces
+the running executable in place. It refuses to run if no prebuilt binary is
+published for your platform.
+
+If you'd like a passive reminder instead of running the command yourself, opt
+into a throttled (at most once every 24 hours) background check that prints a
+one-line footer on normal runs when a newer version is known:
+
+```bash
+workstats --check-updates                  # opt in for this run
+WORKSTATS_CHECK_UPDATES=1 workstats         # opt in via environment
+```
+
+```json
+{"check_updates": true}
+```
+
+in the [config file](#inputs-and-index) opts in permanently. `--no-update-check`
+or `WORKSTATS_NO_UPDATE_CHECK=1` suppresses both the background check and the
+footer for a single run, regardless of how it was enabled. Every check is a
+plain HTTPS request to GitHub's public release API—no other data leaves the
+machine, and nothing is ever installed without `workstats update`.
 
 ## Start here
 
@@ -290,10 +335,11 @@ payroll data.
 
 ## Privacy boundary
 
-`workstats` is local-only:
+`workstats` is local-only by default:
 
-- no network API calls;
-- no telemetry or update checks;
+- no network calls and no telemetry, unless you explicitly run `workstats
+  update` or opt into `--check-updates` (see [Updating](#updating));
+- no credential discovery and no attempt to sign in to providers;
 - no prompt or response bodies in reports or the cache;
 - Codex and OpenCode SQLite databases are opened read-only;
 - known credential files such as `auth.json`, `secrets.json`, `.env`, and key
@@ -302,9 +348,9 @@ payroll data.
 - CSV cells are neutralized against spreadsheet formula injection.
 
 The cache contains the structural fields needed for reports: timestamps,
-working directories, session identifiers, model names, roles, and derived
-intervals. JSON/CSV output can contain repository names and paths—review a
-report before sharing it.
+working directories, session identifiers, model names, roles, derived
+intervals, and token usage counts. JSON/CSV output can contain repository
+names and paths—review a report before sharing it.
 
 See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
@@ -339,11 +385,20 @@ workstats --cache /safe/path.db # choose another index
 ```
 
 `WORKSTATS_CACHE`, `WORKSTATS_CONFIG`, `WORKSTATS_EVENTS`, and `WORKSTATS_GIT`
-provide explicit overrides.
+provide explicit overrides. When [update checks](#updating) are opted into, the
+last known result is cached next to the index as `update-check.json`
+(`WORKSTATS_UPDATE_CACHE` overrides its path); it contains only a version
+string and a timestamp.
 
 Copilot CLI and OpenCode are marked best-effort because their vendors may evolve
 the internal event/database schema. The readers check tables and fields before
 querying, stay read-only, and degrade to diagnostics instead of guessing.
+
+Token usage (input, output, cache-read, cache-creation) is read from Claude
+Code and Codex transcripts directly and from Copilot's end-of-session summary.
+Gemini CLI and OpenCode token counts are best-effort and may read as zero if
+the locally installed version doesn't expose per-turn usage fields; this never
+affects the time-based metrics.
 
 ## Grouping and filtering
 
@@ -398,9 +453,14 @@ cargo build --release --locked
 
 The repository, installers, tests, and release artifacts are Rust-only.
 
-A `v<version>` tag matching `Cargo.toml` triggers the release workflow. It builds
-six native artifacts, executes every runnable binary, generates SHA-256
-checksums, and publishes a GitHub release without repository secrets.
+Versions are not set by hand. A merged pull request labelled `major`, `minor`,
+or `patch` decides the next one; a merge carrying none of those labels
+releases nothing. [`cratis/release-action`](https://github.com/Cratis/release-action)
+works out the version and cuts the GitHub release, then the release workflow
+builds six native artifacts from it, executes every runnable binary, generates
+SHA-256 checksums, and attaches them—no repository secrets required for the
+binaries. A configured `HOMEBREW_TAP_DEPLOY_KEY` additionally publishes the
+release to a Homebrew tap; it is skipped gracefully when absent.
 
 ## License
 

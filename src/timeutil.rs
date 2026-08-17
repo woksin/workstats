@@ -427,6 +427,7 @@ mod tests {
             points,
             exact_intervals: vec![],
             human_points: vec![],
+            token_events: vec![],
             is_subagent: false,
         }
     }

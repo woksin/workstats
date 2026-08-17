@@ -1,6 +1,38 @@
 # Changelog
 
-All notable changes to `workstats` are documented here.
+Notable changes, newest first. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+Versions are not set by hand. A merged pull request labelled `major`, `minor`
+or `patch` decides the next one, and the
+[release workflow](.github/workflows/release.yml) cuts the release from it —
+so the tag, the GitHub release, and the binaries all come from that label.
+This file is the readable summary of what changed; the release notes on each
+tag are the generated list of pull requests.
+
+## [Unreleased]
+
+### Added
+
+- Token usage tracking (input, output, cache-read, cache-creation) for Claude
+  Code, Codex, GitHub Copilot CLI, and Gemini CLI, grouped by the existing
+  `root`, `repo`, `cwd`, `provider`, `model`, `day`, and `month` dimensions. A
+  `Tokens` summary line, table column, and `--raw` provider/model breakdown,
+  plus token fields in JSON and CSV output.
+- `workstats update` and `workstats update --check` to explicitly check for
+  and install newer releases from GitHub, verifying the download against the
+  release's published `SHA256SUMS` before replacing the running binary.
+- An opt-in, throttled (~daily) background update check with a one-line
+  footer notice (`--check-updates`, `WORKSTATS_CHECK_UPDATES`, or
+  `check_updates` in the config file; suppressible with `--no-update-check` /
+  `WORKSTATS_NO_UPDATE_CHECK`). Normal runs remain fully local unless
+  explicitly opted in.
+
+### Changed
+
+- Releases are now cut automatically from a merged pull request's `major` /
+  `minor` / `patch` label instead of a manually pushed `v*` tag, and publish a
+  Homebrew formula alongside the binaries.
 
 ## 0.6.1 — 2026-08-16
 
