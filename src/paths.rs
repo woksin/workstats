@@ -57,6 +57,8 @@ fn normalize_backreferences(value: &str) -> String {
 pub struct Config {
     #[serde(default)]
     pub source_roots: Vec<ConfigRule>,
+    #[serde(default)]
+    pub check_updates: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +220,7 @@ impl PathResolver {
             points: raw.points,
             exact_intervals: raw.exact_intervals,
             human_points: raw.human_points,
+            token_events: raw.token_events,
             is_subagent: raw.is_subagent,
         }
     }
@@ -266,6 +269,16 @@ pub fn default_cache_path() -> PathBuf {
         return PathBuf::from(path).join("workstats/cache/index.sqlite3");
     }
     home_dir().join(".cache/workstats/index.sqlite3")
+}
+
+pub fn default_update_check_path() -> PathBuf {
+    if let Some(path) = env::var_os("WORKSTATS_UPDATE_CACHE") {
+        return PathBuf::from(path);
+    }
+    default_cache_path()
+        .parent()
+        .map(|parent| parent.join("update-check.json"))
+        .unwrap_or_else(|| home_dir().join(".cache/workstats/update-check.json"))
 }
 
 pub fn lossy_claude_cwd(project_dir: &Path) -> String {

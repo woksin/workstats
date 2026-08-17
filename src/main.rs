@@ -8,6 +8,7 @@ mod paths;
 mod progress;
 mod sources;
 mod timeutil;
+mod update;
 
 use std::collections::{BTreeSet, HashSet};
 use std::env;
@@ -29,7 +30,9 @@ use cache::TranscriptCache;
 use git::{default_git_author, read_git_commits};
 use model::{Diagnostics, Inputs, Report, Session};
 use output::{print_csv, print_json, print_table};
-use paths::{PathResolver, configured_rules, default_cache_path, load_config};
+use paths::{
+    PathResolver, configured_rules, default_cache_path, default_update_check_path, load_config,
+};
 use progress::Progress;
 use sources::{
     default_codex_database, default_events_path, default_history_paths, normalize_provider,
@@ -65,12 +68,23 @@ enum Command {
     /// Append one content-free event for a CLI, IDE, script, or API wrapper
     #[command(visible_alias = "event")]
     Record(Box<RecordArguments>),
+    /// Check for and install a newer workstats release from GitHub
+    Update(UpdateArguments),
 }
 
 #[derive(Debug, Args)]
 struct SourcesArguments {
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
     output_format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct UpdateArguments {
+    #[arg(
+        long,
+        help = "Report whether a newer version exists without installing it"
+    )]
+    check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -128,7 +142,7 @@ struct RecordedEvent {
 #[command(
     name = "workstats",
     version,
-    about = "Measures local Git output and active AI-assisted work across supported CLIs, IDEs, and API event logs. Transcript text is never emitted and no network APIs are used.",
+    about = "Measures local Git output and active AI-assisted work across supported CLIs, IDEs, and API event logs. Transcript text is never emitted and no network calls are made unless you run `workstats update` or opt into --check-updates.",
     after_help = "Human work is a supervision-inclusive estimate from prompts, foreground session boundaries, and authored commits, not a stopwatch. Autonomous agent output does not imply continuous human presence."
 )]
 struct Arguments {
@@ -251,6 +265,16 @@ struct Arguments {
         help = "Show detailed parallel agent/model activity"
     )]
     raw: bool,
+    #[arg(
+        long,
+        help = "Opt in to a throttled (~daily) background check for newer releases; shown as a footer notice, never installed automatically"
+    )]
+    check_updates: bool,
+    #[arg(
+        long,
+        help = "Suppress the update-available footer and background check for this run"
+    )]
+    no_update_check: bool,
 }
 
 fn main() {
@@ -266,6 +290,7 @@ fn main() {
     let result = match arguments.command.as_ref() {
         Some(Command::Sources(command)) => print_sources(command),
         Some(Command::Record(command)) => record_event(command),
+        Some(Command::Update(command)) => run_update_command(command),
         None => run(arguments),
     };
     if let Err(error) = result {
@@ -396,6 +421,13 @@ fn run(arguments: Arguments) -> Result<()> {
     }
     let mut diagnostics = Diagnostics::default();
     let config = load_config(arguments.config.as_deref(), &mut diagnostics);
+    let check_updates_configured = config.check_updates.unwrap_or(false);
+    let update_check_suppressed =
+        arguments.no_update_check || env::var_os("WORKSTATS_NO_UPDATE_CHECK").is_some();
+    let update_check_opt_in = !update_check_suppressed
+        && (arguments.check_updates
+            || env::var_os("WORKSTATS_CHECK_UPDATES").is_some()
+            || check_updates_configured);
     let rules = configured_rules(config, &arguments.source_rule)?;
     let mut resolver = PathResolver::new(rules);
     let cache_path = arguments.cache.clone().unwrap_or_else(default_cache_path);
@@ -606,7 +638,17 @@ fn run(arguments: Arguments) -> Result<()> {
     match arguments.output_format {
         OutputFormat::Json => print_json(&report)?,
         OutputFormat::Csv => print_csv(&report)?,
-        OutputFormat::Table => print_table(&report, &diagnostics, arguments.top, arguments.raw),
+        OutputFormat::Table => {
+            print_table(&report, &diagnostics, arguments.top, arguments.raw);
+            let update_notice =
+                update::maybe_check_for_update(&default_update_check_path(), update_check_opt_in);
+            if let Some(latest) = update_notice {
+                println!(
+                    "\nworkstats {latest} is available (you have {}) — run `workstats update`.",
+                    update::current_version()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -630,6 +672,33 @@ fn valid_provider_identifier(provider: &str, allow_all: bool) -> bool {
         && provider
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-'))
+}
+
+fn run_update_command(arguments: &UpdateArguments) -> Result<()> {
+    let cache_path = default_update_check_path();
+    println!("Current version: workstats {}", update::current_version());
+    if arguments.check {
+        let outcome = update::check_now(&cache_path)?;
+        if outcome.available {
+            println!(
+                "A new version is available: workstats {}  (run `workstats update` to install it)",
+                outcome.latest
+            );
+        } else {
+            println!("workstats is up to date.");
+        }
+        return Ok(());
+    }
+    let outcome = update::install_latest(&cache_path)?;
+    if outcome.available {
+        println!(
+            "Updated workstats {} → {}. Restart to use the new version.",
+            outcome.current, outcome.latest
+        );
+    } else {
+        println!("workstats is already up to date.");
+    }
+    Ok(())
 }
 
 fn print_sources(arguments: &SourcesArguments) -> Result<()> {
@@ -845,6 +914,7 @@ mod tests {
             points: Vec::new(),
             exact_intervals: Vec::new(),
             human_points: Vec::new(),
+            token_events: Vec::new(),
             is_subagent: false,
         };
 

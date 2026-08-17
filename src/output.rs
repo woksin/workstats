@@ -36,6 +36,11 @@ pub fn print_csv(report: &Report) -> Result<()> {
             "ignored_additions",
             "ignored_deletions",
             "net_lines",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_creation_tokens",
+            "total_tokens",
             "active_days",
             "calendar_days",
             "average_active_seconds_per_active_day",
@@ -133,6 +138,15 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             number(summary.foreground_session_count),
             number(summary.subagent_session_count)
         );
+        if summary.total_tokens != 0 {
+            println!(
+                "  Tokens                {}  ({} in, {} out, {} cached)",
+                compact_tokens(summary.total_tokens),
+                compact_tokens(summary.input_tokens),
+                compact_tokens(summary.output_tokens),
+                compact_tokens(summary.cache_read_tokens + summary.cache_creation_tokens)
+            );
+        }
         println!();
         if raw {
             println!("Parallel agent work by provider / model  (may overlap)");
@@ -145,16 +159,37 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                 println!("    {model:<34} {:>10}", hours(*seconds));
             }
             println!();
+            if summary.total_tokens != 0 {
+                println!("Tokens by provider / model");
+                for (provider, tokens) in &summary.provider_tokens {
+                    println!("  {provider:<24} {:>10}", compact_tokens(*tokens));
+                }
+                let mut model_tokens: Vec<_> = summary.model_tokens.iter().collect();
+                model_tokens.sort_by(|left, right| right.1.cmp(left.1));
+                for (model, tokens) in model_tokens.into_iter().take(12) {
+                    println!("    {model:<34} {:>10}", compact_tokens(*tokens));
+                }
+                println!();
+            }
         }
     }
 
+    let show_tokens = report.rows.iter().any(|row| row.total_tokens != 0);
     let title = report.group_by.join(" × ");
     println!("By {title}  (human involvement first; AI wall clock shown as context)");
-    println!(
-        "  {:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10}",
-        "Work area", "Human", "Days", "Avg/day", "Commits", "AI wall", "Agent work"
-    );
-    println!("  {}", "─".repeat(96));
+    if show_tokens {
+        println!(
+            "  {:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10} {:>9}",
+            "Work area", "Human", "Days", "Avg/day", "Commits", "AI wall", "Agent work", "Tokens"
+        );
+        println!("  {}", "─".repeat(106));
+    } else {
+        println!(
+            "  {:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10}",
+            "Work area", "Human", "Days", "Avg/day", "Commits", "AI wall", "Agent work"
+        );
+        println!("  {}", "─".repeat(96));
+    }
     let rows = if top == 0 {
         &report.rows[..]
     } else {
@@ -173,15 +208,28 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                 .collect();
             label = format!("…{suffix}");
         }
-        println!(
-            "  {label:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10}",
-            hours(row.human_estimated_seconds),
-            number(row.human_active_days),
-            hours(row.average_human_seconds_per_active_day),
-            number(row.commit_count),
-            hours(row.ai_wall_seconds),
-            hours(row.parallel_agent_seconds),
-        );
+        if show_tokens {
+            println!(
+                "  {label:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10} {:>9}",
+                hours(row.human_estimated_seconds),
+                number(row.human_active_days),
+                hours(row.average_human_seconds_per_active_day),
+                number(row.commit_count),
+                hours(row.ai_wall_seconds),
+                hours(row.parallel_agent_seconds),
+                compact_tokens(row.total_tokens),
+            );
+        } else {
+            println!(
+                "  {label:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10}",
+                hours(row.human_estimated_seconds),
+                number(row.human_active_days),
+                hours(row.average_human_seconds_per_active_day),
+                number(row.commit_count),
+                hours(row.ai_wall_seconds),
+                hours(row.parallel_agent_seconds),
+            );
+        }
     }
     if top != 0 && report.rows.len() > top {
         println!("  … {} more rows; use --top 0", report.rows.len() - top);
@@ -257,6 +305,11 @@ fn row_field(row: &ReportRow, name: &str) -> String {
         "ignored_additions" => row.ignored_additions.to_string(),
         "ignored_deletions" => row.ignored_deletions.to_string(),
         "net_lines" => row.net_lines.to_string(),
+        "input_tokens" => row.input_tokens.to_string(),
+        "output_tokens" => row.output_tokens.to_string(),
+        "cache_read_tokens" => row.cache_read_tokens.to_string(),
+        "cache_creation_tokens" => row.cache_creation_tokens.to_string(),
+        "total_tokens" => row.total_tokens.to_string(),
         "active_days" => row.active_days.to_string(),
         "calendar_days" => row.calendar_days.to_string(),
         "average_active_seconds_per_active_day" => value(row.average_active_seconds_per_active_day),
@@ -322,6 +375,19 @@ fn local_date(value: &str) -> String {
 fn hours(seconds: f64) -> String {
     let rounded = seconds.round().max(0.0) as u64;
     format!("{}h {:02}m", rounded / 3600, rounded % 3600 / 60)
+}
+
+fn compact_tokens(value: u64) -> String {
+    let value = value as f64;
+    if value < 1000.0 {
+        format!("{value:.0}")
+    } else if value < 1_000_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else if value < 1_000_000_000.0 {
+        format!("{:.1}M", value / 1_000_000.0)
+    } else {
+        format!("{:.1}B", value / 1_000_000_000.0)
+    }
 }
 
 fn number(value: impl ToString) -> String {

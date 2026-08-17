@@ -11,7 +11,9 @@ use serde::{Deserialize, Deserializer};
 use walkdir::WalkDir;
 
 use crate::cache::{CacheLookup, FileStamp, TranscriptCache, file_stamp};
-use crate::model::{ActivityPoint, Diagnostics, ExactInterval, RawSession, Session};
+use crate::model::{
+    ActivityPoint, Diagnostics, ExactInterval, RawSession, Session, TokenEvent, TokenUsage,
+};
 use crate::paths::{PathResolver, lossy_claude_cwd};
 use crate::timeutil::{nearest_models, parse_epoch_milliseconds, parse_timestamp};
 
@@ -52,6 +54,8 @@ struct GeminiRecord {
     kind: Option<String>,
     #[serde(default)]
     messages: Vec<GeminiMessage>,
+    #[serde(default)]
+    tokens: Option<GeminiTokens>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +64,18 @@ struct GeminiMessage {
     record_type: Option<String>,
     timestamp: Option<String>,
     model: Option<String>,
+    #[serde(default)]
+    tokens: Option<GeminiTokens>,
+}
+
+#[derive(Default, Deserialize)]
+struct GeminiTokens {
+    #[serde(default)]
+    input: u64,
+    #[serde(default)]
+    output: u64,
+    #[serde(default)]
+    cached: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -96,11 +112,30 @@ struct CopilotData {
     parent_agent_task_id: Option<String>,
     #[serde(rename = "copilotVersion")]
     copilot_version: Option<String>,
+    #[serde(default, rename = "modelMetrics")]
+    model_metrics: Option<BTreeMap<String, CopilotModelMetrics>>,
 }
 
 #[derive(Deserialize)]
 struct CopilotContext {
     cwd: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct CopilotModelMetrics {
+    usage: Option<CopilotUsage>,
+}
+
+#[derive(Default, Deserialize)]
+struct CopilotUsage {
+    #[serde(default, rename = "inputTokens")]
+    input_tokens: u64,
+    #[serde(default, rename = "outputTokens")]
+    output_tokens: u64,
+    #[serde(default, rename = "cacheReadTokens")]
+    cache_read_tokens: u64,
+    #[serde(default, rename = "cacheWriteTokens")]
+    cache_write_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +212,19 @@ struct ClaudeRecord {
 struct ClaudeMessage {
     model: Option<String>,
     human_content: bool,
+    usage: Option<ClaudeUsage>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
 }
 
 fn deserialize_message<'de, D>(deserializer: D) -> Result<Option<ClaudeMessage>, D::Error>
@@ -200,6 +248,7 @@ where
                 match key.as_str() {
                     "model" => message.model = map.next_value::<Option<String>>()?,
                     "content" => message.human_content = map.next_value::<HumanContent>()?.0,
+                    "usage" => message.usage = map.next_value::<Option<ClaudeUsage>>()?,
                     _ => {
                         map.next_value::<IgnoredAny>()?;
                     }
@@ -351,6 +400,7 @@ struct CodexPayload {
     item: Option<ExactCandidate>,
     result: Option<ExactCandidate>,
     task: Option<ExactCandidate>,
+    info: Option<CodexTokenInfo>,
 }
 
 #[derive(Deserialize)]
@@ -359,6 +409,23 @@ struct ExactCandidate {
     started_at_ms: Option<f64>,
     #[serde(default, deserialize_with = "deserialize_maybe_number")]
     completed_at_ms: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct CodexTokenInfo {
+    last_token_usage: Option<CodexTokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct CodexTokenUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 fn deserialize_maybe_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -737,6 +804,7 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
                         record_type: record.record_type,
                         timestamp: record.timestamp,
                         model: record.model,
+                        tokens: record.tokens,
                     });
                 }
             },
@@ -768,6 +836,7 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
     let mut current_model = "unknown".to_string();
     let mut points = Vec::new();
     let mut human_points = Vec::new();
+    let mut token_events = Vec::new();
     let is_subagent = kind.as_deref() == Some("subagent")
         || path
             .file_name()
@@ -792,6 +861,22 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         points.push(point.clone());
         if message_type == "user" && !is_subagent {
             human_points.push(point);
+        }
+        if let Some(tokens) = message.tokens {
+            // `cached` is a subset of `input`, not additional to it.
+            let usage = TokenUsage {
+                input_tokens: tokens.input.saturating_sub(tokens.cached),
+                output_tokens: tokens.output,
+                cache_read_tokens: tokens.cached,
+                cache_creation_tokens: 0,
+            };
+            if !usage.is_zero() {
+                token_events.push(TokenEvent {
+                    timestamp,
+                    model: current_model.clone(),
+                    usage,
+                });
+            }
         }
     }
     if points.is_empty() {
@@ -828,6 +913,7 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         points,
         exact_intervals: Vec::new(),
         human_points,
+        token_events,
         is_subagent,
         approximate_cwd,
         version,
@@ -843,6 +929,7 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
     let mut current_model = "unknown".to_string();
     let mut points_by_cwd: BTreeMap<Option<String>, Vec<ActivityPoint>> = BTreeMap::new();
     let mut human_by_cwd: BTreeMap<Option<String>, Vec<ActivityPoint>> = BTreeMap::new();
+    let mut token_events_by_cwd: BTreeMap<Option<String>, Vec<TokenEvent>> = BTreeMap::new();
     let mut subagent_intervals: Vec<(String, String, ExactInterval)> = Vec::new();
     for_json_lines(
         path,
@@ -879,6 +966,34 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) else {
                 return;
             };
+            if record_type == "session.shutdown"
+                && let Some(metrics) = record.data.model_metrics
+            {
+                for (model_name, entry) in metrics {
+                    let Some(usage) = entry.usage else {
+                        continue;
+                    };
+                    // `cacheReadTokens` is a subset of `inputTokens`, not additional to it.
+                    let usage = TokenUsage {
+                        input_tokens: usage.input_tokens.saturating_sub(usage.cache_read_tokens),
+                        output_tokens: usage.output_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_creation_tokens: usage.cache_write_tokens,
+                    };
+                    if usage.is_zero() {
+                        continue;
+                    }
+                    token_events_by_cwd
+                        .entry(cwd.clone())
+                        .or_default()
+                        .push(TokenEvent {
+                            timestamp,
+                            model: safe_model(&model_name),
+                            usage,
+                        });
+                }
+                return;
+            }
             if record_type == "subagent.completed"
                 && let Some(duration_ms) = record.data.duration_ms
                 && duration_ms.is_finite()
@@ -947,6 +1062,7 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
         }
         let approximate_cwd = cwd_key.is_none();
         let human_points = human_by_cwd.remove(&cwd_key).unwrap_or_default();
+        let token_events = token_events_by_cwd.remove(&cwd_key).unwrap_or_default();
         let resolved_cwd =
             cwd_key.unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned());
         result.sessions.push(RawSession {
@@ -961,6 +1077,7 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             points,
             exact_intervals: Vec::new(),
             human_points,
+            token_events,
             is_subagent: false,
             approximate_cwd,
             version: version.clone(),
@@ -980,6 +1097,7 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             points: Vec::new(),
             exact_intervals: vec![interval],
             human_points: Vec::new(),
+            token_events: Vec::new(),
             is_subagent: true,
             approximate_cwd,
             version: version.clone(),
@@ -1031,6 +1149,7 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
                 points: Vec::new(),
                 exact_intervals: Vec::new(),
                 human_points: Vec::new(),
+                token_events: Vec::new(),
                 is_subagent,
                 approximate_cwd: false,
                 version: Some("workstats-events-v1".to_string()),
@@ -1228,6 +1347,7 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                 points: session.points,
                 exact_intervals: Vec::new(),
                 human_points: session.human_points,
+                token_events: Vec::new(),
                 is_subagent: session.is_subagent,
                 approximate_cwd: false,
                 version: session.version,
@@ -1418,6 +1538,7 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
     let mut result = ParsedFile::default();
     let mut points = Vec::new();
     let mut human_points = Vec::new();
+    let mut token_events = Vec::new();
     let mut cwd = None;
     let mut session_id = None;
     let mut version = None;
@@ -1450,6 +1571,10 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
             {
                 current_model = safe_model(model);
             }
+            let usage = record
+                .message
+                .as_ref()
+                .and_then(|message| message.usage.clone());
             let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) else {
                 return;
             };
@@ -1457,6 +1582,23 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
                 timestamp,
                 model: current_model.clone(),
             });
+            if record_type == "assistant"
+                && let Some(usage) = usage
+            {
+                let usage = TokenUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cache_read_tokens: usage.cache_read_input_tokens,
+                    cache_creation_tokens: usage.cache_creation_input_tokens,
+                };
+                if !usage.is_zero() {
+                    token_events.push(TokenEvent {
+                        timestamp,
+                        model: current_model.clone(),
+                        usage,
+                    });
+                }
+            }
             let human = record_type == "user"
                 && record.message.is_some_and(|message| message.human_content)
                 && !record.is_meta
@@ -1499,6 +1641,7 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         points,
         exact_intervals: Vec::new(),
         human_points,
+        token_events,
         is_subagent: path
             .components()
             .any(|part| part.as_os_str() == "subagents"),
@@ -1517,6 +1660,7 @@ pub fn parse_codex_file(
     let mut points_by_cwd: BTreeMap<Option<String>, Vec<ActivityPoint>> = BTreeMap::new();
     let mut exact_by_cwd: BTreeMap<Option<String>, Vec<ExactInterval>> = BTreeMap::new();
     let mut human_by_cwd: BTreeMap<Option<String>, Vec<ActivityPoint>> = BTreeMap::new();
+    let mut token_events_by_cwd: BTreeMap<Option<String>, Vec<TokenEvent>> = BTreeMap::new();
     let mut cwd = None;
     let mut metadata_cwd = None;
     let mut session_id = None;
@@ -1578,6 +1722,16 @@ pub fn parse_codex_file(
                     {
                         exact_by_cwd.entry(cwd.clone()).or_default().push(interval);
                     }
+                    if record.record_type.as_deref() == Some("event_msg")
+                        && let Some(timestamp) =
+                            record.timestamp.as_deref().and_then(parse_timestamp)
+                        && let Some(event) = codex_token_event(&payload, timestamp, &current_model)
+                    {
+                        token_events_by_cwd
+                            .entry(cwd.clone())
+                            .or_default()
+                            .push(event);
+                    }
                 }
                 _ => {}
             }
@@ -1605,6 +1759,7 @@ pub fn parse_codex_file(
     cwd_keys.extend(points_by_cwd.keys().cloned());
     cwd_keys.extend(exact_by_cwd.keys().cloned());
     cwd_keys.extend(human_by_cwd.keys().cloned());
+    cwd_keys.extend(token_events_by_cwd.keys().cloned());
     if cwd_keys.is_empty() {
         result.diagnostics.skipped_sessions += 1;
         return result;
@@ -1614,6 +1769,7 @@ pub fn parse_codex_file(
         let mut points = points_by_cwd.remove(&cwd_key).unwrap_or_default();
         let mut exact_intervals = exact_by_cwd.remove(&cwd_key).unwrap_or_default();
         let human_points = human_by_cwd.remove(&cwd_key).unwrap_or_default();
+        let mut token_events = token_events_by_cwd.remove(&cwd_key).unwrap_or_default();
         if fallback_model != "unknown" {
             for point in &mut points {
                 if point.model == "unknown" {
@@ -1623,6 +1779,11 @@ pub fn parse_codex_file(
             for interval in &mut exact_intervals {
                 if interval.model == "unknown" {
                     interval.model.clone_from(&fallback_model);
+                }
+            }
+            for event in &mut token_events {
+                if event.model == "unknown" {
+                    event.model.clone_from(&fallback_model);
                 }
             }
         }
@@ -1644,6 +1805,7 @@ pub fn parse_codex_file(
             points,
             exact_intervals,
             human_points,
+            token_events,
             is_subagent,
             approximate_cwd,
             version: None,
@@ -1673,6 +1835,33 @@ fn exact_codex_interval(payload: &CodexPayload, model: &str) -> Option<ExactInte
                 model: model.to_string(),
             })
         })
+}
+
+fn codex_token_event(
+    payload: &CodexPayload,
+    timestamp: DateTime<Utc>,
+    model: &str,
+) -> Option<TokenEvent> {
+    if payload.payload_type.as_deref() != Some("token_count") {
+        return None;
+    }
+    let last = payload.info.as_ref()?.last_token_usage.as_ref()?;
+    // `cached_input_tokens` is a subset of `input_tokens` (OpenAI-style accounting), not
+    // additional to it, so it is split out here rather than summed on top.
+    let usage = TokenUsage {
+        input_tokens: last.input_tokens.saturating_sub(last.cached_input_tokens),
+        output_tokens: last.output_tokens,
+        cache_read_tokens: last.cached_input_tokens,
+        cache_creation_tokens: last.cache_write_input_tokens,
+    };
+    if usage.is_zero() {
+        return None;
+    }
+    Some(TokenEvent {
+        timestamp,
+        model: model.to_string(),
+        usage,
+    })
 }
 
 pub fn read_codex_sqlite_metadata(
@@ -2266,5 +2455,225 @@ mod tests {
         assert_eq!(1, parsed.sessions.len());
         assert_eq!(1, parsed.sessions[0].human_points.len());
         assert_eq!("openai/gpt-test", parsed.sessions[0].points[0].model);
+    }
+
+    #[test]
+    fn claude_assistant_usage_becomes_a_token_event() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let path = project.join("session.jsonl");
+        let records = [
+            serde_json::json!({
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "cwd": project,
+                "message": {"content": "hello"}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:05Z",
+                "cwd": project,
+                "message": {
+                    "model": "claude-test",
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 34,
+                        "cache_creation_input_tokens": 5,
+                        "cache_read_input_tokens": 6
+                    }
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.sessions[0].token_events.len());
+        let event = &parsed.sessions[0].token_events[0];
+        assert_eq!("claude-test", event.model);
+        assert_eq!(12, event.usage.input_tokens);
+        assert_eq!(34, event.usage.output_tokens);
+        assert_eq!(5, event.usage.cache_creation_tokens);
+        assert_eq!(6, event.usage.cache_read_tokens);
+    }
+
+    #[test]
+    fn codex_token_count_events_report_per_turn_deltas() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("rollout-test.jsonl");
+        let records = [
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "s", "cwd": root.path(), "model": "gpt-a"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:10Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 100, "cached_input_tokens": 10,
+                            "cache_write_input_tokens": 0, "output_tokens": 20,
+                            "reasoning_output_tokens": 5, "total_tokens": 120
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 100, "cached_input_tokens": 10,
+                            "cache_write_input_tokens": 0, "output_tokens": 20,
+                            "reasoning_output_tokens": 5, "total_tokens": 120
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:20Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 260, "cached_input_tokens": 90,
+                            "cache_write_input_tokens": 0, "output_tokens": 45,
+                            "reasoning_output_tokens": 8, "total_tokens": 305
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 160, "cached_input_tokens": 80,
+                            "cache_write_input_tokens": 0, "output_tokens": 25,
+                            "reasoning_output_tokens": 3, "total_tokens": 185
+                        }
+                    }
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_codex_file(&path, &CodexMetadataIndex::default(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.sessions.len());
+        let events = &parsed.sessions[0].token_events;
+        assert_eq!(2, events.len());
+        assert_eq!(90, events[0].usage.input_tokens);
+        assert_eq!(80, events[1].usage.input_tokens);
+        assert_eq!(80, events[1].usage.cache_read_tokens);
+        let total: u64 = events.iter().map(|event| event.usage.total()).sum();
+        assert_eq!(120 + 185, total);
+    }
+
+    #[test]
+    fn gemini_message_tokens_become_a_token_event() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("workspace/example");
+        let storage = root.path().join("hash");
+        let chats = storage.join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            storage.join(".project_root"),
+            project.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        let path = chats.join("session-2026-test.jsonl");
+        let records = [
+            serde_json::json!({
+                "id": "one",
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "content": "not parsed"
+            }),
+            serde_json::json!({
+                "id": "two",
+                "type": "gemini",
+                "timestamp": "2026-01-01T00:01:00Z",
+                "model": "gemini-test",
+                "tokens": {"input": 10, "output": 5, "cached": 2}
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_gemini_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.sessions[0].token_events.len());
+        let event = &parsed.sessions[0].token_events[0];
+        assert_eq!("gemini-test", event.model);
+        assert_eq!(8, event.usage.input_tokens);
+        assert_eq!(5, event.usage.output_tokens);
+        assert_eq!(2, event.usage.cache_read_tokens);
+    }
+
+    #[test]
+    fn copilot_shutdown_model_metrics_become_token_events() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let records = [
+            serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {"sessionId": "copilot-session", "selectedModel": "gpt-test", "context": {"cwd": root.path()}}
+            }),
+            serde_json::json!({
+                "type": "user.message",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {"content": "not parsed"}
+            }),
+            serde_json::json!({
+                "type": "session.shutdown",
+                "timestamp": "2026-01-01T00:05:00Z",
+                "data": {
+                    "modelMetrics": {
+                        "gpt-test": {
+                            "usage": {
+                                "inputTokens": 100,
+                                "outputTokens": 20,
+                                "cacheReadTokens": 5,
+                                "cacheWriteTokens": 1
+                            }
+                        }
+                    }
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        let foreground = parsed
+            .sessions
+            .iter()
+            .find(|session| !session.is_subagent)
+            .unwrap();
+        assert_eq!(1, foreground.token_events.len());
+        let event = &foreground.token_events[0];
+        assert_eq!("gpt-test", event.model);
+        assert_eq!(95, event.usage.input_tokens);
+        assert_eq!(20, event.usage.output_tokens);
+        assert_eq!(5, event.usage.cache_read_tokens);
+        assert_eq!(1, event.usage.cache_creation_tokens);
     }
 }
