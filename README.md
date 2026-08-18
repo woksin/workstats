@@ -171,8 +171,8 @@ cargo install --git https://github.com/woksin/workstats --locked
 ```
 
 Or clone the repository and use the platform installer. These compile the
-locked release build, preserve existing commands unless `--force` / `-Force` is
-explicit, and install the backward-compatible `gitstats` alias too.
+locked release build and preserve existing commands unless `--force` /
+`-Force` is explicit.
 
 ```bash
 # macOS / Linux

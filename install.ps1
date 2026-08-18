@@ -35,22 +35,20 @@ if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 $BinDir = (Resolve-Path -LiteralPath $BinDir).Path
 
-foreach ($name in @('workstats.exe', 'gitstats.exe')) {
-    $target = Join-Path $BinDir $name
-    if (Test-Path -LiteralPath $target) {
-        if (-not $Force) {
-            throw "install.ps1: refusing to replace $target; rerun with -Force to preserve it as .before-workstats"
-        }
-        $backup = "$target.before-workstats"
-        $suffix = 1
-        while (Test-Path -LiteralPath $backup) {
-            $backup = "$target.before-workstats.$suffix"
-            $suffix += 1
-        }
-        Move-Item -LiteralPath $target -Destination $backup
+$target = Join-Path $BinDir 'workstats.exe'
+if (Test-Path -LiteralPath $target) {
+    if (-not $Force) {
+        throw "install.ps1: refusing to replace $target; rerun with -Force to preserve it as .before-workstats"
     }
-    Copy-Item -LiteralPath $source -Destination $target
+    $backup = "$target.before-workstats"
+    $suffix = 1
+    while (Test-Path -LiteralPath $backup) {
+        $backup = "$target.before-workstats.$suffix"
+        $suffix += 1
+    }
+    Move-Item -LiteralPath $target -Destination $backup
 }
+Copy-Item -LiteralPath $source -Destination $target
 
-Write-Host "Installed workstats.exe and gitstats.exe in $BinDir"
+Write-Host "Installed workstats.exe in $BinDir"
 Write-Host 'Add that directory to PATH if it is not already there.'

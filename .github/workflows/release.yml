@@ -290,7 +290,6 @@ jobs:
 
             def install
               bin.install "workstats"
-              bin.install_symlink "workstats" => "gitstats"
             end
 
             test do

@@ -12,6 +12,14 @@ tag are the generated list of pull requests.
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** the `gitstats` alias and every remnant of it — the installed
+  `gitstats` command, its Homebrew symlink, the legacy-entrypoint notice and
+  `WORKSTATS_LEGACY_ENTRYPOINT`, and the `GITSTATS_DIR` / `GITSTATS_AUTHOR`
+  environment fallbacks. Use `workstats`, `WORKSTATS_DIR`, and
+  `WORKSTATS_AUTHOR` instead.
+
 ### Added
 
 - Work composition: changed Git lines bucketed into `source`, `test`, `docs`,

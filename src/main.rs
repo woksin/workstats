@@ -279,14 +279,6 @@ struct Arguments {
 }
 
 fn main() {
-    let invoked_as_gitstats = env::var_os("WORKSTATS_LEGACY_ENTRYPOINT").is_some()
-        || env::args_os()
-            .next()
-            .and_then(|path| PathBuf::from(path).file_stem().map(|name| name.to_owned()))
-            .is_some_and(|name| name == "gitstats");
-    if invoked_as_gitstats {
-        eprintln!("gitstats is now workstats; running the combined dashboard.");
-    }
     let arguments = Arguments::parse();
     let result = match arguments.command.as_ref() {
         Some(Command::Sources(command)) => print_sources(command),
@@ -350,14 +342,12 @@ fn run(arguments: Arguments) -> Result<()> {
     progress.set("Loading configuration");
     let directory = arguments.directory.clone().unwrap_or_else(|| {
         env::var_os("WORKSTATS_DIR")
-            .or_else(|| env::var_os("GITSTATS_DIR"))
             .map(PathBuf::from)
             .or_else(|| env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."))
     });
     let author = arguments.author.clone().unwrap_or_else(|| {
         env::var("WORKSTATS_AUTHOR")
-            .or_else(|_| env::var("GITSTATS_AUTHOR"))
             .ok()
             .or_else(default_git_author)
             .unwrap_or_default()
