@@ -46,7 +46,9 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
     if seconds > MAX_DURATION_SECONDS {
         bail!("duration must be at most 8784h (366 days)");
     }
-    Ok(Duration::microseconds((seconds * 1_000_000.0).round() as i64))
+    Ok(Duration::microseconds(
+        (seconds * 1_000_000.0).round() as i64
+    ))
 }
 
 /// chrono panics when a timestamp plus a delta leaves the representable range.
@@ -549,9 +551,15 @@ mod tests {
             ..session(vec![])
         };
         let intervals = build_session_intervals(&value, Duration::minutes(30));
-        assert_eq!(vec![("m", 600.0)], shape(&intervals));
-        assert_eq!(parse_timestamp("2026-01-01T10:00:00Z").unwrap(), intervals[0].start);
-        assert_eq!(parse_timestamp("2026-01-01T10:20:00Z").unwrap(), intervals[0].end);
+        assert_eq!(vec![("m", 1200.0)], shape(&intervals));
+        assert_eq!(
+            parse_timestamp("2026-01-01T10:00:00Z").unwrap(),
+            intervals[0].start
+        );
+        assert_eq!(
+            parse_timestamp("2026-01-01T10:20:00Z").unwrap(),
+            intervals[0].end
+        );
     }
 
     #[test]
@@ -566,7 +574,10 @@ mod tests {
         let intervals = build_session_intervals(&value, Duration::minutes(30));
         // The wall clock is unchanged; only the attribution inside the overlap moves.
         assert_eq!(1200.0, union_seconds(&intervals));
-        assert_eq!(BTreeMap::from([("m", 900.0), ("n", 300.0)]), seconds_by_model(&intervals));
+        assert_eq!(
+            BTreeMap::from([("m", 900.0), ("n", 300.0)]),
+            seconds_by_model(&intervals)
+        );
     }
 
     #[test]

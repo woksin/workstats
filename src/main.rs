@@ -349,7 +349,10 @@ fn main() {
     let result = match command {
         Some(Command::Ui(command)) => run(*command, Presentation::Explore),
         Some(Command::Sources(command)) => print_sources(&command),
-        Some(Command::Classify(command)) => classify_paths(&command),
+        // `--config` reads naturally on either side of the subcommand, and a
+        // flag that is silently ignored on one side is the same trap as the
+        // grouping aliases that used to discard `--group-by` (AUDIT V).
+        Some(Command::Classify(command)) => classify_paths(&command, report.config.as_deref()),
         Some(Command::Record(command)) => record_event(&command),
         Some(Command::Update(command)) => run_update_command(&command),
         None => run(report, Presentation::Print),
@@ -868,9 +871,12 @@ fn print_sources(arguments: &SourcesArguments) -> Result<()> {
 
 /// Answers "why did this file land there?" against the configured registry,
 /// which is the only way to debug a category rule without running a report.
-fn classify_paths(arguments: &ClassifyArguments) -> Result<()> {
+fn classify_paths(arguments: &ClassifyArguments, fallback_config: Option<&Path>) -> Result<()> {
     let mut diagnostics = Diagnostics::default();
-    let config = load_config(arguments.config.as_deref(), &mut diagnostics);
+    let config = load_config(
+        arguments.config.as_deref().or(fallback_config),
+        &mut diagnostics,
+    );
     let registry = config.category_registry()?;
     for message in &diagnostics.messages {
         eprintln!("workstats: {message}");
@@ -1099,6 +1105,46 @@ mod tests {
         assert_eq!(2, command.paths.len());
         assert_eq!(OutputFormat::Json, command.output_format);
         assert!(Arguments::try_parse_from(["workstats", "classify"]).is_err());
+    }
+
+    /// `--config` before the subcommand lands on the report arguments, which is
+    /// why `classify_paths` takes it as a fallback: without that it parses fine
+    /// and is then silently ignored, so the user sees the built-in categories
+    /// and no error.
+    #[test]
+    fn classify_accepts_the_config_flag_on_either_side_of_the_subcommand() {
+        let before = Arguments::try_parse_from([
+            "workstats",
+            "--config",
+            "/tmp/rules.json",
+            "classify",
+            "src/main.rs",
+        ])
+        .unwrap();
+        let Some(Command::Classify(command)) = &before.command else {
+            panic!("expected the classify subcommand");
+        };
+        assert_eq!(None, command.config);
+        assert_eq!(
+            Some(Path::new("/tmp/rules.json")),
+            before.report.config.as_deref()
+        );
+
+        let after = Arguments::try_parse_from([
+            "workstats",
+            "classify",
+            "--config",
+            "/tmp/rules.json",
+            "src/main.rs",
+        ])
+        .unwrap();
+        let Some(Command::Classify(command)) = &after.command else {
+            panic!("expected the classify subcommand");
+        };
+        assert_eq!(
+            Some(Path::new("/tmp/rules.json")),
+            command.config.as_deref()
+        );
     }
 
     /// The explorer is only worth having if it answers the same question the
