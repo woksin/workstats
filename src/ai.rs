@@ -24,12 +24,40 @@ pub const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// the far larger limit.
 pub const MAX_GEMINI_JSON_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The largest real VS Code chat session measured on the machine this was designed
+/// against, out of 26. The next three below it are 15.1 MB, 12.3 MB and 10.2 MB, all in
+/// the one workspace that is used daily — an ordinary long-running session, not an
+/// outlier. Recorded as a constant so the ceiling below is checked against evidence
+/// rather than against itself.
+pub const LARGEST_OBSERVED_VSCODE_CHAT_BYTES: u64 = 17_853_291;
+
 /// A VS Code chat session is one JSON document too, so the line-bounded discipline the
-/// JSONL adapters rely on does not apply and the file needs its own ceiling. The
-/// largest session found on the machine this was designed against was 6.4 MB, and a
-/// single `chatSessions` directory held 102 of them; this leaves generous headroom
-/// while keeping one damaged or runaway file from deciding the process's memory use.
-pub const MAX_VSCODE_CHAT_JSON_BYTES: u64 = 16 * 1024 * 1024;
+/// JSONL adapters rely on does not apply and the file needs its own ceiling.
+///
+/// The previous ceiling was 16 MiB, set at 2.5x the then-largest observed session of
+/// 6.4 MB. Sessions grow with use: the largest is now `LARGEST_OBSERVED_VSCODE_CHAT_BYTES`,
+/// which the old ceiling rejected outright and lost a whole session's activity to, with
+/// the next one down only 1.6 MB clear of it. So the ceiling has to clear real growth by
+/// more than the last one did, not by a hair.
+///
+/// It can afford to. The parser deserializes into the narrow structs below rather than
+/// into a `serde_json::Value`, so serde skips every unread field instead of building it:
+/// measured peak resident cost is ~0.16 MB for the 17.9 MB session (a `Value` tree of
+/// the same file costs 50 MB, 2.8x the file), ~0.15 MB for a synthetic 64 MB document
+/// whose bulk is one unread string, and ~1.8 MB for a 42 MB document holding 20,000
+/// requests. Cost tracks the request count, not the file size. Wall time at the ceiling
+/// is ~0.12 s. So this bounds the pathological case — a corrupt or runaway file — at a
+/// fraction of a second and a couple of megabytes, while sitting ~3.8x above the largest
+/// session a real editor has produced here and an order of magnitude under the whole-file
+/// bound `MAX_GEMINI_JSON_BYTES` already accepts.
+pub const MAX_VSCODE_CHAT_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The relation that matters, held at compile time rather than left to a reviewer:
+/// whatever the ceiling is set to, it clears the largest session real use has produced
+/// by enough to absorb the growth that broke the last one, and it stays under the
+/// whole-file bound the crate already accepts so that it is still a ceiling.
+const _: () = assert!(MAX_VSCODE_CHAT_JSON_BYTES >= 3 * LARGEST_OBSERVED_VSCODE_CHAT_BYTES);
+const _: () = assert!(MAX_VSCODE_CHAT_JSON_BYTES <= MAX_GEMINI_JSON_BYTES);
 
 /// The `version` VS Code stamps on its own chat serialization. It has been bumped
 /// before — that is why the field exists — and reading a newer layout as if it were
@@ -1346,8 +1374,14 @@ pub fn parse_copilot_file(
 /// `sessions.repository` is a hint, never a verdict: on the machine this was designed
 /// against, one row in seven named `Cratis/Chronicle` for a session that ran in
 /// `.../cratis/Arc`. The working directory decides where the session is reported, and
-/// the disagreement is said out loud so a wrong slug is visible rather than silently
+/// the disagreement is recorded so a wrong slug is visible rather than silently
 /// preferred or silently dropped.
+///
+/// Recorded as a note, not a warning. The slug is Copilot's own metadata about a session
+/// that was written and closed long ago: the user cannot correct it, nothing was lost,
+/// and the report is already right — so the only thing a `Warning:` line achieves is to
+/// reappear on every run until the reader stops looking at warnings altogether. The
+/// count reaches the summary and the detail reaches `--format json`.
 fn report_copilot_repository_disagreement(
     result: &mut ParsedFile,
     entry: Option<&CopilotStoreSession>,
@@ -1390,7 +1424,8 @@ fn report_copilot_repository_disagreement(
         .as_deref()
         .map(|branch| format!(" on branch {branch}"))
         .unwrap_or_default();
-    result.diagnostics.warn(format!(
+    result.diagnostics.repository_conflicts += 1;
+    result.diagnostics.note(format!(
         "GitHub Copilot session {session_id} records repository {repository}{branch} but ran in {cwd}; the working directory decides ({})",
         path.display()
     ));
@@ -1420,16 +1455,19 @@ fn copilot_session_store_path(root: &Path) -> PathBuf {
 /// A session's working directory can come from the store, so a change to the row has to
 /// invalidate the cached parse of that session — the same reason the Gemini fingerprint
 /// follows `.project_root`. Bumped to v3 because a v2 entry was parsed without the
-/// store and may hold an approximate cwd the store can now resolve.
+/// store and may hold an approximate cwd the store can now resolve, and to v4 because a
+/// v3 entry recorded the repository disagreement as a warning: transcripts do not change
+/// after a session ends, so without this the cache would keep replaying the warning this
+/// release exists to stop, on every run, forever.
 fn copilot_context_fingerprint(store: &CopilotSessionStore, path: &Path) -> String {
     match store.get(&copilot_session_directory(path)) {
         Some(entry) => format!(
-            "copilot-v3:{}:{}:{}",
+            "copilot-v4:{}:{}:{}",
             entry.cwd.as_deref().unwrap_or_default(),
             entry.repository.as_deref().unwrap_or_default(),
             entry.branch.as_deref().unwrap_or_default()
         ),
-        None => "copilot-v3:none".to_string(),
+        None => "copilot-v4:none".to_string(),
     }
 }
 
@@ -1679,10 +1717,15 @@ fn copilot_vscode_workspace_key(path: &Path) -> String {
 /// the fingerprint has to follow that file: a constant one kept a workspace pinned to a
 /// stale directory for as long as the transcript itself was untouched (the Gemini
 /// `.project_root` bug).
+///
+/// Bumped to v2 because a v1 entry may have been written under the old size ceiling,
+/// which recorded a real session as an unreadable file. A finished chat session is never
+/// written to again, so its size and mtime never change and the cache would go on
+/// serving that refusal — and go on losing the session — indefinitely.
 fn copilot_vscode_context_fingerprint(path: &Path) -> String {
     match copilot_vscode_workspace_file(path) {
-        Some(file) => format!("copilot-vscode-v1:{}", crate::cache::file_context(&file)),
-        None => "copilot-vscode-v1:none".to_string(),
+        Some(file) => format!("copilot-vscode-v2:{}", crate::cache::file_context(&file)),
+        None => "copilot-vscode-v2:none".to_string(),
     }
 }
 
@@ -4113,11 +4156,53 @@ mod tests {
             "requests": [{"timestamp": 1_767_225_600_000_i64, "modelId": "copilot/gpt-test"}]
         });
         let path = vscode_chat_session(root.path(), "1a2b", "session", None, &document);
-        // Sessions reach 6.4 MB and arrive in directories of a hundred; the cap is what
-        // keeps one file from deciding the whole run's memory use.
+        // A file that is genuinely pathological is still declined rather than read.
         let parsed = parse_copilot_vscode_file(&path, 16);
         assert!(parsed.sessions.is_empty());
         assert_eq!(1, parsed.diagnostics.unreadable_files);
+    }
+
+    /// Pins what the ceiling is *for* rather than what it says, because what it
+    /// says has already been wrong once: it was set at 2.5x the largest session
+    /// anyone had seen, sessions kept growing, and a real 17.9 MB session was
+    /// dropped whole for being 1 MB over. An assertion on the literal value
+    /// would have passed happily through all of that, so this one asserts the
+    /// outcome instead — a session the size of the largest one real use has
+    /// produced parses, and its activity is counted.
+    #[test]
+    fn a_chat_session_the_size_of_the_largest_real_one_is_read_not_refused() {
+        let root = tempdir().unwrap();
+        let sessions = root.path().join("1a2b/chatSessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join("large.json");
+
+        // The bulk is one field the parser never reads, which is where a real
+        // session's bulk is too: the prompt and response bodies this tool
+        // deliberately does not look at.
+        let head = r#"{"version":3,"sessionId":"chat-large","filler":""#;
+        let tail = r#"","requests":[{"timestamp":1767225600000,"modelId":"copilot/gpt-test","result":{"timings":{"totalElapsed":30000}}}]}"#;
+        let padding = LARGEST_OBSERVED_VSCODE_CHAT_BYTES as usize - head.len() - tail.len();
+        fs::write(&path, format!("{head}{}{tail}", "p".repeat(padding))).unwrap();
+        assert_eq!(
+            LARGEST_OBSERVED_VSCODE_CHAT_BYTES,
+            fs::metadata(&path).unwrap().len()
+        );
+
+        let parsed = parse_copilot_vscode_file(&path, MAX_VSCODE_CHAT_JSON_BYTES);
+        assert_eq!(
+            1,
+            parsed.sessions.len(),
+            "a session this size is ordinary, and losing it loses a whole session's activity: {:?}",
+            parsed.diagnostics.messages
+        );
+        assert_eq!(0, parsed.diagnostics.unreadable_files);
+        assert_eq!(1, parsed.sessions[0].exact_intervals.len());
+
+        // The regression itself: the ceiling this replaced refused exactly this
+        // file, and reported it as data the user could do nothing about.
+        let refused = parse_copilot_vscode_file(&path, 16 * 1024 * 1024);
+        assert!(refused.sessions.is_empty());
+        assert_eq!(1, refused.diagnostics.unreadable_files);
     }
 
     #[test]
@@ -4241,33 +4326,44 @@ mod tests {
         assert_eq!(arc.to_string_lossy(), parsed.sessions[0].cwd);
         assert!(!parsed.sessions[0].approximate_cwd);
         // `repository` was wrong in one row of seven on the machine this was designed
-        // against: the directory decides, and the disagreement is reported.
-        let message = parsed
+        // against: the directory decides, and the disagreement is recorded — as a note,
+        // never a warning, because the tool already resolved it and the reader has
+        // nothing to do about a slug Copilot wrote months ago.
+        assert_eq!(1, parsed.diagnostics.repository_conflicts);
+        assert_eq!(
+            0, parsed.diagnostics.warning_count,
+            "a resolved disagreement must not interrupt a clean run: {:?}",
+            parsed.diagnostics.messages
+        );
+        let note = parsed
             .diagnostics
-            .messages
+            .notes
             .iter()
-            .find(|message| message.contains("Cratis/Chronicle"))
-            .expect("the repository disagreement is reported");
-        assert!(message.contains("Arc"), "unexpected diagnostic {message}");
+            .find(|note| note.contains("Cratis/Chronicle"))
+            .expect("the repository disagreement is recorded");
+        assert!(note.contains("Arc"), "unexpected diagnostic {note}");
         assert!(
             !parsed
                 .diagnostics
-                .messages
+                .notes
                 .iter()
+                .chain(&parsed.diagnostics.messages)
                 .any(|message| message.contains("SECRET")),
             "message bodies must never leave the database"
         );
 
-        // The agreeing row says nothing, because there is nothing to warn about.
+        // The agreeing row says nothing at all, because there is nothing to record.
         let agreeing = root.path().join("session-state/780e0e2d/events.jsonl");
         fs::create_dir_all(agreeing.parent().unwrap()).unwrap();
         fs::write(&agreeing, records("780e0e2d")).unwrap();
         let parsed = parse_copilot_file(&agreeing, &store, MAX_JSONL_LINE_BYTES);
         assert_eq!(chronicle.to_string_lossy(), parsed.sessions[0].cwd);
+        assert_eq!(0, parsed.diagnostics.repository_conflicts);
         assert!(
-            parsed.diagnostics.messages.is_empty(),
-            "{:?}",
-            parsed.diagnostics.messages
+            parsed.diagnostics.messages.is_empty() && parsed.diagnostics.notes.is_empty(),
+            "{:?} {:?}",
+            parsed.diagnostics.messages,
+            parsed.diagnostics.notes
         );
 
         // Without the store the same transcript cannot say where it ran, which is the
