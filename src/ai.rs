@@ -157,17 +157,31 @@ struct WorkstatsEvent {
     role: String,
     started_at: Option<String>,
     completed_at: Option<String>,
-    #[serde(
-        default,
-        rename = "content",
-        alias = "prompt",
-        alias = "response",
-        alias = "input",
-        alias = "output",
-        alias = "api_key",
-        deserialize_with = "deserialize_sensitive_payload"
-    )]
-    sensitive_payload: bool,
+    // One field each rather than six aliases of a single field. Aliases make
+    // serde raise "duplicate field" as soon as a record carries two of them —
+    // and `response` together with `output` is the ordinary shape of an
+    // API-wrapper log — which reported a privacy rejection as a malformed line
+    // and sent the author hunting a JSON syntax error that did not exist.
+    // Every one deserializes through `IgnoredAny`, so the value is recognised
+    // without ever being read into memory.
+    #[serde(default, deserialize_with = "deserialize_sensitive_payload")]
+    content: bool,
+    #[serde(default, deserialize_with = "deserialize_sensitive_payload")]
+    prompt: bool,
+    #[serde(default, deserialize_with = "deserialize_sensitive_payload")]
+    response: bool,
+    #[serde(default, deserialize_with = "deserialize_sensitive_payload")]
+    input: bool,
+    #[serde(default, deserialize_with = "deserialize_sensitive_payload")]
+    output: bool,
+    #[serde(default, deserialize_with = "deserialize_sensitive_payload")]
+    api_key: bool,
+}
+
+impl WorkstatsEvent {
+    fn carries_sensitive_payload(&self) -> bool {
+        self.content || self.prompt || self.response || self.input || self.output || self.api_key
+    }
 }
 
 fn deserialize_sensitive_payload<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -1141,7 +1155,7 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
         max_line_bytes,
         &mut result.diagnostics,
         |record: WorkstatsEvent| {
-            if record.sensitive_payload {
+            if record.carries_sensitive_payload() {
                 sensitive_records += 1;
                 return;
             }
@@ -2620,6 +2634,52 @@ mod tests {
         assert_eq!(1, parsed.sessions[0].human_points.len());
         assert_eq!(1, parsed.sessions[0].exact_intervals.len());
         assert_eq!(1, parsed.diagnostics.content_rejections);
+    }
+
+    /// A wrapper logging an exchange naturally writes several of these at once.
+    /// While they were aliases of one field, serde raised "duplicate field"
+    /// before the privacy guard ran, and the record was reported as malformed —
+    /// sending the author after a JSON syntax error that did not exist.
+    #[test]
+    fn a_record_carrying_several_sensitive_fields_is_a_privacy_rejection() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let project = root.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-01-01T10:00:00Z",
+                "provider": "wrapper",
+                "session_id": "s1",
+                "cwd": project,
+                "event": "prompt",
+                "response": "SECRET",
+                "output": "ALSO SECRET"
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T10:05:00Z",
+                "provider": "wrapper",
+                "session_id": "s2",
+                "cwd": project,
+                "event": "prompt"
+            }),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_event_file(&path, MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.diagnostics.content_rejections);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        // The clean record still lands, and the rejected one is gone entirely.
+        assert_eq!(1, parsed.sessions.len());
+        assert!(parsed.sessions[0].session_id.starts_with("s2:"));
     }
 
     #[test]
