@@ -80,7 +80,10 @@ tag are the generated list of pull requests.
   instead of producing a clean-looking report with data silently missing.
 - Event records carrying prompt or response text are still rejected, but are
   now reported on their own line — `Privacy: N record(s) … skipped, as
-  designed.` — rather than being counted as malformed input.
+  designed.` — rather than being counted as malformed input. A record carrying
+  several such fields at once, which is the ordinary shape of an API-wrapper
+  log writing both `response` and `output`, is reported the same way instead of
+  as a JSON syntax error that was never there.
 - The transcript index is rebuilt once on the first run after upgrading,
   because what it stores and how a cached time range is derived both changed.
 
@@ -127,7 +130,9 @@ tag are the generated list of pull requests.
 - Non-ASCII paths are classified and ignored correctly. Git quotes and
   octal-escapes them by default, which broke extension detection and every
   ignore glob: `src_æøå.rs` was reported as `other` rather than `source`, and
-  `node_modules/pakke_æøå.js` was counted as authored work.
+  `node_modules/pakke_æøå.js` was counted as authored work. The same holds for
+  a path holding a quote, a backslash, or a control character, which Git quotes
+  whatever that setting says — `node_modules/a"b.js` is ignored again.
 - CSV no longer breaks negative numbers. Formula neutralisation prefixed an
   apostrophe to any cell starting with `-`, so a negative `net_lines` shipped as
   `'-1`. Cells that parse as numbers are now left alone; genuine formulas are
@@ -135,7 +140,10 @@ tag are the generated list of pull requests.
 - `--repo` now filters Git commits by the same three labels it already used for
   AI sessions — repository name, working directory, and source root — so a
   filter naming a source root no longer returns AI sessions with no Git output
-  beside them.
+  beside them. A filter that matches only a session's own nested working
+  directory keeps its commits too: the checkout inferred from that session is
+  no longer re-filtered against the repository root, which does not contain
+  what the nested directory matched.
 - An absurd duration such as `--gap-cap 99999999999999999999h` is a clean
   command-line error instead of a panic.
 - Tests kept in a sibling project (`Arc.Core.Specs/`, `Fundamentals.Tests/`) or
