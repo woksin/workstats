@@ -14,6 +14,19 @@ tag are the generated list of pull requests.
 
 ### Added
 
+- Work composition: changed Git lines bucketed into `source`, `test`, `docs`,
+  `config`, `assets`, and `other` from the file path alone, with a
+  test-lines-per-source-line ratio. Shown in the dashboard, per row in JSON,
+  and as `{area}_files` / `{area}_additions` / `{area}_deletions` columns in
+  CSV. It measures churn, not the size of the codebase.
+- Change shapes: each commit described as `new code`, `revision`, `removal`,
+  `tests`, `docs`, `config`, `assets`, or `mixed` from the area holding at
+  least 60% of its changed lines and its addition/deletion balance. Commit
+  messages and file contents are never read.
+- A committed-output count pairing foreground AI sessions with authored
+  commits in the same repository within one `--human-idle` window. Sessions in
+  repositories Git did not scan are excluded from both sides, so the remainder
+  genuinely reflects reading, review, and uncommitted work.
 - Token usage tracking (input, output, cache-read, cache-creation) for Claude
   Code, Codex, GitHub Copilot CLI, and Gemini CLI, grouped by the existing
   `root`, `repo`, `cwd`, `provider`, `model`, `day`, and `month` dimensions. A

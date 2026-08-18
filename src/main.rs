@@ -1,6 +1,7 @@
 mod aggregate;
 mod ai;
 mod cache;
+mod classify;
 mod git;
 mod model;
 mod output;

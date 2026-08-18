@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use tempfile::tempfile;
 
+use crate::classify::{CategoryTally, classify, tally_add};
 use crate::model::{Diagnostics, GitCommit};
 use crate::paths::PathResolver;
 
@@ -314,6 +315,20 @@ pub fn read_git_commits(
     commits
 }
 
+/// One commit being accumulated across its `--numstat` lines.
+#[derive(Default)]
+struct PendingCommit {
+    sha: String,
+    timestamp: Option<DateTime<Utc>>,
+    additions: u64,
+    deletions: u64,
+    ignored_additions: u64,
+    ignored_deletions: u64,
+    files: Vec<String>,
+    categories: CategoryTally,
+    matched_file: bool,
+}
+
 fn parse_git_log(
     reader: impl BufRead,
     repo: &str,
@@ -325,74 +340,42 @@ fn parse_git_log(
 ) -> Vec<GitCommit> {
     let mut commits = Vec::new();
     let mut repo_seen = HashSet::new();
-    let mut current_sha = String::new();
-    let mut current_time = None;
-    let mut additions = 0_u64;
-    let mut deletions = 0_u64;
-    let mut ignored_additions = 0_u64;
-    let mut ignored_deletions = 0_u64;
-    let mut files = Vec::new();
-    let mut matched_file = false;
+    let mut pending = PendingCommit::default();
 
-    let emit = |commits: &mut Vec<GitCommit>,
-                repo_seen: &mut HashSet<String>,
-                sha: &str,
-                timestamp: Option<DateTime<Utc>>,
-                additions: u64,
-                deletions: u64,
-                ignored_additions: u64,
-                ignored_deletions: u64,
-                files: &mut Vec<String>,
-                matched_file: bool| {
-        if let Some(timestamp) = timestamp
-            && !sha.is_empty()
-            && matched_file
-            && !globally_seen.contains(sha)
-            && !repo_seen.contains(sha)
-        {
-            repo_seen.insert(sha.to_string());
-            commits.push(GitCommit {
-                sha: sha.to_string(),
-                timestamp,
-                repo: repo.to_string(),
-                cwd: cwd.to_string(),
-                root: root.to_string(),
-                additions,
-                deletions,
-                files: std::mem::take(files),
-                ignored_additions,
-                ignored_deletions,
-            });
-        } else {
-            files.clear();
-        }
-    };
+    let emit =
+        |commits: &mut Vec<GitCommit>, repo_seen: &mut HashSet<String>, pending: PendingCommit| {
+            if let Some(timestamp) = pending.timestamp
+                && !pending.sha.is_empty()
+                && pending.matched_file
+                && !globally_seen.contains(&pending.sha)
+                && !repo_seen.contains(&pending.sha)
+            {
+                repo_seen.insert(pending.sha.clone());
+                commits.push(GitCommit {
+                    sha: pending.sha,
+                    timestamp,
+                    repo: repo.to_string(),
+                    cwd: cwd.to_string(),
+                    root: root.to_string(),
+                    additions: pending.additions,
+                    deletions: pending.deletions,
+                    files: pending.files,
+                    ignored_additions: pending.ignored_additions,
+                    ignored_deletions: pending.ignored_deletions,
+                    categories: pending.categories,
+                });
+            }
+        };
 
     for line in reader.lines().map_while(Result::ok) {
         if let Some(header) = line.strip_prefix("W\t") {
-            emit(
-                &mut commits,
-                &mut repo_seen,
-                &current_sha,
-                current_time,
-                additions,
-                deletions,
-                ignored_additions,
-                ignored_deletions,
-                &mut files,
-                matched_file,
-            );
+            emit(&mut commits, &mut repo_seen, std::mem::take(&mut pending));
             let mut fields = header.splitn(2, '\t');
-            current_sha = fields.next().unwrap_or_default().to_string();
-            current_time = fields
+            pending.sha = fields.next().unwrap_or_default().to_string();
+            pending.timestamp = fields
                 .next()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc));
-            additions = 0;
-            deletions = 0;
-            ignored_additions = 0;
-            ignored_deletions = 0;
-            matched_file = false;
             continue;
         }
         let fields: Vec<_> = line.split('\t').collect();
@@ -401,35 +384,25 @@ fn parse_git_log(
         }
         let added = parse_numstat(fields[0]);
         let removed = parse_numstat(fields[1]);
-        if added.is_none() || removed.is_none() {
+        let (Some(added), Some(removed)) = (added, removed) else {
             continue;
-        }
+        };
         let file_path = fields.last().copied().unwrap_or_default();
         if includes.is_some_and(|patterns| !patterns.is_match(file_path)) {
             continue;
         }
-        matched_file = true;
+        pending.matched_file = true;
         if ignores.is_some_and(|patterns| patterns.is_match(file_path)) {
-            ignored_additions += added.unwrap();
-            ignored_deletions += removed.unwrap();
+            pending.ignored_additions += added;
+            pending.ignored_deletions += removed;
         } else {
-            additions += added.unwrap();
-            deletions += removed.unwrap();
-            files.push(file_path.to_string());
+            pending.additions += added;
+            pending.deletions += removed;
+            tally_add(&mut pending.categories, classify(file_path), added, removed);
+            pending.files.push(file_path.to_string());
         }
     }
-    emit(
-        &mut commits,
-        &mut repo_seen,
-        &current_sha,
-        current_time,
-        additions,
-        deletions,
-        ignored_additions,
-        ignored_deletions,
-        &mut files,
-        matched_file,
-    );
+    emit(&mut commits, &mut repo_seen, pending);
     commits
 }
 
@@ -472,6 +445,7 @@ fn iso(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::Category;
     use tempfile::tempdir;
 
     fn git(arguments: &[&str]) {
@@ -550,5 +524,45 @@ mod tests {
             false,
         );
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn commit_lines_are_attributed_to_file_areas() {
+        let base = tempdir().unwrap();
+        let repo = base.path().join("org/areas");
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        git(&["init", "-q", repo.to_str().unwrap()]);
+        let path = repo.to_str().unwrap();
+        git(&["-C", path, "config", "user.name", "Area Author"]);
+        git(&["-C", path, "config", "user.email", "area@example.com"]);
+        fs::write(repo.join("src/lib.rs"), "one\ntwo\nthree\n").unwrap();
+        fs::write(repo.join("tests/lib_test.rs"), "check\n").unwrap();
+        fs::write(repo.join("README.md"), "docs\ndocs\n").unwrap();
+        git(&["-C", path, "add", "."]);
+        git(&["-C", path, "commit", "-qm", "areas"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Area Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(1, commits.len());
+        let categories = &commits[0].categories;
+        assert_eq!(3, categories[Category::Source.index()].additions);
+        assert_eq!(1, categories[Category::Test.index()].additions);
+        assert_eq!(2, categories[Category::Docs.index()].additions);
+        assert_eq!(0, categories[Category::Config.index()].additions);
+        assert_eq!(6, commits[0].additions);
     }
 }

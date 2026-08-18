@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::classify::CategoryTally;
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ActivityPoint {
     pub timestamp: DateTime<Utc>,
@@ -100,6 +102,15 @@ impl Session {
             .chain(self.human_points.iter().map(|point| point.timestamp))
             .min()
     }
+
+    pub fn last_seen(&self) -> Option<DateTime<Utc>> {
+        self.points
+            .iter()
+            .map(|point| point.timestamp)
+            .chain(self.exact_intervals.iter().map(|item| item.end))
+            .chain(self.human_points.iter().map(|point| point.timestamp))
+            .max()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +159,7 @@ pub struct GitCommit {
     pub files: Vec<String>,
     pub ignored_additions: u64,
     pub ignored_deletions: u64,
+    pub categories: CategoryTally,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -196,6 +208,8 @@ pub struct Methodology {
     pub ai_time: &'static str,
     pub deduplication: &'static str,
     pub gap_cap_seconds: f64,
+    pub composition: &'static str,
+    pub change_shapes: &'static str,
     pub scope: &'static str,
 }
 
@@ -203,6 +217,25 @@ pub struct Methodology {
 pub struct Observed {
     pub first_seen: Option<String>,
     pub last_seen: Option<String>,
+}
+
+/// Changed Git lines attributed to one file area. `files` counts distinct
+/// paths, so it deduplicates a file touched by several commits.
+#[derive(Clone, Debug, Serialize)]
+pub struct CompositionEntry {
+    pub category: String,
+    pub files: usize,
+    pub additions: u64,
+    pub deletions: u64,
+    pub share_of_changed_lines: f64,
+}
+
+/// Commits counted by the observable shape of their diff.
+#[derive(Clone, Debug, Serialize)]
+pub struct ShapeEntry {
+    pub shape: String,
+    pub commits: usize,
+    pub share_of_classified_commits: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,11 +255,15 @@ pub struct Summary {
     pub session_count: usize,
     pub foreground_session_count: usize,
     pub subagent_session_count: usize,
+    pub foreground_sessions_with_commits: usize,
+    pub foreground_sessions_without_commits: usize,
     pub commit_count: usize,
     pub additions: u64,
     pub deletions: u64,
     pub ignored_additions: u64,
     pub ignored_deletions: u64,
+    pub composition: Vec<CompositionEntry>,
+    pub change_shapes: Vec<ShapeEntry>,
     pub active_days: usize,
     pub provider_seconds: BTreeMap<String, f64>,
     pub model_seconds: BTreeMap<String, f64>,
@@ -258,6 +295,8 @@ pub struct ReportRow {
     pub ignored_additions: u64,
     pub ignored_deletions: u64,
     pub net_lines: i64,
+    pub composition: Vec<CompositionEntry>,
+    pub change_shapes: Vec<ShapeEntry>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
