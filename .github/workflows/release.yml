@@ -230,17 +230,52 @@ jobs:
       TAG: ${{ needs.release.outputs.tag }}
 
     steps:
+      # The guard below has to tell "no tap on purpose" apart from "the README
+      # promises a tap that does not exist", and the only thing that knows the
+      # difference is the README itself. A sparse checkout of that one file is
+      # the whole reason this job needs a working tree at all.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
       # The tap is optional. Cutting a release before it is set up should
       # publish the binaries and say the tap was skipped, not fail the release
       # and leave the assets looking broken.
+      #
+      # Optional is not the same as silent, though. This step used to write one
+      # line to the step summary and exit green, which is invisible from the
+      # Actions list and from a PR check — so a README telling people to
+      # `brew install` sat next to a tap that was never written to, release
+      # after release, with nothing anywhere to say so. Hence two outcomes
+      # instead of one: a warning annotation when the tap is deliberately
+      # absent, and a failed release when the README says otherwise.
       - name: Is the tap configured?
         id: guard
         run: |
-          if [ -z "${TAP_KEY:-}" ]; then
+          set -euo pipefail
+
+          # Both spellings of the instruction count: the fully-qualified
+          # one-liner (`brew install woksin/workstats/workstats`) and the older
+          # `brew tap woksin/workstats` pair. Either one tells a reader the tap
+          # is there for them.
+          advertised=false
+          if [ -f README.md ] && grep -qE 'brew (tap|install) woksin/' README.md; then
+            advertised=true
+          fi
+
+          if [ -n "${TAP_KEY:-}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          elif [ "$advertised" = true ]; then
+            echo "::error title=Homebrew tap advertised but not configured::README.md tells users to install workstats with Homebrew, but HOMEBREW_TAP_DEPLOY_KEY is not set on this repository, so the tap cannot be updated. Either configure the deploy key or remove the Homebrew instructions from README.md."
+            exit 1
+          else
+            # An annotation, not just a summary line: it shows up in the run
+            # header and in the Actions list, where somebody will actually see
+            # it.
+            echo "::warning title=Homebrew tap skipped::No HOMEBREW_TAP_DEPLOY_KEY secret, so the tap was not updated. README.md does not advertise a Homebrew install, so this is treated as deliberate."
             echo "No HOMEBREW_TAP_DEPLOY_KEY secret — skipping the tap." >> "$GITHUB_STEP_SUMMARY"
             echo "configured=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download artifacts
@@ -254,7 +289,38 @@ jobs:
         if: steps.guard.outputs.configured == 'true'
         run: |
           set -euo pipefail
-          sha() { shasum -a 256 "./artifacts/workstats-$1.tar.gz" | cut -d' ' -f1; }
+
+          # Hashed here, at statement level, and not as `$(sha …)` inside the
+          # heredoc below. `set -e` does not fire on a command substitution in
+          # that position: a missing artifact would print an error, expand to
+          # nothing, and ship `sha256 ""` from a step that exits 0 — a green
+          # release that hands every user a checksum mismatch. An assignment is
+          # somewhere errexit can see, so the same accident stops the job.
+          sha() {
+            local file="./artifacts/workstats-$1.tar.gz" digest
+            if [ ! -f "$file" ]; then
+              echo "missing artifact: $file" >&2
+              exit 1
+            fi
+            # The same either/or as the Package step: neither tool is
+            # guaranteed on every runner image, and this one used to assume
+            # shasum. A missing shasum would have emptied all four fields.
+            if command -v sha256sum >/dev/null; then
+              digest=$(sha256sum "$file" | cut -d' ' -f1)
+            else
+              digest=$(shasum -a 256 "$file" | cut -d' ' -f1)
+            fi
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "not a sha256 digest for $file: '$digest'" >&2
+              exit 1
+            fi
+            printf '%s' "$digest"
+          }
+
+          sha_macos_arm=$(sha macos-arm64)
+          sha_macos_x86=$(sha macos-x86_64)
+          sha_linux_arm=$(sha linux-arm64)
+          sha_linux_x86=$(sha linux-x86_64)
           base="https://github.com/woksin/workstats/releases/download/${TAG}"
 
           mkdir -p out
@@ -269,22 +335,22 @@ jobs:
             on_macos do
               on_arm do
                 url "${base}/workstats-macos-arm64.tar.gz"
-                sha256 "$(sha macos-arm64)"
+                sha256 "${sha_macos_arm}"
               end
               on_intel do
                 url "${base}/workstats-macos-x86_64.tar.gz"
-                sha256 "$(sha macos-x86_64)"
+                sha256 "${sha_macos_x86}"
               end
             end
 
             on_linux do
               on_arm do
                 url "${base}/workstats-linux-arm64.tar.gz"
-                sha256 "$(sha linux-arm64)"
+                sha256 "${sha_linux_arm}"
               end
               on_intel do
                 url "${base}/workstats-linux-x86_64.tar.gz"
-                sha256 "$(sha linux-x86_64)"
+                sha256 "${sha_linux_x86}"
               end
             end
 
@@ -297,6 +363,21 @@ jobs:
             end
           end
           RUBY
+
+          # Checked rather than assumed, in the same spirit as the binaries
+          # job's "Check executable": the formula is the artifact this job
+          # ships, and an empty `sha256` in it is indistinguishable from a
+          # tampered download to everyone downstream. Four fields, all filled,
+          # or nothing gets pushed.
+          if grep -q 'sha256 ""' out/workstats.rb; then
+            echo "the generated formula has an empty sha256 field" >&2
+            exit 1
+          fi
+          if [ "$(grep -c '^      sha256 "' out/workstats.rb)" -ne 4 ]; then
+            echo "expected 4 sha256 fields in the generated formula" >&2
+            exit 1
+          fi
+
           cat out/workstats.rb
 
       - name: Push it to the tap
@@ -327,3 +408,42 @@ jobs:
           fi
           git commit -m "workstats ${VERSION}"
           git push
+
+      # Pushing is not publishing. A deploy key that lost write access, a tap
+      # whose default branch moved, a push that raced another run — each of
+      # those can leave this job green with nothing usable at the far end. So
+      # fetch the formula back out of the tap, anonymously as far as the tap is
+      # concerned, and insist it is the version this run just cut. The job
+      # cannot claim success unless the file is right where a user will find
+      # it.
+      - name: Verify the published formula
+        if: steps.guard.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # A few seconds of lag between the push and the contents API is
+          # normal and would otherwise fail a release for no reason. Three
+          # looks, then take the answer at face value.
+          published=""
+          for attempt in 1 2 3; do
+            published=$(gh api "repos/${TAP_REPO}/contents/Formula/workstats.rb" --jq '.content' | base64 -d) || published=""
+            if printf '%s\n' "$published" | grep -qF "version \"${VERSION}\""; then
+              break
+            fi
+            [ "$attempt" = 3 ] || sleep 5
+          done
+
+          printf '%s\n' "$published"
+
+          if ! printf '%s\n' "$published" | grep -qF "version \"${VERSION}\""; then
+            echo "${TAP_REPO} does not publish workstats ${VERSION}" >&2
+            exit 1
+          fi
+          if printf '%s\n' "$published" | grep -q 'sha256 ""'; then
+            echo "${TAP_REPO} published a formula with an empty sha256 field" >&2
+            exit 1
+          fi
+
+          echo "Tap published workstats ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
