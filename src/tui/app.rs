@@ -615,6 +615,38 @@ impl App {
     }
 }
 
+/// Shared by the tests in this module and in `views`, so the renderer is
+/// exercised through the same `App` the navigation tests drive. `App::new`
+/// builds its own `Dataset` from a whole `Report` and reads the real saved-views
+/// file; a test wants neither, so it hands in both.
+#[cfg(test)]
+pub(super) fn app_for_test(data: Dataset, views_path: PathBuf) -> App {
+    let mut app = App {
+        index: Index::build(search_targets(&data, Grain::Month)),
+        data,
+        stack: vec![Level::new(LevelKind::Overview, "", "workstats")],
+        grain: Grain::Month,
+        sort: default_sort(LevelKind::Overview),
+        filter: String::new(),
+        mode: Mode::Normal,
+        input: String::new(),
+        status: None,
+        help: false,
+        views: SavedViews::default(),
+        views_path,
+        views_selected: 0,
+        hits: Vec::new(),
+        search_selected: 0,
+        diff: None,
+        diff_offset: 0,
+        rows: Vec::new(),
+        viewport: 10,
+        quit: false,
+    };
+    app.rebuild();
+    app
+}
+
 /// Moves `current` by `delta` and keeps it inside `0..length`, saturating at
 /// both ends rather than wrapping — wrapping past the last row reads as a bug.
 fn step(current: usize, delta: isize, length: usize) -> usize {
@@ -711,29 +743,7 @@ mod tests {
             ),
             sample_commit("cccccccccccc", "/repos/gadget", &[("README.md", 5, 0)]),
         ]);
-        let mut app = App {
-            index: Index::build(search_targets(&data, Grain::Month)),
-            data,
-            stack: vec![Level::new(LevelKind::Overview, "", "workstats")],
-            grain: Grain::Month,
-            sort: default_sort(LevelKind::Overview),
-            filter: String::new(),
-            mode: Mode::Normal,
-            input: String::new(),
-            status: None,
-            help: false,
-            views: SavedViews::default(),
-            views_path: directory.path().join("views.json"),
-            views_selected: 0,
-            hits: Vec::new(),
-            search_selected: 0,
-            diff: None,
-            diff_offset: 0,
-            rows: Vec::new(),
-            viewport: 10,
-            quit: false,
-        };
-        app.rebuild();
+        let app = app_for_test(data, directory.path().join("views.json"));
         (app, directory)
     }
 

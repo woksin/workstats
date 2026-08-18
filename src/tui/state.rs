@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::classify::{CategoryTally, active_registry};
 use crate::model::{GitCommit, Report};
+use crate::output::number;
 use crate::paths::{default_config_path, home_dir};
 use crate::timeutil::{local_date, local_month};
 
@@ -125,69 +126,66 @@ pub struct Sort {
     pub descending: bool,
 }
 
-/// A column of the current level's table.
+/// A column of the current level's table. A column declares no width: the
+/// renderer measures the rows it is actually given, because a width guessed
+/// here is either too small for the longest value or — as `Repository` was,
+/// stretched across half a wide terminal — far wider than anything in it.
 pub struct Column {
     pub title: &'static str,
-    /// Preferred width in cells; 0 means "take whatever is left".
-    pub width: u16,
     /// Right-align when rendering.
     pub numeric: bool,
 }
 
-const fn column(title: &'static str, width: u16, numeric: bool) -> Column {
-    Column {
-        title,
-        width,
-        numeric,
-    }
+const fn column(title: &'static str, numeric: bool) -> Column {
+    Column { title, numeric }
 }
 
 const OVERVIEW_COLUMNS: &[Column] = &[
-    column("Repository", 0, false),
-    column("Source root", 18, false),
-    column("Commits", 9, true),
-    column("Files", 8, true),
-    column("Added", 10, true),
-    column("Removed", 10, true),
-    column("Net", 9, true),
-    column("AI h", 8, true),
-    column("Human h", 9, true),
+    column("Repository", false),
+    column("Source root", false),
+    column("Commits", true),
+    column("Files", true),
+    column("Added", true),
+    column("Removed", true),
+    column("Net", true),
+    column("AI h", true),
+    column("Human h", true),
 ];
 
 const PERIOD_COLUMNS: &[Column] = &[
-    column("Period", 12, false),
-    column("Commits", 9, true),
-    column("Files", 8, true),
-    column("Added", 10, true),
-    column("Removed", 10, true),
-    column("Net", 9, true),
+    column("Period", false),
+    column("Commits", true),
+    column("Files", true),
+    column("Added", true),
+    column("Removed", true),
+    column("Net", true),
 ];
 
 const CATEGORY_COLUMNS: &[Column] = &[
-    column("Category", 16, false),
-    column("Files", 8, true),
-    column("Added", 10, true),
-    column("Removed", 10, true),
-    column("Net", 9, true),
-    column("Share", 8, true),
+    column("Category", false),
+    column("Files", true),
+    column("Added", true),
+    column("Removed", true),
+    column("Net", true),
+    column("Share", true),
 ];
 
 const COMMIT_COLUMNS: &[Column] = &[
-    column("When", 17, false),
-    column("Commit", 10, false),
-    column("Change", 0, false),
-    column("Files", 7, true),
-    column("Added", 9, true),
-    column("Removed", 9, true),
+    column("When", false),
+    column("Commit", false),
+    column("Change", false),
+    column("Files", true),
+    column("Added", true),
+    column("Removed", true),
 ];
 
-const FILE_COLUMNS: &[Column] = &[column("File", 0, false), column("Category", 14, false)];
+const FILE_COLUMNS: &[Column] = &[column("File", false), column("Category", false)];
 
 const HISTORY_COLUMNS: &[Column] = &[
-    column("When", 17, false),
-    column("Commit", 10, false),
-    column("Change", 0, false),
-    column("Period", 12, false),
+    column("When", false),
+    column("Commit", false),
+    column("Change", false),
+    column("Period", false),
 ];
 
 pub fn columns(kind: LevelKind) -> &'static [Column] {
@@ -236,7 +234,7 @@ impl Field {
 
     pub fn count(value: u64) -> Self {
         Self {
-            text: group_digits(value),
+            text: number(value),
             value: Some(value as f64),
         }
     }
@@ -244,7 +242,7 @@ impl Field {
     pub fn lines(value: i64) -> Self {
         let sign = if value < 0 { '-' } else { '+' };
         Self {
-            text: format!("{sign}{}", group_digits(value.unsigned_abs())),
+            text: format!("{sign}{}", number(value.unsigned_abs())),
             value: Some(value as f64),
         }
     }
@@ -314,7 +312,10 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
     ("Backspace / ← / h", "go up one level"),
     ("/", "filter the current level as you type"),
     ("s", "fuzzy search repositories, files and commits"),
-    ("1 – 9", "sort by that column; press again to reverse"),
+    (
+        "1 – 9",
+        "sort by the numbered column; press again to reverse",
+    ),
     ("[ / ]", "previous / next sort column"),
     ("o", "reverse the sort order"),
     ("p", "switch the period between month and day"),
@@ -850,20 +851,14 @@ fn report_summary(report: &Report) -> Vec<(String, String)> {
     let summary = &report.summary;
     vec![
         ("Observed".to_string(), observed(report)),
-        (
-            "Commits".to_string(),
-            group_digits(summary.commit_count as u64),
-        ),
-        (
-            "Sessions".to_string(),
-            group_digits(summary.session_count as u64),
-        ),
+        ("Commits".to_string(), number(summary.commit_count)),
+        ("Sessions".to_string(), number(summary.session_count)),
         (
             "Lines".to_string(),
             format!(
                 "+{} / -{}",
-                group_digits(summary.additions),
-                group_digits(summary.deletions)
+                number(summary.additions),
+                number(summary.deletions)
             ),
         ),
         (
@@ -874,7 +869,7 @@ fn report_summary(report: &Report) -> Vec<(String, String)> {
             "AI".to_string(),
             format!("{:.1} h", summary.attributed_active_seconds / 3600.0),
         ),
-        ("Tokens".to_string(), group_digits(summary.total_tokens)),
+        ("Tokens".to_string(), number(summary.total_tokens)),
     ]
 }
 
@@ -888,18 +883,6 @@ fn observed(report: &Report) -> String {
 /// RFC 3339 is ASCII, so the calendar date is the first ten bytes.
 fn date_part(value: &str) -> &str {
     &value[..value.len().min(10)]
-}
-
-fn group_digits(value: u64) -> String {
-    let digits = value.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (position, digit) in digits.chars().enumerate() {
-        if position > 0 && (digits.len() - position).is_multiple_of(3) {
-            grouped.push(' ');
-        }
-        grouped.push(digit);
-    }
-    grouped
 }
 
 /// Shared by the tests in this module and in `app`, so both exercise the same
@@ -1063,10 +1046,13 @@ mod tests {
 
     #[test]
     fn numbers_are_grouped_and_signed_where_it_helps() {
-        assert_eq!("1 234 567", group_digits(1_234_567));
-        assert_eq!("0", group_digits(0));
+        // The explorer separates thousands the way the printed report does, so
+        // a figure read in one and then the other is the same figure. A space
+        // here would also fight the space between the table's columns.
+        assert_eq!("1,234,567", Field::count(1_234_567).text);
+        assert_eq!("0", Field::count(0).text);
         assert_eq!("-42", Field::lines(-42).text);
-        assert_eq!("+42", Field::lines(42).text);
+        assert_eq!("+1,048", Field::lines(1048).text);
         assert_eq!(Some(-42.0), Field::lines(-42).value);
         assert_eq!("2026-06-15", date_part("2026-06-15T12:00:00+00:00"));
     }
