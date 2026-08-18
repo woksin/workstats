@@ -49,7 +49,6 @@ jobs:
         run: |
           ./install.sh --bin-dir "$RUNNER_TEMP/workstats-bin"
           "$RUNNER_TEMP/workstats-bin/workstats" --version
-          "$RUNNER_TEMP/workstats-bin/gitstats" --version
 
       - name: Test Windows installer
         if: runner.os == 'Windows'
@@ -57,7 +56,6 @@ jobs:
         run: |
           ./install.ps1 -BinDir "$env:RUNNER_TEMP\workstats-bin"
           & "$env:RUNNER_TEMP\workstats-bin\workstats.exe" --version
-          & "$env:RUNNER_TEMP\workstats-bin\gitstats.exe" --version
 
   fmt:
     name: rustfmt
