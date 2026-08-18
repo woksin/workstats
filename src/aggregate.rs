@@ -8,6 +8,7 @@ use crate::model::{
     CompositionEntry, GitCommit, HumanSignal, Interval, Methodology, Observed, ReportRow, Session,
     ShapeEntry, Summary, TokenUsage,
 };
+use crate::output::is_direction_override;
 use crate::timeutil::{
     build_human_intervals, build_session_intervals, calendar_days, clip_interval, local_date,
     local_month, split_interval, union_seconds,
@@ -827,12 +828,24 @@ fn include_time(row: &mut Bucket, first: DateTime<Utc>, last: DateTime<Utc>) {
     row.last_seen = Some(row.last_seen.map_or(last, |value| value.max(last)));
 }
 
+/// A grouping key is a repository path, a working directory, or a model name —
+/// none of it text this tool chose. The same value is printed as a table cell,
+/// so it gets the treatment `safe_message` gives a warning: control characters
+/// would hand an escape sequence to the terminal, and a direction override
+/// would let a crafted path reorder the row around it. Both become the
+/// replacement character, and the same substitution reaches JSON and CSV so
+/// that every format names a row identically.
+///
+/// That reach is why `is_direction_override` stops short of LRM and RLM. They
+/// open no directional scope, so they cannot spoof a row, but they are real
+/// characters in Hebrew and Arabic paths — replacing them here would hand a
+/// downstream consumer a repository name that no longer matches the checkout.
 fn safe_value(value: &str) -> String {
     value
         .chars()
         .take(4096)
         .map(|character| {
-            if character.is_control() {
+            if character.is_control() || is_direction_override(character) {
                 '�'
             } else {
                 character
@@ -1256,5 +1269,63 @@ mod tests {
             .find(|row| row.key.get("repo") == Some(&"repo-b".to_string()))
             .unwrap();
         assert_eq!(60, repo_b.total_tokens);
+    }
+
+    #[test]
+    fn a_grouping_key_cannot_repaint_or_reorder_the_row_it_names() {
+        // U+202E would print the rest of the cell right-to-left, so a checkout
+        // called `gnp.exe` could name a row that reads `exe.png`.
+        assert_eq!("repo\u{fffd}name", safe_value("repo\u{202e}name"));
+        assert_eq!(
+            "a\u{fffd}b\u{fffd}c\u{fffd}",
+            safe_value("a\u{2066}b\u{202c}c\u{202a}")
+        );
+        assert_eq!("a\u{fffd}b", safe_value("a\u{1b}b"));
+        // Anything a terminal draws as itself is left alone, including the
+        // scripts a direction override is otherwise legitimately used with.
+        assert_eq!("~/src/prosjekt-æøå", safe_value("~/src/prosjekt-æøå"));
+        assert_eq!(4096, safe_value(&"x".repeat(5000)).chars().count());
+    }
+
+    #[test]
+    fn a_right_to_left_checkout_keeps_the_name_it_has_on_disk() {
+        // U+200F is a directional mark, not a scope: it cannot reorder the row
+        // it names, and it is ordinary content in a Hebrew directory name. A
+        // key is what JSON and CSV consumers join on, so mangling one here
+        // would leave them unable to match this row to the checkout. Escaped
+        // rather than written literally so that this file carries no invisible
+        // characters of its own.
+        let hebrew = "~/\u{5de}\u{5e1}\u{5de}\u{5db}\u{5d9}\u{5dd}\u{200f}/workstats";
+        assert_eq!(hebrew, safe_value(hebrew));
+        // The mark U+200E and the override U+202D both nudge text leftward and
+        // both are invisible, so the pair is asserted together: only the one
+        // that opens a scope is replaced.
+        assert_eq!("report\u{200e}-2026", safe_value("report\u{200e}-2026"));
+        assert_eq!("report\u{fffd}-2026", safe_value("report\u{202d}-2026"));
+    }
+
+    #[test]
+    fn a_crafted_repository_name_is_neutralised_in_every_format() {
+        let report = build_report(
+            &[session(
+                "a",
+                "repo\u{202e}name",
+                vec![point("2026-01-01T10:00:00Z")],
+                vec![],
+            )],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+        // The key is sanitised once, here, so the table, JSON and CSV all carry
+        // the same name for the row rather than three spellings of it.
+        assert_eq!(
+            Some(&"repo\u{fffd}name".to_string()),
+            report.rows[0].key.get("repo")
+        );
     }
 }

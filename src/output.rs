@@ -1,11 +1,13 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::ops::AddAssign;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
 
 use crate::classify::active_registry;
-use crate::model::{CompositionEntry, Diagnostics, Report, ReportRow};
+use crate::model::{CompositionEntry, Diagnostics, MAX_STORED_MESSAGES, Report, ReportRow};
 
 pub fn print_json(report: &Report) -> Result<()> {
     let stdout = io::stdout();
@@ -93,6 +95,20 @@ pub fn print_csv(report: &Report) -> Result<()> {
 /// Enough diagnostic messages to see what went wrong without burying the
 /// report; the rest stay in `--format json`.
 const MAX_PRINTED_MESSAGES: usize = 5;
+
+/// Enough of the model list to see what did the work; the rest stay in
+/// `--format json`.
+const MAX_PRINTED_MODELS: usize = 12;
+
+/// A quoted path is not this tool's own text, so it is clipped before it is
+/// printed.
+const MAX_MESSAGE_CHARACTERS: usize = 200;
+
+/// One user-facing spelling for "no model named". The pipeline carries three:
+/// `unknown` where a transcript never named one, `<synthetic>` where a provider
+/// writes its own placeholder, and `—` for a Git commit, which has no model at
+/// all. The distinction is internal, so it does not reach the table or `--raw`.
+const NO_MODEL: &str = "(no model)";
 
 pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
     let summary = &report.summary;
@@ -187,27 +203,42 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         }
         println!();
         if raw {
-            println!("Parallel agent work by provider / model  (may overlap)");
-            for (provider, seconds) in &summary.provider_seconds {
-                println!("  {provider:<24} {:>10}", hours(*seconds));
-            }
-            let mut models: Vec<_> = summary.model_seconds.iter().collect();
-            models.sort_by(|left, right| right.1.total_cmp(left.1));
-            for (model, seconds) in models.into_iter().take(12) {
-                println!("    {model:<34} {:>10}", hours(*seconds));
-            }
-            println!();
-            if summary.total_tokens != 0 {
-                println!("Tokens by provider / model");
-                for (provider, tokens) in &summary.provider_tokens {
-                    println!("  {provider:<24} {:>10}", compact_tokens(*tokens));
-                }
-                let mut model_tokens: Vec<_> = summary.model_tokens.iter().collect();
-                model_tokens.sort_by(|left, right| right.1.cmp(left.1));
-                for (model, tokens) in model_tokens.into_iter().take(12) {
-                    println!("    {model:<34} {:>10}", compact_tokens(*tokens));
+            // The model totals are global: the summary never records which
+            // provider served a model, so indenting them under the provider
+            // list would draw a nesting that does not exist.
+            if !summary.provider_seconds.is_empty() {
+                println!("Parallel agent work by provider  (may overlap)");
+                for (provider, seconds) in &summary.provider_seconds {
+                    println!("  {provider:<24} {:>10}", hours(*seconds));
                 }
                 println!();
+            }
+            if !summary.model_seconds.is_empty() {
+                println!("Parallel agent work by model  (all providers together)");
+                let (models, omitted) = ranked_models(&summary.model_seconds, f64::total_cmp);
+                for (model, seconds) in models {
+                    println!("  {model:<34} {:>10}", hours(seconds));
+                }
+                print_omitted_models(omitted);
+                println!();
+            }
+            if summary.total_tokens != 0 {
+                if !summary.provider_tokens.is_empty() {
+                    println!("Tokens by provider");
+                    for (provider, tokens) in &summary.provider_tokens {
+                        println!("  {provider:<24} {:>10}", compact_tokens(*tokens));
+                    }
+                    println!();
+                }
+                if !summary.model_tokens.is_empty() {
+                    println!("Tokens by model  (all providers together)");
+                    let (model_tokens, omitted) = ranked_models(&summary.model_tokens, u64::cmp);
+                    for (model, tokens) in model_tokens {
+                        println!("  {model:<34} {:>10}", compact_tokens(tokens));
+                    }
+                    print_omitted_models(omitted);
+                    println!();
+                }
             }
         }
     }
@@ -315,15 +346,17 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         .find(|name| report.group_by.iter().any(|dimension| dimension == name))
         && !rows.is_empty()
     {
-        let mut totals: BTreeMap<String, f64> = BTreeMap::new();
-        for row in &report.rows {
-            if let Some(period) = row.key.get(calendar) {
-                *totals.entry(period.clone()).or_default() += row.human_estimated_seconds;
-            }
-        }
+        // The bars cover exactly the rows above them. Drawing the hidden rows
+        // too gave `--top 1` a chart whose tallest bar belonged to a row the
+        // reader could not see.
+        let scope = if rows.len() < report.rows.len() {
+            format!("the {} rows above only, oldest → newest", rows.len())
+        } else {
+            "oldest → newest".to_string()
+        };
         println!(
-            "\n  Human-work trend  {}  (oldest → newest)",
-            spark(&totals.into_values().collect::<Vec<_>>())
+            "\n  Human-work trend  {}  ({scope}; the table lists rows newest first)",
+            spark(&trend_totals(rows, calendar))
         );
     }
     println!();
@@ -370,28 +403,109 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     for message in diagnostics.messages.iter().take(MAX_PRINTED_MESSAGES) {
         println!("Warning: {}", safe_message(message));
     }
-    if diagnostics.messages.len() > MAX_PRINTED_MESSAGES {
-        println!(
-            "Warning: … {} more; use --format json for all of them.",
-            diagnostics.messages.len() - MAX_PRINTED_MESSAGES
-        );
+    if let Some(note) = hidden_messages_note(diagnostics.warning_count) {
+        println!("{note}");
+    }
+}
+
+/// The footer for the warnings that were not printed. `raised` counts every
+/// warning, including the ones `Diagnostics` stopped storing, so the number is
+/// exact; past the storage cap it is `--format json` that cannot show them all,
+/// and the note says which ones it does carry.
+fn hidden_messages_note(raised: u64) -> Option<String> {
+    let hidden = raised
+        .checked_sub(MAX_PRINTED_MESSAGES as u64)
+        .filter(|hidden| *hidden != 0)?;
+    Some(if raised > MAX_STORED_MESSAGES as u64 {
+        format!(
+            "Warning: … {hidden} more; only the first {MAX_STORED_MESSAGES} warnings were kept, and --format json carries those."
+        )
+    } else {
+        format!("Warning: … {hidden} more; use --format json for all of them.")
+    })
+}
+
+/// Human seconds per calendar period, oldest first, from the rows the table
+/// printed rather than from every row in the report.
+fn trend_totals(rows: &[ReportRow], calendar: &str) -> Vec<f64> {
+    let mut totals: BTreeMap<&str, f64> = BTreeMap::new();
+    for row in rows {
+        if let Some(period) = row.key.get(calendar) {
+            *totals.entry(period.as_str()).or_default() += row.human_estimated_seconds;
+        }
+    }
+    totals.into_values().collect()
+}
+
+/// The largest models first, plus how many the cap left out so the list can say
+/// what it hid. Models that render to the same name are summed, because the
+/// spellings they came from are an internal distinction.
+fn ranked_models<T>(
+    totals: &BTreeMap<String, T>,
+    compare: impl Fn(&T, &T) -> Ordering,
+) -> (Vec<(String, T)>, usize)
+where
+    T: Copy + Default + AddAssign,
+{
+    let mut merged: BTreeMap<String, T> = BTreeMap::new();
+    for (model, total) in totals {
+        *merged.entry(display_model(model)).or_default() += *total;
+    }
+    let mut ranked: Vec<_> = merged.into_iter().collect();
+    ranked.sort_by(|left, right| compare(&right.1, &left.1).then_with(|| left.0.cmp(&right.0)));
+    let omitted = ranked.len().saturating_sub(MAX_PRINTED_MODELS);
+    ranked.truncate(MAX_PRINTED_MODELS);
+    (ranked, omitted)
+}
+
+fn print_omitted_models(omitted: usize) {
+    if omitted != 0 {
+        println!("  … {omitted} more models; use --format json for all of them.");
     }
 }
 
 /// A message quotes a path the tool did not choose, so it can carry control
-/// characters into a terminal.
+/// characters — and characters that reorder the line around them — into a
+/// terminal.
 fn safe_message(value: &str) -> String {
-    value
+    let mut safe: String = value
         .chars()
-        .take(200)
+        .take(MAX_MESSAGE_CHARACTERS)
         .map(|character| {
-            if character.is_control() {
+            if character.is_control() || is_direction_override(character) {
                 '·'
             } else {
                 character
             }
         })
-        .collect()
+        .collect();
+    if value.chars().nth(MAX_MESSAGE_CHARACTERS).is_some() {
+        safe.push('…');
+    }
+    safe
+}
+
+/// The bidirectional embeddings and overrides (U+202A–202E) and isolates
+/// (U+2066–2069), shared with the diff viewer. Unicode does not classify them
+/// as control characters, so `char::is_control` lets them through, yet each
+/// opens a directional scope that runs until its terminator or the end of the
+/// line — which is what lets a quoted path or a line of a file read as
+/// something it is not. That scope is the whole of Trojan Source
+/// (CVE-2021-42574). Anything here that reaches a terminal is replaced rather
+/// than printed.
+///
+/// LRM (U+200E) and RLM (U+200F) are deliberately **not** here, and must not be
+/// added. UAX #9 calls them implicit directional marks: invisible characters
+/// with a strong bidi class that never touch the directional status stack of
+/// rules X1–X8, so they cannot open a scope and cannot reverse a letter. They
+/// only tilt how the neutrals immediately beside them resolve — precisely what
+/// any visible Hebrew or Arabic letter already does, so excluding them forfeits
+/// no protection. What they are is ordinary content in Hebrew and Arabic file
+/// and directory names, where replacing them corrupts a real path, and via
+/// `safe_value` corrupts it in JSON and CSV too. rustc's own
+/// `text_direction_codepoint_in_literal` draws the line in the same place.
+pub fn is_direction_override(character: char) -> bool {
+    matches!(character, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 fn row_field(row: &ReportRow, name: &str) -> String {
@@ -460,14 +574,24 @@ fn label(row: &ReportRow, dimensions: &[String]) -> String {
         .iter()
         .map(|name| {
             let value = row.key.get(name).cloned().unwrap_or_default();
-            if name == "month" {
-                named_month(&value).unwrap_or(value)
-            } else {
-                value
+            match name.as_str() {
+                "month" => named_month(&value).unwrap_or(value),
+                "model" => display_model(&value),
+                _ => value,
             }
         })
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// `--format json` and `--format csv` keep the raw spelling, which is a
+/// consumer contract; only what a person reads is normalised.
+fn display_model(value: &str) -> String {
+    if matches!(value, "" | "unknown" | "<synthetic>" | "—") {
+        NO_MODEL.to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 fn named_month(value: &str) -> Option<String> {
@@ -757,5 +881,112 @@ mod tests {
     fn calendar_months_have_readable_labels() {
         assert_eq!(Some("May 2026".into()), named_month("2026-05"));
         assert_eq!(None, named_month("not-a-month"));
+    }
+
+    #[test]
+    fn the_model_list_says_how_many_models_it_left_out() {
+        let totals: BTreeMap<String, f64> = (0..15)
+            .map(|index| (format!("model-{index:02}"), index as f64))
+            .collect();
+        let (ranked, omitted) = ranked_models(&totals, f64::total_cmp);
+        assert_eq!(MAX_PRINTED_MODELS, ranked.len());
+        assert_eq!(3, omitted);
+        assert_eq!("model-14", ranked[0].0);
+        assert_eq!("model-03", ranked[MAX_PRINTED_MODELS - 1].0);
+    }
+
+    #[test]
+    fn a_short_model_list_is_not_reported_as_truncated() {
+        let totals: BTreeMap<String, u64> =
+            BTreeMap::from([("gpt".to_string(), 5), ("sonnet".to_string(), 9)]);
+        let (ranked, omitted) = ranked_models(&totals, u64::cmp);
+        assert_eq!(0, omitted);
+        assert_eq!(
+            vec![("sonnet".to_string(), 9), ("gpt".to_string(), 5)],
+            ranked
+        );
+    }
+
+    #[test]
+    fn the_internal_no_model_spellings_render_as_one_entry() {
+        let totals: BTreeMap<String, f64> = BTreeMap::from([
+            ("unknown".to_string(), 10.0),
+            ("<synthetic>".to_string(), 5.0),
+            ("—".to_string(), 1.0),
+            ("sonnet".to_string(), 4.0),
+        ]);
+        let (ranked, _) = ranked_models(&totals, f64::total_cmp);
+        assert_eq!(
+            vec![(NO_MODEL.to_string(), 16.0), ("sonnet".to_string(), 4.0)],
+            ranked
+        );
+    }
+
+    #[test]
+    fn model_labels_use_one_spelling_for_no_model() {
+        let dimensions = vec!["model".to_string()];
+        for spelling in ["unknown", "<synthetic>", "—", ""] {
+            let mut row = row_with(Vec::new());
+            row.key.insert("model".to_string(), spelling.to_string());
+            assert_eq!(NO_MODEL, label(&row, &dimensions), "for {spelling:?}");
+        }
+        let mut row = row_with(Vec::new());
+        row.key
+            .insert("model".to_string(), "claude-opus-4".to_string());
+        assert_eq!("claude-opus-4", label(&row, &dimensions));
+    }
+
+    #[test]
+    fn the_hidden_warning_count_stays_exact_past_the_storage_cap() {
+        assert_eq!(None, hidden_messages_note(0));
+        assert_eq!(None, hidden_messages_note(MAX_PRINTED_MESSAGES as u64));
+        let few = hidden_messages_note(MAX_PRINTED_MESSAGES as u64 + 2).unwrap();
+        assert!(few.contains("… 2 more"), "{few}");
+        assert!(!few.contains("were kept"), "{few}");
+        // 130 warnings with 100 of them stored: the count is the number that
+        // happened, and only the reach of --format json is qualified.
+        let capped = hidden_messages_note(130).unwrap();
+        assert!(capped.contains("… 125 more"), "{capped}");
+        assert!(capped.contains("first 100 warnings were kept"), "{capped}");
+    }
+
+    #[test]
+    fn a_warning_cannot_reorder_itself() {
+        // U+202E would print the rest of the line right-to-left.
+        assert_eq!("path·to·file", safe_message("path\u{202e}to\u{2066}file"));
+        assert_eq!("a·b", safe_message("a\tb"));
+        // U+200F opens no directional scope and is ordinary content in an RTL
+        // path, so a Hebrew directory a warning quotes survives verbatim.
+        // Escaped rather than written literally so that this file carries no
+        // invisible characters of its own.
+        let hebrew = "~/\u{5de}\u{5e1}\u{5de}\u{5db}\u{5d9}\u{5dd}\u{200f}/log";
+        assert_eq!(hebrew, safe_message(hebrew));
+        let long = "x".repeat(MAX_MESSAGE_CHARACTERS + 10);
+        let clipped = safe_message(&long);
+        assert_eq!(MAX_MESSAGE_CHARACTERS + 1, clipped.chars().count());
+        assert!(clipped.ends_with('…'));
+        assert!(!safe_message("x").ends_with('…'));
+    }
+
+    #[test]
+    fn the_trend_covers_only_the_rows_the_table_printed() {
+        let rows = [
+            calendar_row("2026-05", 60.0),
+            calendar_row("2026-04", 30.0),
+            calendar_row("2026-04", 10.0),
+            calendar_row("2026-03", 3600.0),
+        ];
+        // Oldest first, and the two April rows are one bar.
+        assert_eq!(vec![3600.0, 40.0, 60.0], trend_totals(&rows, "month"));
+        // `--top 2` hides the tall March row, so its bar goes too.
+        assert_eq!(vec![30.0, 60.0], trend_totals(&rows[..2], "month"));
+        assert_eq!("▄█", spark(&trend_totals(&rows[..2], "month")));
+    }
+
+    fn calendar_row(month: &str, human_estimated_seconds: f64) -> ReportRow {
+        let mut row = row_with(Vec::new());
+        row.key.insert("month".to_string(), month.to_string());
+        row.human_estimated_seconds = human_estimated_seconds;
+        row
     }
 }

@@ -162,6 +162,11 @@ pub struct GitCommit {
     pub categories: CategoryTally,
 }
 
+/// Enough stored warnings to see what went wrong without the report becoming
+/// the log. Past it `warn` keeps counting but stops keeping, so `messages` is
+/// a sample and `warning_count` is the total.
+pub const MAX_STORED_MESSAGES: usize = 100;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Diagnostics {
     pub malformed_lines: u64,
@@ -178,12 +183,18 @@ pub struct Diagnostics {
     pub cache_misses: u64,
     pub cache_writes: u64,
     pub pruned_files: u64,
+    /// Every warning raised, including the ones past `MAX_STORED_MESSAGES`
+    /// that were never stored. `messages.len()` is a floor, so a report that
+    /// wants the real number has to read this one.
+    #[serde(default)]
+    pub warning_count: u64,
     pub messages: Vec<String>,
 }
 
 impl Diagnostics {
     pub fn warn(&mut self, message: impl Into<String>) {
-        if self.messages.len() < 100 {
+        self.warning_count += 1;
+        if self.messages.len() < MAX_STORED_MESSAGES {
             self.messages.push(message.into());
         }
     }
@@ -199,6 +210,15 @@ impl Diagnostics {
         self.cache_misses += other.cache_misses;
         self.cache_writes += other.cache_writes;
         self.pruned_files += other.pruned_files;
+        // Only the warnings `other` could not store are added here: the loop
+        // below goes through `warn`, which counts every message it replays, so
+        // adding `other.warning_count` as well would count those twice. The
+        // subtraction saturates for a `Diagnostics` whose messages did not come
+        // through `warn` — deserialising one without the field defaults it to
+        // zero — where the stored messages are the only total there is.
+        self.warning_count += other
+            .warning_count
+            .saturating_sub(other.messages.len() as u64);
         for message in &other.messages {
             self.warn(message.clone());
         }
@@ -345,4 +365,54 @@ pub struct Report {
     pub rows: Vec<ReportRow>,
     pub diagnostics: Diagnostics,
     pub inputs: Inputs,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn warned(count: usize, prefix: &str) -> Diagnostics {
+        let mut diagnostics = Diagnostics::default();
+        for index in 0..count {
+            diagnostics.warn(format!("{prefix} {index}"));
+        }
+        diagnostics
+    }
+
+    #[test]
+    fn warnings_are_counted_past_the_point_where_they_stop_being_stored() {
+        let diagnostics = warned(MAX_STORED_MESSAGES + 30, "left");
+        assert_eq!(MAX_STORED_MESSAGES, diagnostics.messages.len());
+        assert_eq!(MAX_STORED_MESSAGES as u64 + 30, diagnostics.warning_count);
+    }
+
+    #[test]
+    fn merging_counts_every_warning_exactly_once() {
+        // Both sides are over the cap, which is where replaying `other`'s
+        // stored messages through `warn` could double count them.
+        let mut left = warned(MAX_STORED_MESSAGES + 30, "left");
+        let right = warned(MAX_STORED_MESSAGES + 12, "right");
+        left.merge(&right);
+        assert_eq!(
+            2 * MAX_STORED_MESSAGES as u64 + 42,
+            left.warning_count,
+            "a merged total must be the warnings raised, not the messages kept"
+        );
+        assert_eq!(MAX_STORED_MESSAGES, left.messages.len());
+    }
+
+    #[test]
+    fn merging_a_countless_diagnostics_falls_back_to_its_stored_messages() {
+        // Messages that never went through `warn`, which is what deserialising
+        // a `Diagnostics` without the field gives: they are all that is known
+        // about it, and they must not be lost from the total.
+        let older = Diagnostics {
+            messages: vec!["stale".to_string()],
+            ..Diagnostics::default()
+        };
+        let mut current = warned(2, "current");
+        current.merge(&older);
+        assert_eq!(3, current.warning_count);
+        assert_eq!(3, current.messages.len());
+    }
 }

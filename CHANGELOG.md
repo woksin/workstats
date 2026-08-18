@@ -52,6 +52,28 @@ tag are the generated list of pull requests.
   direction-override characters are replaced before drawing so a file cannot
   repaint the terminal.
 - `--no-default-events` skips the event log written by `workstats record`.
+- GitHub Copilot Chat in VS Code, as the provider `copilot-vscode`. Every
+  prompt in a chat session counts as human involvement at the moment it was
+  sent, and a turn VS Code timed contributes the interval it actually took
+  rather than the activity estimate. Sessions are attributed to the workspace
+  folder they were opened in. `Code`, `Code - Insiders`, and `VSCodium` are read
+  when they exist; any other install is reachable with `--history
+  copilot-vscode=PATH`. Copilot reports a premium-request multiplier rather than
+  token counts, so these sessions carry no tokens. `copilot-chat`,
+  `vscode-copilot`, and `vs-code-copilot` all name the same provider. Copilot
+  is now covered on both surfaces that leave a timestamped local record — the
+  CLI and Copilot Chat; inline completions leave none.
+- `--month` and `--year` narrow a report to one calendar month or year.
+  `--month 2026-07` and `--year 2026` name one outright, and both also accept
+  `current` (`this`) and `last` (`previous`), resolved against the local
+  calendar. They are filters, like `--since`/`--until` — `--group-by` and
+  `--period` remain the groupings — so they compose with those and refuse to be
+  combined with each other or with the bounds.
+- `brew install woksin/workstats/workstats` installs and updates `workstats`
+  again. The tap now exists and every release publishes a formula to it. The
+  fully qualified name is the form to use: Homebrew 5.1.15 and newer will not
+  load a formula from a third-party tap until it is trusted, and naming the tap
+  in full trusts that one formula rather than everything in it.
 
 ### Changed
 
@@ -108,6 +130,12 @@ tag are the generated list of pull requests.
   changes directory after its last activity event.
 - A GitHub Copilot CLI subagent no longer overwrites the model recorded for the
   foreground session, which misattributed the work that followed it.
+- A GitHub Copilot CLI session whose event log never recorded a working
+  directory is now credited to the repository it actually ran in, read from the
+  CLI's own session store, instead of landing under the transcript directory
+  with an approximate location. A directory the event log did record still
+  wins, and a session store naming a repository the directory contradicts is
+  reported as a warning rather than silently preferred.
 - A single unreadable row in the OpenCode database no longer discards every
   OpenCode session. OpenCode stores `time_created` as a numeric column that
   SQLite may hold as a floating-point value, which aborted the whole read. Bad
@@ -159,6 +187,28 @@ tag are the generated list of pull requests.
   additions, deletions, file counts, and work composition. Only nested copies
   were being ignored. The same root anchoring now applies to
   `--path-exclude` patterns written in that shape.
+- `--raw` no longer reads as though each model belonged to the provider above
+  it. The per-model figures were indented under the per-provider list, but they
+  have always been totals across every provider. Provider and model are now two
+  separately headed lists at the same indent, and a model list cut short says
+  how many more there are.
+- The human-work sparkline covers the rows the table actually printed. With
+  `--top`, it was drawn from the whole report, so the picture disagreed with the
+  numbers under it. It also names its direction now: oldest to newest, while
+  the table lists rows newest first.
+- The count of hidden diagnostics is the number of warnings raised, not the
+  number the report kept. Only the first hundred are stored, so a run with more
+  than that understated how much it was not showing.
+- A crafted repository name, path, or warning can no longer reorder the line it
+  appears on. Direction-override characters are replaced along with control
+  characters everywhere text is drawn, and a grouping key is neutralised once,
+  before the table, JSON, and CSV are written, so all three name a row
+  identically. A warning clipped at 200 characters now ends in `…` instead of
+  stopping mid-sentence.
+- A session with no recorded model is spelled `(no model)` throughout the table
+  and `--raw`, rather than `unknown`, `<synthetic>`, or a bare dash depending on
+  which adapter it came from — three spellings that split one figure across
+  three rows. `--format json` and `--format csv` still carry the raw values.
 
 ## 1.0.0 — 2026-08-18
 

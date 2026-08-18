@@ -24,6 +24,26 @@ pub const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// the far larger limit.
 pub const MAX_GEMINI_JSON_BYTES: u64 = 128 * 1024 * 1024;
 
+/// A VS Code chat session is one JSON document too, so the line-bounded discipline the
+/// JSONL adapters rely on does not apply and the file needs its own ceiling. The
+/// largest session found on the machine this was designed against was 6.4 MB, and a
+/// single `chatSessions` directory held 102 of them; this leaves generous headroom
+/// while keeping one damaged or runaway file from deciding the process's memory use.
+pub const MAX_VSCODE_CHAT_JSON_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The `version` VS Code stamps on its own chat serialization. It has been bumped
+/// before — that is why the field exists — and reading a newer layout as if it were
+/// this one would report confident nonsense, so a higher version is declined.
+const COPILOT_VSCODE_FORMAT_VERSION: u32 = 3;
+
+/// The directory VS Code keeps chat transcripts in, one level below a workspace's
+/// storage directory.
+const VSCODE_CHAT_SESSION_DIRECTORY: &str = "chatSessions";
+
+/// Nothing waits a week for one turn, so a longer duration is a corrupt field rather
+/// than a measurement. The Copilot CLI's subagent durations are bounded the same way.
+const MAX_EXACT_DURATION_MS: f64 = 7.0 * 24.0 * 60.0 * 60.0 * 1000.0;
+
 #[derive(Debug, Default, Deserialize, serde::Serialize)]
 pub struct ParsedFile {
     pub sessions: Vec<RawSession>,
@@ -141,6 +161,96 @@ struct CopilotUsage {
     cache_read_tokens: u64,
     #[serde(default, rename = "cacheWriteTokens")]
     cache_write_tokens: u64,
+}
+
+/// The structural half of a VS Code Copilot Chat session.
+///
+/// `message.text`, `response[]`, and `result.metadata.renderedUserMessage` hold the
+/// conversation itself, including file excerpts, and they are deliberately absent from
+/// this struct: serde skips a field no struct names without materializing its value, so
+/// a 6 MB transcript is walked for four fields and the bodies are never read into
+/// memory. Adding a field here is therefore a privacy decision, not a parsing one.
+#[derive(Default, Deserialize)]
+struct VsCodeChatSession {
+    #[serde(default, deserialize_with = "deserialize_maybe_number")]
+    version: Option<f64>,
+    #[serde(default, rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default)]
+    requests: Vec<VsCodeChatRequest>,
+}
+
+#[derive(Default, Deserialize)]
+struct VsCodeChatRequest {
+    /// Epoch milliseconds: the moment the developer pressed enter.
+    #[serde(default, deserialize_with = "deserialize_maybe_number")]
+    timestamp: Option<f64>,
+    #[serde(default, rename = "modelId")]
+    model_id: Option<String>,
+    #[serde(default)]
+    result: Option<VsCodeChatResult>,
+}
+
+#[derive(Default, Deserialize)]
+struct VsCodeChatResult {
+    #[serde(default)]
+    timings: Option<VsCodeChatTimings>,
+}
+
+#[derive(Default, Deserialize)]
+struct VsCodeChatTimings {
+    #[serde(
+        default,
+        rename = "totalElapsed",
+        deserialize_with = "deserialize_maybe_number"
+    )]
+    total_elapsed: Option<f64>,
+}
+
+/// `workspace.json` beside a workspace's `chatSessions` directory, which is the only
+/// thing tying a chat session to a place on disk.
+#[derive(Default, Deserialize)]
+struct VsCodeWorkspace {
+    #[serde(default)]
+    folder: Option<String>,
+    /// A multi-root workspace was never observed on the machine this was designed
+    /// against, so this is a tolerant guess: an absent array simply leaves the cwd
+    /// approximate, which is the same outcome as not looking.
+    #[serde(default)]
+    folders: Vec<VsCodeWorkspaceFolder>,
+}
+
+#[derive(Default, Deserialize)]
+struct VsCodeWorkspaceFolder {
+    #[serde(default)]
+    uri: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// One row of the Copilot CLI's newer `session-store.db`, restricted to the columns
+/// that say *where* a session ran.
+///
+/// The same database's `turns` table holds every prompt and response body the CLI has
+/// seen, with an FTS5 index over them. Nothing here reads it, and the column list in
+/// `read_copilot_session_store` is closed on purpose.
+#[derive(Clone, Debug, Default)]
+pub struct CopilotStoreSession {
+    pub cwd: Option<String>,
+    pub repository: Option<String>,
+    pub branch: Option<String>,
+    pub host_type: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct CopilotSessionStore {
+    by_id: BTreeMap<String, CopilotStoreSession>,
+}
+
+impl CopilotSessionStore {
+    fn get(&self, id: &str) -> Option<&CopilotStoreSession> {
+        self.by_id.get(id)
+    }
 }
 
 #[derive(Deserialize)]
@@ -669,6 +779,38 @@ pub fn discover_copilot_files(root: &Path) -> Vec<PathBuf> {
     })
 }
 
+/// Finds `<workspace hash>/chatSessions/*.json` under VS Code's `workspaceStorage`.
+///
+/// The two levels are walked by hand rather than handed to `WalkDir` because
+/// `workspaceStorage` holds one directory per workspace — 120 of them on the machine
+/// this was designed against, of which ~26 had chat sessions — and each is full of
+/// unrelated extension state. A recursive `*.json` walk would read all of it and would
+/// also pull other extensions' files into the parser.
+pub fn discover_copilot_vscode_files(root: &Path) -> Vec<PathBuf> {
+    let Ok(workspaces) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for workspace in workspaces.filter_map(Result::ok) {
+        let Ok(files) = fs::read_dir(workspace.path().join(VSCODE_CHAT_SESSION_DIRECTORY)) else {
+            continue;
+        };
+        paths.extend(
+            files
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+                }),
+        );
+    }
+    paths.sort();
+    paths
+}
+
 pub fn discover_event_files(path: &Path) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.to_path_buf()];
@@ -720,16 +862,48 @@ pub fn read_copilot_sessions_indexed(
         ));
         return Vec::new();
     }
+    // `session-state/` and `session-store.db` are siblings in the CLI's home, so the
+    // database is found from the history root rather than through a second flag:
+    // `--history copilot=PATH` then keeps both pointing at the same install.
+    let store = read_copilot_session_store(&copilot_session_store_path(root), diagnostics);
     load_files(
         discover_copilot_files(root),
         resolver,
         diagnostics,
         cache,
         "copilot",
-        |_| "copilot-v2".to_string(),
+        |path| copilot_context_fingerprint(&store, path),
         since,
         until,
-        |path| parse_copilot_file(path, MAX_JSONL_LINE_BYTES),
+        |path| parse_copilot_file(path, &store, MAX_JSONL_LINE_BYTES),
+    )
+}
+
+pub fn read_copilot_vscode_sessions_indexed(
+    root: &Path,
+    resolver: &mut PathResolver,
+    diagnostics: &mut Diagnostics,
+    cache: Option<&mut TranscriptCache>,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Vec<Session> {
+    if !root.is_dir() {
+        diagnostics.warn(format!(
+            "GitHub Copilot Chat history not found: {}",
+            root.display()
+        ));
+        return Vec::new();
+    }
+    load_files(
+        discover_copilot_vscode_files(root),
+        resolver,
+        diagnostics,
+        cache,
+        "copilot-vscode",
+        copilot_vscode_context_fingerprint,
+        since,
+        until,
+        |path| parse_copilot_vscode_file(path, MAX_VSCODE_CHAT_JSON_BYTES),
     )
 }
 
@@ -946,7 +1120,14 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
     result
 }
 
-pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
+/// The event log decides everything about a session; the store only fills gaps it left.
+/// See `read_copilot_session_store` for why the database is read at all and what it is
+/// never allowed to read.
+pub fn parse_copilot_file(
+    path: &Path,
+    store: &CopilotSessionStore,
+    max_line_bytes: usize,
+) -> ParsedFile {
     let mut result = ParsedFile::default();
     let mut session_id = None;
     let mut version = None;
@@ -1077,12 +1258,25 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             }
         },
     );
+    let directory_id = copilot_session_directory(path);
     let base_id = session_id.unwrap_or_else(|| {
-        path.parent()
-            .and_then(Path::file_name)
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file_stem(path))
+        if directory_id.is_empty() {
+            file_stem(path)
+        } else {
+            directory_id.clone()
+        }
     });
+    // Keyed by the session directory name rather than by the id inside the file,
+    // because `copilot_context_fingerprint` has to reach the same row from the path
+    // alone — a cached parse that outlives a change to the row it used is the Gemini
+    // `.project_root` bug. The CLI names the directory after the session UUID, so on a
+    // real install the two agree.
+    let store_entry = store.get(&directory_id);
+    let store_cwd = store_entry
+        .and_then(|entry| entry.cwd.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     // A `session.context_changed` after the last activity event leaves the shutdown
     // usage under a cwd that has no points, so the sessions come from the union of the
     // maps rather than from the activity map alone — as `parse_codex_file` already does.
@@ -1098,9 +1292,12 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
         if points.is_empty() && token_events.is_empty() {
             continue;
         }
-        let approximate_cwd = cwd_key.is_none();
-        let resolved_cwd =
-            cwd_key.unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned());
+        // A cwd the event log recorded is the directory the CLI actually ran in, so the
+        // store never overrides it — only fills its absence.
+        let resolved = cwd_key.or_else(|| store_cwd.clone());
+        let approximate_cwd = resolved.is_none();
+        let resolved_cwd = resolved
+            .unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned());
         result.sessions.push(RawSession {
             provider: "copilot".to_string(),
             session_id: if multiple {
@@ -1120,16 +1317,16 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
         });
     }
     for (subagent_id, subagent_cwd, interval) in subagent_intervals {
-        let approximate_cwd = subagent_cwd.is_empty();
+        let resolved = Some(subagent_cwd)
+            .filter(|value| !value.is_empty())
+            .or_else(|| store_cwd.clone());
+        let approximate_cwd = resolved.is_none();
         result.sessions.push(RawSession {
             provider: "copilot".to_string(),
             session_id: format!("{base_id}:subagent:{subagent_id}"),
             source_file: path.to_path_buf(),
-            cwd: if approximate_cwd {
-                path.parent().unwrap_or(path).to_string_lossy().into_owned()
-            } else {
-                subagent_cwd
-            },
+            cwd: resolved
+                .unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned()),
             points: Vec::new(),
             exact_intervals: vec![interval],
             human_points: Vec::new(),
@@ -1139,10 +1336,424 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             version: version.clone(),
         });
     }
+    report_copilot_repository_disagreement(&mut result, store_entry, &base_id, path);
     if result.sessions.is_empty() {
         result.diagnostics.skipped_sessions += 1;
     }
     result
+}
+
+/// `sessions.repository` is a hint, never a verdict: on the machine this was designed
+/// against, one row in seven named `Cratis/Chronicle` for a session that ran in
+/// `.../cratis/Arc`. The working directory decides where the session is reported, and
+/// the disagreement is said out loud so a wrong slug is visible rather than silently
+/// preferred or silently dropped.
+fn report_copilot_repository_disagreement(
+    result: &mut ParsedFile,
+    entry: Option<&CopilotStoreSession>,
+    session_id: &str,
+    path: &Path,
+) {
+    let Some(entry) = entry else {
+        return;
+    };
+    // Only a GitHub-hosted session carries an `owner/repo` slug; anything else is a
+    // string this comparison has no business interpreting.
+    let hosted_on_github = entry
+        .host_type
+        .as_deref()
+        .is_none_or(|value| value.eq_ignore_ascii_case("github"));
+    if !hosted_on_github {
+        return;
+    }
+    let Some(repository) = entry
+        .repository
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(cwd) = result
+        .sessions
+        .iter()
+        .find(|session| !session.approximate_cwd)
+        .map(|session| session.cwd.as_str())
+    else {
+        return;
+    };
+    if repository_matches_directory(repository, cwd) {
+        return;
+    }
+    let branch = entry
+        .branch
+        .as_deref()
+        .map(|branch| format!(" on branch {branch}"))
+        .unwrap_or_default();
+    result.diagnostics.warn(format!(
+        "GitHub Copilot session {session_id} records repository {repository}{branch} but ran in {cwd}; the working directory decides ({})",
+        path.display()
+    ));
+}
+
+/// Compares the name half of an `owner/repo` slug with the last component of the
+/// working directory. A clone legitimately sits in a differently named directory, so
+/// this only decides whether a disagreement is worth reporting — never which side wins.
+fn repository_matches_directory(repository: &str, cwd: &str) -> bool {
+    let name = repository.rsplit('/').next().unwrap_or(repository);
+    Path::new(cwd)
+        .file_name()
+        .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case(name))
+}
+
+fn copilot_session_directory(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::file_name)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn copilot_session_store_path(root: &Path) -> PathBuf {
+    root.parent().unwrap_or(root).join("session-store.db")
+}
+
+/// A session's working directory can come from the store, so a change to the row has to
+/// invalidate the cached parse of that session — the same reason the Gemini fingerprint
+/// follows `.project_root`. Bumped to v3 because a v2 entry was parsed without the
+/// store and may hold an approximate cwd the store can now resolve.
+fn copilot_context_fingerprint(store: &CopilotSessionStore, path: &Path) -> String {
+    match store.get(&copilot_session_directory(path)) {
+        Some(entry) => format!(
+            "copilot-v3:{}:{}:{}",
+            entry.cwd.as_deref().unwrap_or_default(),
+            entry.repository.as_deref().unwrap_or_default(),
+            entry.branch.as_deref().unwrap_or_default()
+        ),
+        None => "copilot-v3:none".to_string(),
+    }
+}
+
+/// Reads the Copilot CLI's SQLite session store for working-directory and repository
+/// attribution only.
+///
+/// The column list is closed on purpose. `turns` holds every prompt and response body
+/// the CLI has seen and `search_index*` is an FTS5 index over them; selecting from
+/// either would pull message text into the process, which the privacy boundary forbids.
+/// The connection is opened read-only for the same reason the Codex and OpenCode
+/// readers are — this tool must never be able to alter another program's state.
+///
+/// The store is a supplement, not a replacement: it held 7 sessions where
+/// `session-state/` held 19, because it does not backfill. It therefore adds nothing
+/// the event log already knows, and creates no session of its own — without reading
+/// `turns` there are no timestamps to place one in time with.
+pub fn read_copilot_session_store(
+    path: &Path,
+    diagnostics: &mut Diagnostics,
+) -> CopilotSessionStore {
+    if !path.is_file() {
+        return CopilotSessionStore::default();
+    }
+    let result = (|| -> rusqlite::Result<CopilotSessionStore> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if !sqlite_table_exists(&connection, "sessions")? {
+            return Ok(CopilotSessionStore::default());
+        }
+        let columns = sqlite_columns(&connection, "sessions")?;
+        if !columns.contains("id") {
+            return Ok(CopilotSessionStore::default());
+        }
+        let column = |name: &str| {
+            if columns.contains(name) {
+                format!("\"{name}\"")
+            } else {
+                "NULL".to_string()
+            }
+        };
+        let query = format!(
+            "SELECT \"id\", {}, {}, {}, {} FROM sessions",
+            column("cwd"),
+            column("repository"),
+            column("branch"),
+            column("host_type")
+        );
+        let mut statement = connection.prepare(&query)?;
+        let mut rows = statement.query([])?;
+        let mut store = CopilotSessionStore::default();
+        while let Some(row) = rows.next()? {
+            // One unreadable cell costs one row, as in the OpenCode reader; a session
+            // without an id cannot be joined to anything anyway.
+            let Some(id) = sqlite_text(row, 0).filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            store.by_id.insert(
+                id,
+                CopilotStoreSession {
+                    cwd: sqlite_text(row, 1),
+                    repository: sqlite_text(row, 2),
+                    branch: sqlite_text(row, 3),
+                    host_type: sqlite_text(row, 4),
+                },
+            );
+        }
+        Ok(store)
+    })();
+    match result {
+        Ok(store) => store,
+        Err(error) => {
+            // A missing or newer store is not a broken run: the event log stays the
+            // primary source and simply keeps whatever it knew on its own.
+            diagnostics.warn(format!(
+                "GitHub Copilot session store ignored: {}: {error}",
+                path.display()
+            ));
+            CopilotSessionStore::default()
+        }
+    }
+}
+
+/// Reads one VS Code Copilot Chat session.
+///
+/// Two things make this unlike the JSONL adapters. The file is a single JSON document,
+/// so the line bound the others rely on cannot apply and the whole-file cap is what
+/// keeps memory bounded. And VS Code records how long each turn actually took, so agent
+/// time here is measured rather than estimated: the `--gap-cap` heuristic every other
+/// adapter needs is not used, and must not be layered on top of a real duration.
+pub fn parse_copilot_vscode_file(path: &Path, max_bytes: u64) -> ParsedFile {
+    let mut result = ParsedFile::default();
+    let document = File::open(path)
+        .map_err(anyhow::Error::from)
+        .and_then(|file| {
+            let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if size > max_bytes {
+                anyhow::bail!("chat session larger than {max_bytes} bytes");
+            }
+            // The BufReader is not cosmetic: serde_json's `IoRead` issues one syscall
+            // per byte, which measured ~90x slower on a large session.
+            serde_json::from_reader::<_, VsCodeChatSession>(BufReader::with_capacity(
+                128 * 1024,
+                file,
+            ))
+            .map_err(Into::into)
+        });
+    let document = match document {
+        Ok(document) => document,
+        Err(error) => {
+            // Best-effort by design: VS Code owns this format and changes it. A session
+            // that cannot be read is reported and skipped, never guessed at.
+            result.diagnostics.unreadable_files += 1;
+            result.diagnostics.warn(format!(
+                "invalid Copilot Chat session skipped: {}: {error}",
+                path.display()
+            ));
+            return result;
+        }
+    };
+    if document
+        .version
+        .is_some_and(|value| value > f64::from(COPILOT_VSCODE_FORMAT_VERSION))
+    {
+        result.diagnostics.skipped_sessions += 1;
+        result.diagnostics.warn(format!(
+            "Copilot Chat session format is newer than v{COPILOT_VSCODE_FORMAT_VERSION}, skipped: {}",
+            path.display()
+        ));
+        return result;
+    }
+
+    let mut points = Vec::new();
+    let mut human_points = Vec::new();
+    let mut exact_intervals = Vec::new();
+    let mut current_model = "unknown".to_string();
+    for request in document.requests {
+        if let Some(model) = request.model_id.as_deref() {
+            current_model = copilot_vscode_model(model);
+        }
+        let Some(timestamp) = request.timestamp.and_then(parse_epoch_milliseconds) else {
+            continue;
+        };
+        let point = ActivityPoint {
+            timestamp,
+            model: current_model.clone(),
+        };
+        // The instant the developer submitted a prompt, which is the same human
+        // evidence the other adapters take from a user message.
+        human_points.push(point.clone());
+        let elapsed = request
+            .result
+            .and_then(|value| value.timings)
+            .and_then(|timings| timings.total_elapsed);
+        match exact_vscode_interval(timestamp, elapsed, &current_model) {
+            // A measured turn needs no activity point: a point would add a gap-capped
+            // range on top of the exact interval and stretch a 30-second turn to the
+            // gap cap.
+            Some(interval) => exact_intervals.push(interval),
+            // A cancelled or still-running turn has no duration to trust, so it falls
+            // back to the ordinary point timeline rather than disappearing.
+            None => points.push(point),
+        }
+    }
+    if points.is_empty() && exact_intervals.is_empty() && human_points.is_empty() {
+        result.diagnostics.skipped_sessions += 1;
+        return result;
+    }
+
+    let workspace =
+        copilot_vscode_workspace_file(path).and_then(|file| vscode_workspace_folder(&file));
+    let approximate_cwd = workspace.is_none();
+    let cwd =
+        workspace.unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned());
+    let session_id = document
+        .session_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| file_stem(path));
+    // The workspace-storage directory is part of the id because the aggregator keys a
+    // session by (provider, id) alone, and storage directories get copied between
+    // machines and workspaces — two files carrying one id would otherwise collapse into
+    // a single session.
+    let workspace_key = copilot_vscode_workspace_key(path);
+    result.sessions.push(RawSession {
+        provider: "copilot-vscode".to_string(),
+        session_id: if workspace_key.is_empty() {
+            session_id
+        } else {
+            format!("{session_id}:{workspace_key}")
+        },
+        source_file: path.to_path_buf(),
+        cwd,
+        points,
+        exact_intervals,
+        human_points,
+        // Copilot Chat records a premium-request multiplier ("GPT-5 mini • 1x"), never
+        // token counts, so there is nothing honest to report here.
+        token_events: Vec::new(),
+        is_subagent: false,
+        approximate_cwd,
+        version: document
+            .version
+            .map(|value| format!("vscode-chat-v{}", value.round() as i64)),
+    });
+    result
+}
+
+/// `result.timings.totalElapsed` is the measured duration of one turn in milliseconds.
+fn exact_vscode_interval(
+    start: DateTime<Utc>,
+    elapsed_milliseconds: Option<f64>,
+    model: &str,
+) -> Option<ExactInterval> {
+    let elapsed = elapsed_milliseconds?;
+    if !elapsed.is_finite() || elapsed <= 0.0 || elapsed > MAX_EXACT_DURATION_MS {
+        return None;
+    }
+    // `checked_add_signed` rather than `+`: chrono panics when a timestamp from a file
+    // this tool does not control plus a duration leaves the representable range.
+    let end = start.checked_add_signed(chrono::Duration::milliseconds(elapsed.round() as i64))?;
+    Some(ExactInterval {
+        start,
+        end,
+        model: model.to_string(),
+    })
+}
+
+/// `copilot/gpt-5-mini` names the vendor twice once the provider column already says
+/// Copilot, so the prefix is dropped — the CLI adapter reports the same models
+/// unprefixed, and a model column that spells one product two ways cannot be grouped.
+fn copilot_vscode_model(value: &str) -> String {
+    safe_model(value.strip_prefix("copilot/").unwrap_or(value))
+}
+
+/// `chatSessions/` sits beside `workspace.json` inside one workspace-storage directory.
+fn copilot_vscode_workspace_file(path: &Path) -> Option<PathBuf> {
+    Some(path.parent()?.parent()?.join("workspace.json"))
+}
+
+fn copilot_vscode_workspace_key(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// A chat session takes its working directory from an out-of-band `workspace.json`, so
+/// the fingerprint has to follow that file: a constant one kept a workspace pinned to a
+/// stale directory for as long as the transcript itself was untouched (the Gemini
+/// `.project_root` bug).
+fn copilot_vscode_context_fingerprint(path: &Path) -> String {
+    match copilot_vscode_workspace_file(path) {
+        Some(file) => format!("copilot-vscode-v1:{}", crate::cache::file_context(&file)),
+        None => "copilot-vscode-v1:none".to_string(),
+    }
+}
+
+/// Maps a workspace-storage directory to the folder it belongs to. The file holds a
+/// handful of bytes — `{"folder": "file:///…"}` — but it is bounded anyway, since
+/// nothing about it is under this tool's control.
+fn vscode_workspace_folder(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let record: VsCodeWorkspace = serde_json::from_slice(&bytes).ok()?;
+    record
+        .folder
+        .or_else(|| {
+            record
+                .folders
+                .into_iter()
+                .find_map(|folder| folder.uri.or(folder.path))
+        })
+        .as_deref()
+        .and_then(file_url_to_path)
+}
+
+/// `file:///Volumes/sourcecode/repos/example` is a URL, so it has to be decoded before
+/// it names anything on disk. Only a local `file://` URL with an empty authority maps
+/// to a path: a UNC share or a `vscode-remote://` URI names a place this machine cannot
+/// measure, so it is declined and the session keeps an approximate cwd.
+fn file_url_to_path(value: &str) -> Option<String> {
+    let rest = value.strip_prefix("file://")?;
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let decoded = percent_decode(rest);
+    // `file:///c%3A/Users/…` decodes to `/c:/Users/…`; that leading separator belongs to
+    // the URL, not to the Windows path.
+    let bytes = decoded.as_bytes();
+    if bytes.len() >= 3 && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        return Some(decoded[1..].to_string());
+    }
+    Some(decoded)
+}
+
+/// Decodes `%XX` escapes over bytes rather than characters: a `%` followed by a
+/// multi-byte character would panic a `str` slice, and a percent-escape can encode one
+/// byte of a UTF-8 sequence, which only reassembles correctly as bytes.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            high.zip(low)
+                .and_then(|(high, low)| u8::try_from(high * 16 + low).ok())
+        } else {
+            None
+        };
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
@@ -2559,7 +3170,8 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        let parsed =
+            parse_copilot_file(&path, &CopilotSessionStore::default(), MAX_JSONL_LINE_BYTES);
         assert_eq!(2, parsed.sessions.len());
         let foreground = parsed
             .sessions
@@ -2935,7 +3547,8 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        let parsed =
+            parse_copilot_file(&path, &CopilotSessionStore::default(), MAX_JSONL_LINE_BYTES);
         let foreground = parsed
             .sessions
             .iter()
@@ -3090,7 +3703,8 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        let parsed =
+            parse_copilot_file(&path, &CopilotSessionStore::default(), MAX_JSONL_LINE_BYTES);
         assert_eq!(2, parsed.sessions.len());
         let usage_session = parsed
             .sessions
@@ -3139,7 +3753,8 @@ mod tests {
         )
         .unwrap();
 
-        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        let parsed =
+            parse_copilot_file(&path, &CopilotSessionStore::default(), MAX_JSONL_LINE_BYTES);
         assert_eq!(1, parsed.sessions.len());
         assert_eq!(2, parsed.sessions[0].points.len());
         assert!(
@@ -3322,5 +3937,289 @@ mod tests {
         let events = &parsed.sessions[0].token_events;
         assert_eq!(1, events.len());
         assert_eq!(120, events[0].usage.total());
+    }
+
+    /// Builds `<root>/<workspace>/chatSessions/<name>.json` and the `workspace.json`
+    /// beside it, which is the whole layout the VS Code adapter depends on.
+    fn vscode_chat_session(
+        root: &Path,
+        workspace: &str,
+        name: &str,
+        folder: Option<&str>,
+        document: &serde_json::Value,
+    ) -> PathBuf {
+        let storage = root.join(workspace);
+        let sessions = storage.join("chatSessions");
+        fs::create_dir_all(&sessions).unwrap();
+        if let Some(folder) = folder {
+            fs::write(
+                storage.join("workspace.json"),
+                serde_json::json!({ "folder": folder }).to_string(),
+            )
+            .unwrap();
+        }
+        let path = sessions.join(format!("{name}.json"));
+        fs::write(&path, document.to_string()).unwrap();
+        path
+    }
+
+    #[test]
+    fn copilot_chat_requests_become_prompts_and_an_exact_interval() {
+        let root = tempdir().unwrap();
+        let storage = root.path().join("workspaceStorage");
+        // A percent-escaped space in the folder URL: `workspace.json` stores a URL, not
+        // a path, and an undecoded one names no directory on this machine.
+        let project = root.path().join("repos/my example");
+        fs::create_dir_all(&project).unwrap();
+        let folder = format!("file://{}/repos/my%20example", root.path().display());
+        let document = serde_json::json!({
+            "version": 3,
+            "sessionId": "chat-one",
+            "requests": [
+                {
+                    "timestamp": 1_767_225_600_000_i64,
+                    "modelId": "copilot/gpt-test",
+                    "message": {"text": "not parsed"},
+                    "response": [{"value": "not parsed"}],
+                    "result": {
+                        "timings": {"firstProgress": 500, "totalElapsed": 30000},
+                        "metadata": {"renderedUserMessage": ["not parsed"]}
+                    }
+                },
+                // Cancelled before VS Code measured anything.
+                {
+                    "timestamp": 1_767_225_900_000_i64,
+                    "modelId": "copilot/gpt-test",
+                    "message": {"text": "not parsed"},
+                    "isCanceled": true
+                }
+            ]
+        });
+        let path = vscode_chat_session(
+            &storage,
+            "1a2b",
+            "session",
+            Some(folder.as_str()),
+            &document,
+        );
+        // Neither of these is a chat session, and a looser walk would parse both.
+        fs::write(storage.join("1a2b/state.json"), "{}").unwrap();
+        fs::write(storage.join("1a2b/chatSessions/notes.txt"), "text").unwrap();
+
+        assert_eq!(vec![path.clone()], discover_copilot_vscode_files(&storage));
+
+        let parsed = parse_copilot_vscode_file(&path, MAX_VSCODE_CHAT_JSON_BYTES);
+        assert_eq!(1, parsed.sessions.len());
+        let session = &parsed.sessions[0];
+        assert_eq!("copilot-vscode", session.provider);
+        assert!(!session.is_subagent);
+        assert_eq!(project.to_string_lossy(), session.cwd);
+        assert!(!session.approximate_cwd);
+        // Both submissions are human evidence; only the measured turn is agent time.
+        assert_eq!(2, session.human_points.len());
+        assert_eq!(1, session.exact_intervals.len());
+        assert_eq!(1, session.points.len());
+        assert_eq!("gpt-test", session.exact_intervals[0].model);
+        assert_eq!(
+            30,
+            (session.exact_intervals[0].end - session.exact_intervals[0].start).num_seconds()
+        );
+        // Copilot reports no token counts anywhere, so none may be invented.
+        assert!(session.token_events.is_empty());
+        assert_eq!("chat-one:1a2b", session.session_id);
+    }
+
+    #[test]
+    fn a_chat_session_without_a_workspace_keeps_an_approximate_directory() {
+        let root = tempdir().unwrap();
+        let document = serde_json::json!({
+            "version": 3,
+            "requests": [{"timestamp": 1_767_225_600_000_i64, "modelId": "copilot/gpt-test"}]
+        });
+        let path = vscode_chat_session(root.path(), "3c4d", "session", None, &document);
+        let parsed = parse_copilot_vscode_file(&path, MAX_VSCODE_CHAT_JSON_BYTES);
+        assert!(parsed.sessions[0].approximate_cwd);
+        // A remote workspace names a place this machine cannot measure.
+        assert_eq!(None, file_url_to_path("vscode-remote://ssh-remote/work"));
+        assert_eq!(
+            Some("C:/Users/test/project".to_string()),
+            file_url_to_path("file:///C%3A/Users/test/project")
+        );
+    }
+
+    #[test]
+    fn an_oversized_chat_session_is_declined_rather_than_read() {
+        let root = tempdir().unwrap();
+        let document = serde_json::json!({
+            "version": 3,
+            "sessionId": "chat-one",
+            "requests": [{"timestamp": 1_767_225_600_000_i64, "modelId": "copilot/gpt-test"}]
+        });
+        let path = vscode_chat_session(root.path(), "1a2b", "session", None, &document);
+        // Sessions reach 6.4 MB and arrive in directories of a hundred; the cap is what
+        // keeps one file from deciding the whole run's memory use.
+        let parsed = parse_copilot_vscode_file(&path, 16);
+        assert!(parsed.sessions.is_empty());
+        assert_eq!(1, parsed.diagnostics.unreadable_files);
+    }
+
+    #[test]
+    fn an_unreadable_or_newer_chat_session_degrades_to_a_diagnostic() {
+        let root = tempdir().unwrap();
+        let sessions = root.path().join("1a2b/chatSessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let truncated = sessions.join("truncated.json");
+        fs::write(&truncated, r#"{"version": 3, "requests": ["#).unwrap();
+        let parsed = parse_copilot_vscode_file(&truncated, MAX_VSCODE_CHAT_JSON_BYTES);
+        assert!(parsed.sessions.is_empty());
+        assert_eq!(1, parsed.diagnostics.unreadable_files);
+        assert!(
+            parsed.diagnostics.messages[0].contains("Copilot Chat"),
+            "unexpected diagnostic {:?}",
+            parsed.diagnostics.messages
+        );
+
+        // A format VS Code has moved on from is skipped rather than mis-parsed: the
+        // fields would still deserialize, and would quietly mean something else.
+        let document = serde_json::json!({
+            "version": 4,
+            "requests": [{"timestamp": 1_767_225_600_000_i64, "modelId": "copilot/gpt-test"}]
+        });
+        let newer = vscode_chat_session(root.path(), "3c4d", "session", None, &document);
+        let parsed = parse_copilot_vscode_file(&newer, MAX_VSCODE_CHAT_JSON_BYTES);
+        assert!(parsed.sessions.is_empty());
+        assert_eq!(1, parsed.diagnostics.skipped_sessions);
+        assert_eq!(0, parsed.diagnostics.unreadable_files);
+    }
+
+    #[test]
+    fn the_copilot_session_store_fills_a_missing_directory_without_reading_messages() {
+        let root = tempdir().unwrap();
+        let arc = root.path().join("repos/Arc");
+        let chronicle = root.path().join("repos/Chronicle");
+        fs::create_dir_all(&arc).unwrap();
+        fs::create_dir_all(&chronicle).unwrap();
+        let database = root.path().join("session-store.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    cwd TEXT,
+                    repository TEXT,
+                    host_type TEXT,
+                    branch TEXT,
+                    summary TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                );
+                CREATE TABLE turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    user_message TEXT,
+                    assistant_response TEXT
+                );",
+            )
+            .unwrap();
+        for (id, cwd, repository) in [
+            ("68c65742", &arc, "Cratis/Chronicle"),
+            ("780e0e2d", &chronicle, "Cratis/Chronicle"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sessions(id, cwd, repository, host_type, branch) VALUES (?1, ?2, ?3, 'github', 'main')",
+                    rusqlite::params![id, cwd.to_string_lossy(), repository],
+                )
+                .unwrap();
+        }
+        // Present exactly so a widened column list would be caught: these bodies are
+        // what the reader must never select.
+        connection
+            .execute(
+                "INSERT INTO turns(session_id, user_message, assistant_response) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["68c65742", "SECRET PROMPT", "SECRET RESPONSE"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut diagnostics = Diagnostics::default();
+        let store = read_copilot_session_store(&database, &mut diagnostics);
+        assert!(
+            diagnostics.messages.is_empty(),
+            "{:?}",
+            diagnostics.messages
+        );
+
+        // A session whose event log never recorded a working directory: without the
+        // store it lands under the transcript's own directory, marked approximate.
+        let records = |id: &str| {
+            [
+                serde_json::json!({
+                    "type": "session.start",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "data": {"sessionId": id, "selectedModel": "gpt-test"}
+                }),
+                serde_json::json!({
+                    "type": "user.message",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "data": {}
+                }),
+                serde_json::json!({
+                    "type": "assistant.message",
+                    "timestamp": "2026-01-01T00:01:00Z",
+                    "data": {}
+                }),
+            ]
+            .into_iter()
+            .map(|record| record.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
+        let disagreeing = root.path().join("session-state/68c65742/events.jsonl");
+        fs::create_dir_all(disagreeing.parent().unwrap()).unwrap();
+        fs::write(&disagreeing, records("68c65742")).unwrap();
+
+        let parsed = parse_copilot_file(&disagreeing, &store, MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.sessions.len());
+        assert_eq!(arc.to_string_lossy(), parsed.sessions[0].cwd);
+        assert!(!parsed.sessions[0].approximate_cwd);
+        // `repository` was wrong in one row of seven on the machine this was designed
+        // against: the directory decides, and the disagreement is reported.
+        let message = parsed
+            .diagnostics
+            .messages
+            .iter()
+            .find(|message| message.contains("Cratis/Chronicle"))
+            .expect("the repository disagreement is reported");
+        assert!(message.contains("Arc"), "unexpected diagnostic {message}");
+        assert!(
+            !parsed
+                .diagnostics
+                .messages
+                .iter()
+                .any(|message| message.contains("SECRET")),
+            "message bodies must never leave the database"
+        );
+
+        // The agreeing row says nothing, because there is nothing to warn about.
+        let agreeing = root.path().join("session-state/780e0e2d/events.jsonl");
+        fs::create_dir_all(agreeing.parent().unwrap()).unwrap();
+        fs::write(&agreeing, records("780e0e2d")).unwrap();
+        let parsed = parse_copilot_file(&agreeing, &store, MAX_JSONL_LINE_BYTES);
+        assert_eq!(chronicle.to_string_lossy(), parsed.sessions[0].cwd);
+        assert!(
+            parsed.diagnostics.messages.is_empty(),
+            "{:?}",
+            parsed.diagnostics.messages
+        );
+
+        // Without the store the same transcript cannot say where it ran, which is the
+        // gap the database closes.
+        let parsed = parse_copilot_file(
+            &agreeing,
+            &CopilotSessionStore::default(),
+            MAX_JSONL_LINE_BYTES,
+        );
+        assert!(parsed.sessions[0].approximate_cwd);
     }
 }

@@ -85,11 +85,8 @@ pub fn parse_bound(value: Option<&str>, until: bool) -> Result<Option<DateTime<U
         let start = NaiveDate::from_ymd_opt(year, month, 1)
             .ok_or_else(|| anyhow::anyhow!("date must be YYYY-MM or YYYY-MM-DD"))?;
         if until {
-            if month == 12 {
-                NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap()
-            } else {
-                NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap()
-            }
+            let (year, month) = month_after(year, month);
+            NaiveDate::from_ymd_opt(year, month, 1).unwrap()
         } else {
             start
         }
@@ -105,6 +102,111 @@ pub fn parse_bound(value: Option<&str>, until: bool) -> Result<Option<DateTime<U
         bail!("date must be YYYY-MM or YYYY-MM-DD");
     };
     Ok(Some(local_midnight(date)))
+}
+
+/// Rolling December into the following January, and January back into the
+/// preceding December, is the case every calendar boundary in this module gets
+/// wrong first, so both live in one place instead of at each call site.
+fn month_after(year: i32, month: u32) -> (i32, u32) {
+    if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    }
+}
+
+fn month_before(year: i32, month: u32) -> (i32, u32) {
+    if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    }
+}
+
+fn month_start(year: i32, month: u32) -> Option<DateTime<Utc>> {
+    NaiveDate::from_ymd_opt(year, month, 1).map(local_midnight)
+}
+
+/// The window a calendar shorthand stands for, half-open as `[since, until)`:
+/// `until` is the first instant *after* the span, which is what
+/// `parse_bound(.., true)` produces and what the report's `>= since && < until`
+/// filter expects. An inclusive end would silently drop the span's last day.
+pub type CalendarSpan = (DateTime<Utc>, DateTime<Utc>);
+
+/// One calendar month, or `None` when there is no such month. Both ends are
+/// built by the same pair of helpers, so the December rollover cannot come out
+/// right on one end and wrong on the other.
+fn month_span_of(year: i32, month: u32) -> Option<CalendarSpan> {
+    let (next_year, next_month) = month_after(year, month);
+    let start = month_start(year, month)?;
+    let end = month_start(next_year, next_month)?;
+    Some((start, end))
+}
+
+/// The two relative spans `--month` and `--year` accept. They are what makes the
+/// shorthand worth having: without them a recurring monthly report is a date the
+/// user has to edit every month.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelativeSpan {
+    Current,
+    Previous,
+}
+
+fn relative_span(value: &str) -> Option<RelativeSpan> {
+    match value.to_ascii_lowercase().as_str() {
+        "current" | "this" => Some(RelativeSpan::Current),
+        "last" | "previous" => Some(RelativeSpan::Previous),
+        _ => None,
+    }
+}
+
+/// The span `--month` is shorthand for. The reference instant is passed in
+/// rather than read from the clock so `current` and `last` stay testable, and
+/// it is read on the *local* calendar, the same one every bound here snaps to.
+pub fn month_span(value: &str, reference: DateTime<Utc>) -> Result<CalendarSpan> {
+    let value = value.trim();
+    let (year, month): (i32, u32) = match relative_span(value) {
+        Some(RelativeSpan::Current) => {
+            let today = reference.with_timezone(&Local).date_naive();
+            (today.year(), today.month())
+        }
+        Some(RelativeSpan::Previous) => {
+            let today = reference.with_timezone(&Local).date_naive();
+            month_before(today.year(), today.month())
+        }
+        None => {
+            let expression = Regex::new(r"^(\d{4})-(\d{2})$").expect("static regex");
+            let Some(captures) = expression.captures(value) else {
+                bail!("month must be YYYY-MM, current (this), or last (previous)");
+            };
+            (captures[1].parse()?, captures[2].parse()?)
+        }
+    };
+    let Some(span) = month_span_of(year, month) else {
+        bail!("month must be YYYY-MM, current (this), or last (previous)");
+    };
+    Ok(span)
+}
+
+/// The span `--year` is shorthand for. It runs from January's start to
+/// December's end, so the year rollover is the same one `month_span` uses.
+pub fn year_span(value: &str, reference: DateTime<Utc>) -> Result<CalendarSpan> {
+    let value = value.trim();
+    let year: i32 = match relative_span(value) {
+        Some(RelativeSpan::Current) => reference.with_timezone(&Local).year(),
+        Some(RelativeSpan::Previous) => reference.with_timezone(&Local).year() - 1,
+        None => {
+            let expression = Regex::new(r"^\d{4}$").expect("static regex");
+            if !expression.is_match(value) {
+                bail!("year must be YYYY, current (this), or last (previous)");
+            }
+            value.parse()?
+        }
+    };
+    let (Some(january), Some(december)) = (month_span_of(year, 1), month_span_of(year, 12)) else {
+        bail!("year must be YYYY, current (this), or last (previous)");
+    };
+    Ok((january.0, december.1))
 }
 
 pub fn nearest_models(points: &[ActivityPoint]) -> Vec<ActivityPoint> {
@@ -388,11 +490,8 @@ pub fn split_interval(interval: &Interval, dimension: &str) -> Vec<(String, Inte
                 date.succ_opt().unwrap(),
             )
         } else {
-            let next = if date.month() == 12 {
-                NaiveDate::from_ymd_opt(date.year() + 1, 1, 1).unwrap()
-            } else {
-                NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1).unwrap()
-            };
+            let (year, month) = month_after(date.year(), date.month());
+            let next = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
             (date.format("%Y-%m").to_string(), next)
         };
         let end = interval.end.min(local_midnight(boundary_date));
@@ -650,6 +749,53 @@ mod tests {
         assert_eq!("2026-03-01", local_date(february));
         let day = parse_bound(Some("2026-02-01"), true).unwrap().unwrap();
         assert_eq!("2026-02-02", local_date(day));
+    }
+
+    /// The shorthand has to land on exactly the pair a user would have typed by
+    /// hand, or `--month 2026-12` quietly reports a different window than
+    /// `--since 2026-12 --until 2026-12`.
+    #[test]
+    fn calendar_spans_match_the_bounds_they_stand_for() {
+        let reference = Local
+            .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc);
+        let bounds = |since: &str, until: &str| {
+            (
+                parse_bound(Some(since), false).unwrap().unwrap(),
+                parse_bound(Some(until), true).unwrap().unwrap(),
+            )
+        };
+        let month = |value: &str| month_span(value, reference).unwrap();
+        let year = |value: &str| year_span(value, reference).unwrap();
+
+        assert_eq!(bounds("2026-08", "2026-08"), month("2026-08"));
+        // December has to roll the year over rather than reach for month 13.
+        assert_eq!(bounds("2026-12", "2026-12"), month("2026-12"));
+        assert_eq!("2027-01-01", local_date(month("2026-12").1));
+        assert_eq!(bounds("2026-01", "2026-12"), year("2026"));
+
+        // Resolved against the reference, never the clock, so these hold in
+        // whatever month the suite happens to run in.
+        for value in ["current", "This"] {
+            assert_eq!(bounds("2026-01", "2026-01"), month(value));
+        }
+        // The month before January is the December of the year before.
+        for value in ["last", "PREVIOUS"] {
+            assert_eq!(bounds("2025-12", "2025-12"), month(value));
+        }
+        assert_eq!(bounds("2026-01", "2026-12"), year("current"));
+        assert_eq!(bounds("2025-01", "2025-12"), year("last"));
+
+        for value in ["", "2026", "2026-13", "2026-00", "2026-8", "next"] {
+            let rejected = month_span(value, reference).is_err();
+            assert!(rejected, "--month {value} must be rejected");
+        }
+        for value in ["", "26", "2026-01", "next"] {
+            let rejected = year_span(value, reference).is_err();
+            assert!(rejected, "--year {value} must be rejected");
+        }
     }
 
     #[test]
