@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -11,7 +10,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use tempfile::tempfile;
 
 use crate::classify::{CategoryTally, classify};
-use crate::model::{Diagnostics, GitCommit};
+use crate::model::{Authorship, Diagnostics, GitCommit};
 use crate::paths::PathResolver;
 
 pub const DEFAULT_IGNORES: &[&str] = &[
@@ -42,6 +41,48 @@ pub const DEFAULT_IGNORES: &[&str] = &[
     "Gemfile.lock",
     "go.sum",
 ];
+
+/// The coding agents whose commits arrive in an ordinary `git fetch`, as Git
+/// author patterns.
+///
+/// Each one matches the tail of an address, never the number in front of it:
+/// `198982749+Copilot@…` and `223556219+Copilot@…` are both GitHub's Copilot in
+/// this machine's history, so an identity keyed on the id matches some of an
+/// agent's work and silently misses the rest. Matching the address also covers
+/// every display name the same account commits under — `Copilot` and
+/// `copilot-swe-agent[bot]` share one address — which is what keeps this from
+/// becoming a list of names to chase.
+///
+/// Automation that is not an AI agent is deliberately absent. `github-actions`
+/// and `dependabot` push far more commits than Copilot does, and counting a
+/// version bump as agent output would say something false about both.
+///
+/// These are *basic* regular expressions, because that is what `git log`
+/// defaults to: `+`, `?`, `(`, `)` and `|` are literals here, and a backslash
+/// is what would turn them into operators. See `git_regex_literal`.
+pub const DEFAULT_AGENT_AUTHORS: &[&str] = &[
+    r"+Copilot@users\.noreply\.github\.com>",
+    r"<copilot@github\.com>",
+    r"+claude\[bot\]@users\.noreply\.github\.com>",
+    r"<noreply@anthropic\.com>",
+];
+
+/// `W` marks a commit header: no `--numstat` field can begin with it followed
+/// by a tab except a path that literally starts `W<TAB>`, and `parse_git_log`
+/// only reads the sentinel where a path cannot be.
+const COMMIT_HEADER: &str = "--pretty=format:W%x09%H%x09%aI";
+
+/// The same header plus every `Co-authored-by:` value, `\x02`-separated.
+///
+/// `unfold` is load-bearing rather than cosmetic. A trailer continued on an
+/// indented line otherwise arrives with a newline inside it, and the newline
+/// that closes the header would then be found in the middle of the trailer —
+/// which silently costs that commit its entire diff. Verified against Git
+/// 2.50.1 with a folded trailer, both ways.
+///
+/// Only the values are asked for, so no part of a commit message but the
+/// identities on its trailers is ever read into memory.
+const COMMIT_HEADER_WITH_CO_AUTHORS: &str = "--pretty=format:W%x09%H%x09%aI%x09%(trailers:key=Co-authored-by,valueonly,separator=%x02,unfold)";
 
 pub fn git_executable() -> Option<PathBuf> {
     if let Some(configured) = env::var_os("WORKSTATS_GIT") {
@@ -101,13 +142,18 @@ pub fn default_git_author() -> Option<String> {
     None
 }
 
+/// Escapes `value` so that `git log --author` matches it as plain text.
+///
+/// `--author` takes a *basic* regular expression, and in one `+`, `?`, `(`,
+/// `)`, `{`, `}` and `|` are already literal — a backslash is what promotes
+/// them to operators. Escaping them is therefore the opposite of escaping them:
+/// `person+work@example.com` written as `person\+work@…` asks GNU BRE for "one
+/// or more n" and matches nothing that address ever committed, so every
+/// plus-addressed author quietly reported an empty history.
 fn git_regex_literal(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     for character in value.chars() {
-        if matches!(
-            character,
-            '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
-        ) {
+        if matches!(character, '.' | '^' | '$' | '*' | '[' | '\\') {
             result.push('\\');
         }
         result.push(character);
@@ -167,10 +213,113 @@ fn discover_at(path: &Path, relative_depth: usize, maximum: usize, found: &mut V
     }
 }
 
+/// One `git log` pass: whose commits it asks Git for, and what may be concluded
+/// from them.
+///
+/// There are two passes rather than one widened `--author` because the two
+/// answers must never be summed. Widening the filter is the obvious shortcut
+/// and it is precisely the failure this tool exists to prevent: the agent's
+/// commits would land in the collection the human estimate is built from, and
+/// each one would cluster into a work block carrying setup and review credit
+/// for work no person did. The repositories on one developer's machine can hold
+/// thousands of them.
+struct Pass<'a> {
+    /// `--author` patterns, OR-ed by Git, which accepts the flag repeatedly.
+    /// A list rather than one alternation because `--author` is a *basic*
+    /// regular expression: alternation there is spelled `\|`, a built-in
+    /// default relying on that reads as a typo, and the first person to
+    /// "correct" it to `|` would break it silently.
+    authors: &'a [String],
+    /// Stamped on every commit the pass produces.
+    authorship: Authorship,
+    /// Whether to ask Git for `Co-authored-by:` values.
+    co_authors: bool,
+}
+
+/// The commits the configured author wrote. These are human evidence; nothing
+/// else in this file is.
 #[allow(clippy::too_many_arguments)]
 pub fn read_git_commits(
     base: &Path,
     author: &str,
+    resolver: &mut PathResolver,
+    diagnostics: &mut Diagnostics,
+    depth: usize,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    repo_filter: Option<&str>,
+    path_includes: &[String],
+    path_excludes: &[String],
+    no_ignore: bool,
+    co_authors: bool,
+) -> Vec<GitCommit> {
+    let authors = [author.to_string()];
+    collect_commits(
+        base,
+        &Pass {
+            authors: &authors,
+            authorship: Authorship::default(),
+            co_authors,
+        },
+        resolver,
+        diagnostics,
+        depth,
+        since,
+        until,
+        repo_filter,
+        path_includes,
+        path_excludes,
+        no_ignore,
+    )
+}
+
+/// The commits a coding agent wrote, from the same local history and with no
+/// network access: once a branch has been fetched, the agent's work is ordinary
+/// Git history. The result is output, and it is zero evidence that anyone was
+/// present — see `GitCommit::human_signal`.
+#[allow(clippy::too_many_arguments)]
+pub fn read_agent_commits(
+    base: &Path,
+    authors: &[String],
+    resolver: &mut PathResolver,
+    diagnostics: &mut Diagnostics,
+    depth: usize,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    repo_filter: Option<&str>,
+    path_includes: &[String],
+    path_excludes: &[String],
+    no_ignore: bool,
+) -> Vec<GitCommit> {
+    if authors.is_empty() {
+        return Vec::new();
+    }
+    collect_commits(
+        base,
+        &Pass {
+            authors,
+            authorship: Authorship::agent(),
+            // An agent's own commit is already agent-authored; who it credits
+            // beside itself changes nothing and would only cost a wider read of
+            // the message.
+            co_authors: false,
+        },
+        resolver,
+        diagnostics,
+        depth,
+        since,
+        until,
+        repo_filter,
+        path_includes,
+        path_excludes,
+        no_ignore,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_commits(
+    base: &Path,
+    pass: &Pass<'_>,
     resolver: &mut PathResolver,
     diagnostics: &mut Diagnostics,
     depth: usize,
@@ -230,17 +379,34 @@ pub fn read_git_commits(
             .arg("--no-pager")
             .arg("-C")
             .arg(&repo_path)
-            // Without this Git octal-escapes and quotes every non-ASCII path,
+            // Inert as long as `-z` is on, because Git only escapes a name
+            // when the record terminator is a newline. It stays because a
+            // reader added later that reads newline-terminated output would
+            // otherwise silently start octal-escaping every non-ASCII path,
             // which breaks extension detection and the ignore globs.
             .arg("-c")
             .arg("core.quotePath=false")
             .arg("log")
             .arg("--regexp-ignore-case")
-            .arg(format!("--author={author}"))
             .arg("--no-merges")
             .arg("--date=iso-strict")
-            .arg("--pretty=format:W%x09%H%x09%aI")
-            .arg("--numstat");
+            .arg(if pass.co_authors {
+                COMMIT_HEADER_WITH_CO_AUTHORS
+            } else {
+                COMMIT_HEADER
+            })
+            .arg("--numstat")
+            // NUL-separated fields let a path hold any byte and make a rename
+            // a stated fact rather than a guess at text; see `parse_git_log`.
+            // Rename detection itself stays on — `--no-renames` would turn
+            // every large move into thousands of phantom added and deleted
+            // lines.
+            .arg("-z");
+        // Git ORs repeated `--author` arguments, which is how one pass asks for
+        // several identities without any alternation syntax to get wrong.
+        for pattern in pass.authors {
+            command.arg(format!("--author={pattern}"));
+        }
         if let Some(since) = since {
             command.arg(format!("--since={}", iso(since)));
         }
@@ -288,6 +454,7 @@ pub fn read_git_commits(
         };
         let repo_commits = parse_git_log(
             BufReader::new(stdout),
+            pass,
             &repo,
             &cwd,
             &root,
@@ -324,7 +491,7 @@ pub fn read_git_commits(
     commits
 }
 
-/// One commit being accumulated across its `--numstat` lines.
+/// One commit being accumulated across its `--numstat` fields.
 #[derive(Default)]
 struct PendingCommit {
     sha: String,
@@ -336,10 +503,38 @@ struct PendingCommit {
     files: Vec<String>,
     categories: CategoryTally,
     matched_file: bool,
+    authorship: Authorship,
 }
 
+/// Which field of the `-z` stream comes next. A rename spends three fields on
+/// one change, and either of its path fields may itself read like a header or
+/// like a change — a file really can be named `W\tsomething` — so the two are
+/// claimed by position rather than recognised by shape.
+enum Expected {
+    Change,
+    RenameSource(u64, u64),
+    RenameTarget(u64, u64),
+}
+
+/// `git log -z --numstat` writes NUL-separated fields:
+///
+/// * change: `<added>\t<removed>\t<path>`
+/// * rename: `<added>\t<removed>\t` with an empty path, then two more fields —
+///   the path moved from and the path moved to
+/// * header: `W\t<sha>\t<date>`, glued to the front of the commit's first
+///   change field and closed by a newline. A commit with no diff has no field
+///   to be glued to, so Git closes its header with the field's own NUL. When
+///   the pass asks for them, a fourth header field carries the
+///   `Co-authored-by:` values, `\x02`-separated and empty when there are none.
+///
+/// Commits are separated by an empty field. Paths are the point of all this:
+/// under `-z` Git never quotes or escapes one, so a path may hold every byte
+/// but NUL — tabs, newlines, quotes, backslashes, braces and ` => ` included —
+/// and no field ever has to be un-mangled or guessed at.
+#[allow(clippy::too_many_arguments)]
 fn parse_git_log(
-    reader: impl BufRead,
+    mut reader: impl BufRead,
+    pass: &Pass<'_>,
     repo: &str,
     cwd: &str,
     root: &str,
@@ -372,148 +567,124 @@ fn parse_git_log(
                     ignored_additions: pending.ignored_additions,
                     ignored_deletions: pending.ignored_deletions,
                     categories: pending.categories,
+                    authorship: pending.authorship,
                 });
             }
         };
 
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(header) = line.strip_prefix("W\t") {
+    // One field at a time, never the whole history: some of these repositories
+    // have hundreds of megabytes of log.
+    let mut buffer = Vec::new();
+    let mut expected = Expected::Change;
+    loop {
+        buffer.clear();
+        match reader.read_until(b'\0', &mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if buffer.last() == Some(&b'\0') {
+            buffer.pop();
+        }
+        // A path is bytes and need not be UTF-8. Nothing downstream — the
+        // globs, the categories, the report — can carry the original bytes, so
+        // the lossy spelling is as close as such a path gets. Failing to
+        // decode must not end the stream: one odd path would otherwise cost
+        // the repository every commit behind it.
+        let field = String::from_utf8_lossy(&buffer);
+        let mut rest: &str = &field;
+
+        match std::mem::replace(&mut expected, Expected::Change) {
+            Expected::RenameSource(added, removed) => {
+                expected = Expected::RenameTarget(added, removed);
+                continue;
+            }
+            // A rename is credited to where the file landed, because the
+            // categories, the ignore globs, `--path` and the reported file
+            // list all describe the tree as it stands now.
+            Expected::RenameTarget(added, removed) => {
+                record_change(&mut pending, added, removed, rest, includes, ignores);
+                continue;
+            }
+            Expected::Change => {}
+        }
+
+        if let Some(header) = rest.strip_prefix("W\t") {
+            let (header, remainder) = header.split_once('\n').unwrap_or((header, ""));
             emit(&mut commits, &mut repo_seen, std::mem::take(&mut pending));
-            let mut fields = header.splitn(2, '\t');
-            pending.sha = fields.next().unwrap_or_default().to_string();
-            pending.timestamp = fields
+            // Three-way for the same reason the change fields are: whatever
+            // follows the date is one piece, tabs and all.
+            let mut header = header.splitn(3, '\t');
+            pending.sha = header.next().unwrap_or_default().to_string();
+            pending.timestamp = header
                 .next()
                 .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
                 .map(|value| value.with_timezone(&Utc));
-            continue;
+            pending.authorship = pass.authorship;
+            // Absent unless the pass asked for trailers, and present but empty
+            // for a commit that carries none.
+            for co_author in header
+                .next()
+                .unwrap_or_default()
+                .split('\u{2}')
+                .filter(|value| !value.is_empty())
+            {
+                // A flag on the commit already being counted. An agent named
+                // here did not write a second commit, and inventing a signal
+                // for it would count one piece of work twice.
+                pending.authorship.note_co_author(co_author);
+            }
+            rest = remainder;
         }
-        let fields: Vec<_> = line.split('\t').collect();
-        if fields.len() < 3 {
-            continue;
-        }
-        let added = parse_numstat(fields[0]);
-        let removed = parse_numstat(fields[1]);
-        let (Some(added), Some(removed)) = (added, removed) else {
+
+        // Three-way, so that a tab inside the path stays part of the path.
+        let mut fields = rest.splitn(3, '\t');
+        let (Some(added), Some(removed), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             continue;
         };
-        let unquoted = unquote_path(fields.last().copied().unwrap_or_default());
-        let raw: &str = &unquoted;
-        let resolved = renamed_target(raw);
-        let file_path: &str = &resolved;
-        if includes.is_some_and(|patterns| !patterns.is_match(file_path)) {
+        let (Some(added), Some(removed)) = (parse_numstat(added), parse_numstat(removed)) else {
+            continue;
+        };
+        if path.is_empty() {
+            expected = Expected::RenameSource(added, removed);
             continue;
         }
-        pending.matched_file = true;
-        // Both spellings are tested against the ignores. Without `-z`, git's
-        // rename notation is ambiguous with a filename that genuinely contains
-        // " => ", and resolving such a path strips the directory that the
-        // vendor rule matches on — so `node_modules/a => b.js` would be read as
-        // `b.js` and counted as authored source. Ignoring on either spelling
-        // keeps generated files out; the residual is that a file moved *out* of
-        // an ignored directory stays ignored for that one commit.
-        if ignores.is_some_and(|patterns| patterns.is_match(file_path) || patterns.is_match(raw)) {
-            pending.ignored_additions += added;
-            pending.ignored_deletions += removed;
-        } else {
-            pending.additions += added;
-            pending.deletions += removed;
-            pending.categories.add(classify(file_path), added, removed);
-            pending.files.push(file_path.to_string());
-        }
+        record_change(&mut pending, added, removed, path, includes, ignores);
     }
     emit(&mut commits, &mut repo_seen, pending);
     commits
 }
 
-/// `--numstat` reports a rename as one field in three shapes: `old => new`,
-/// `dir/{old => new}`, and `{old => new}/file`. Categories, ignore globs,
-/// `--path`, and the reported file list all expect a real path, so the entry is
-/// resolved to where the file ended up before any of them sees it. Renames are
-/// left on (`--no-renames` would turn every large move into thousands of
-/// phantom added and deleted lines).
-/// Git wraps a path in quotes and escapes it whenever it holds a quote, a
-/// backslash, or a control character — `core.quotePath=false` suppresses the
-/// escaping of non-ASCII bytes but not this. The wrapping quote is what does the
-/// damage: it becomes part of the extension, so `a"b.js` classifies as `other`,
-/// and it defeats the root-anchored ignore globs, so a quoted
-/// `node_modules/...` is counted as authored work.
-fn unquote_path(field: &str) -> Cow<'_, str> {
-    let Some(inner) = field
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    else {
-        return Cow::Borrowed(field);
-    };
-    let raw = inner.as_bytes();
-    let mut out = Vec::with_capacity(raw.len());
-    let mut index = 0;
-    while index < raw.len() {
-        if raw[index] != b'\\' {
-            out.push(raw[index]);
-            index += 1;
-            continue;
-        }
-        index += 1;
-        let Some(&escape) = raw.get(index) else {
-            break;
-        };
-        index += 1;
-        match escape {
-            b'a' => out.push(0x07),
-            b'b' => out.push(0x08),
-            b'f' => out.push(0x0c),
-            b'n' => out.push(b'\n'),
-            b'r' => out.push(b'\r'),
-            b't' => out.push(b'\t'),
-            b'v' => out.push(0x0b),
-            // Up to three octal digits, which is how every non-ASCII byte and
-            // every control character arrives.
-            b'0'..=b'7' => {
-                let mut value = u32::from(escape - b'0');
-                for _ in 0..2 {
-                    match raw.get(index) {
-                        Some(&digit @ b'0'..=b'7') => {
-                            value = value * 8 + u32::from(digit - b'0');
-                            index += 1;
-                        }
-                        _ => break,
-                    }
-                }
-                out.push(value as u8);
-            }
-            other => out.push(other),
-        }
+fn record_change(
+    pending: &mut PendingCommit,
+    added: u64,
+    removed: u64,
+    path: &str,
+    includes: Option<&GlobSet>,
+    ignores: Option<&GlobSet>,
+) {
+    if includes.is_some_and(|patterns| !patterns.is_match(path)) {
+        return;
     }
-    // A path that is not valid UTF-8 cannot be classified or matched
-    // meaningfully, and inventing replacement characters would only move the
-    // problem, so it keeps the spelling Git gave us.
-    String::from_utf8(out).map_or(Cow::Borrowed(field), Cow::Owned)
-}
-
-fn renamed_target(field: &str) -> Cow<'_, str> {
-    let Some(arrow) = field.find(" => ") else {
-        return Cow::Borrowed(field);
-    };
-    let (left, right) = (&field[..arrow], &field[arrow + 4..]);
-    if let Some(open) = left.rfind('{')
-        && let Some(close) = right.find('}')
-    {
-        return Cow::Owned(join_components(&format!(
-            "{}{}{}",
-            &left[..open],
-            &right[..close],
-            &right[close + 1..]
-        )));
+    pending.matched_file = true;
+    // Matching the real path is enough now. The old parser also matched the
+    // raw field, because a rename shared its spelling with a filename that
+    // genuinely contains " => " — resolving one of those stripped the
+    // directory the vendor rule matches on, so `node_modules/a => b.js`
+    // arrived as `b.js` and counted as authored source. `-z` states the rename
+    // instead of spelling it into the path, so there is no second spelling
+    // left to defend against, and a file moved *out* of an ignored directory
+    // is now counted from the commit that moved it.
+    if ignores.is_some_and(|patterns| patterns.is_match(path)) {
+        pending.ignored_additions += added;
+        pending.ignored_deletions += removed;
+    } else {
+        pending.additions += added;
+        pending.deletions += removed;
+        pending.categories.add(classify(path), added, removed);
+        pending.files.push(path.to_string());
     }
-    Cow::Owned(join_components(right))
-}
-
-/// `dir/{old => }/file` leaves an empty component behind.
-fn join_components(path: &str) -> String {
-    path.split('/')
-        .filter(|piece| !piece.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn parse_numstat(value: &str) -> Option<u64> {
@@ -589,13 +760,329 @@ mod tests {
         (lines.additions, lines.deletions)
     }
 
+    /// The pass the ordinary author scan runs, for tests that drive the parser
+    /// over a literal stream. The author list is unused there — that filtering
+    /// happened inside Git.
+    fn human_pass() -> Pass<'static> {
+        Pass {
+            authors: &[],
+            authorship: Authorship::default(),
+            co_authors: false,
+        }
+    }
+
+    fn agent_authors() -> Vec<String> {
+        DEFAULT_AGENT_AUTHORS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect()
+    }
+
+    /// One more line in one file, committed as `author`, so that every commit
+    /// in a fixture has a diff and the identities are the only thing that
+    /// differs between them.
+    fn commit_as(repo: &Path, body: &mut String, author: &str, message: &[&str]) {
+        let path = repo.to_str().unwrap().to_string();
+        let author = format!("--author={author}");
+        body.push_str("line\n");
+        fs::write(repo.join("code.rs"), body.as_str()).unwrap();
+        git(&["-C", path.as_str(), "add", "."]);
+        let mut arguments = vec!["-C", path.as_str(), "commit", "-q", author.as_str()];
+        for part in message {
+            arguments.push("-m");
+            arguments.push(part);
+        }
+        git(&arguments);
+    }
+
+    fn shas(commits: &[GitCommit]) -> HashSet<String> {
+        commits.iter().map(|commit| commit.sha.clone()).collect()
+    }
+
+    /// The identities are the ones this machine's repositories actually carry,
+    /// including *both* numeric ids GitHub has issued for the one Copilot
+    /// account. A matcher keyed on the id passes the first and silently drops
+    /// the second, which is the whole reason the address suffix is what is
+    /// matched.
+    ///
+    /// The other half of the test is the more important one: running the agent
+    /// pass must leave the author scan reporting exactly what it reported
+    /// before. Widening `--author` instead of adding a pass is the mistake this
+    /// guards against, and it would show up here as the author scan suddenly
+    /// finding an agent's commits.
+    #[test]
+    fn the_agent_pass_finds_the_bots_and_leaves_the_author_filter_alone() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/agents");
+        let mut body = String::new();
+        commit_as(
+            &repo,
+            &mut body,
+            "Test Author <test@example.com>",
+            &["mine"],
+        );
+        for author in [
+            "copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>",
+            "Copilot <223556219+Copilot@users.noreply.github.com>",
+            "GitHub Copilot <copilot@github.com>",
+        ] {
+            commit_as(&repo, &mut body, author, &["Initial plan"]);
+        }
+        // Automation, but not an agent: counting a version bump as agent output
+        // would misdescribe both.
+        commit_as(
+            &repo,
+            &mut body,
+            "dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>",
+            &["bump"],
+        );
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let agents = read_agent_commits(
+            base.path(),
+            &agent_authors(),
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(3, agents.len(), "both Copilot ids and the web identity");
+        assert!(
+            agents
+                .iter()
+                .all(|commit| commit.authorship.is_agent_authored())
+        );
+
+        let mine = read_git_commits(
+            base.path(),
+            "test@example.com",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(1, mine.len(), "the author filter must not have widened");
+        assert!(!mine[0].authorship.is_agent_authored());
+        assert!(shas(&mine).is_disjoint(&shas(&agents)));
+
+        // Asking for no identities at all runs no second pass rather than
+        // matching every author.
+        assert!(
+            read_agent_commits(
+                base.path(),
+                &[],
+                &mut resolver,
+                &mut diagnostics,
+                3,
+                None,
+                None,
+                None,
+                &[],
+                &[],
+                false,
+            )
+            .is_empty()
+        );
+        assert_eq!(0, diagnostics.git_errors);
+    }
+
+    /// A commit the developer wrote with an agent is one commit. The trailer
+    /// says how it was written, so it sets a flag on the commit already being
+    /// counted — a second commit, or a second signal, would be the same work
+    /// counted twice.
+    #[test]
+    fn a_co_authored_commit_is_one_commit_carrying_a_flag() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/pairs");
+        let mut body = String::new();
+        let me = "Test Author <test@example.com>";
+        commit_as(&repo, &mut body, me, &["alone"]);
+        commit_as(
+            &repo,
+            &mut body,
+            me,
+            &[
+                "with copilot",
+                "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+            ],
+        );
+        commit_as(
+            &repo,
+            &mut body,
+            me,
+            &[
+                "with autofix",
+                "Co-authored-by: Copilot Autofix powered by AI <223894421+github-code-quality[bot]@users.noreply.github.com>",
+            ],
+        );
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "test@example.com",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            true,
+        );
+        // Newest first: autofix, copilot, alone.
+        assert_eq!(3, commits.len(), "a trailer must not add a commit");
+        assert!(
+            commits
+                .iter()
+                .all(|commit| !commit.authorship.is_agent_authored())
+        );
+        assert!(commits[0].authorship.is_autofix_assisted());
+        assert!(
+            !commits[0].authorship.is_agent_assisted(),
+            "code scanning is not interactive Copilot"
+        );
+        assert!(commits[1].authorship.is_agent_assisted());
+        assert!(!commits[1].authorship.is_autofix_assisted());
+        assert_eq!(Authorship::default(), commits[2].authorship);
+
+        // Off by default, and off means the trailers are never asked for —
+        // same commits, same lines, no flags.
+        let plain = read_git_commits(
+            base.path(),
+            "test@example.com",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(shas(&commits), shas(&plain));
+        assert!(
+            plain
+                .iter()
+                .all(|commit| commit.authorship == Authorship::default())
+        );
+        assert_eq!(
+            commits.iter().map(|commit| commit.additions).sum::<u64>(),
+            plain.iter().map(|commit| commit.additions).sum::<u64>()
+        );
+    }
+
+    /// Git continues a long trailer on an indented line, and without `unfold`
+    /// that continuation arrives with a newline inside the header field. The
+    /// newline that closes the header would then be found in the middle of the
+    /// trailer, and everything after it — the commit's entire diff — would be
+    /// read as neither.
+    #[test]
+    fn a_folded_co_author_trailer_does_not_swallow_the_diff() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/folded");
+        let mut body = String::new();
+        commit_as(
+            &repo,
+            &mut body,
+            "Test Author <test@example.com>",
+            &[
+                "folded",
+                "Co-authored-by: A Very Long Name\n  Continued <copilot@github.com>",
+            ],
+        );
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "test@example.com",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            true,
+        );
+        assert_eq!(1, commits.len());
+        assert_eq!(
+            1, commits[0].additions,
+            "the diff was read past the trailer"
+        );
+        assert_eq!(vec!["code.rs".to_string()], commits[0].files);
+        assert!(commits[0].authorship.is_agent_assisted());
+    }
+
+    /// `--author` is a *basic* regular expression, so escaping `+`, `(` or `)`
+    /// is what makes them operators rather than what makes them literal. The
+    /// end-to-end half matters more than the string comparison: a
+    /// plus-addressed author used to be handed `person\+work@…`, which asks for
+    /// "one or more n" and matched none of that developer's commits.
     #[test]
     fn configured_author_is_safe_as_a_git_regex() {
         assert_eq!(
-            r"person\+work@example\.com",
+            r"person+work@example\.com",
             git_regex_literal("person+work@example.com")
         );
-        assert_eq!(r"A \(Team\)", git_regex_literal("A (Team)"));
+        assert_eq!("A (Team)", git_regex_literal("A (Team)"));
+        // `]` needs no escape once `[` carries one: nothing opened a bracket
+        // expression for it to close.
+        assert_eq!(r"a\.b\[c]\*d", git_regex_literal("a.b[c]*d"));
+
+        let base = tempdir().unwrap();
+        let repo = base.path().join("org/plus");
+        fs::create_dir_all(&repo).unwrap();
+        let path = repo.to_str().unwrap().to_string();
+        git(&["init", "-q", &path]);
+        git(&["-C", &path, "config", "user.name", "Plus Author"]);
+        git(&[
+            "-C",
+            &path,
+            "config",
+            "user.email",
+            "person+work@example.com",
+        ]);
+        fs::write(repo.join("main.rs"), "one\n").unwrap();
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "plus"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            &git_regex_literal("person+work@example.com"),
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(1, commits.len(), "a plus-addressed author found nothing");
     }
 
     #[test]
@@ -637,6 +1124,7 @@ mod tests {
             &[],
             &[],
             false,
+            false,
         );
         assert_eq!(1, commits.len());
         assert_eq!(2, commits[0].additions);
@@ -655,29 +1143,34 @@ mod tests {
             &["*.md".into()],
             &[],
             false,
+            false,
         );
         assert!(filtered.is_empty());
     }
 
-    /// A filename may legitimately contain " => ", and without `-z` git writes
-    /// it exactly like a rename. Resolving one of those strips the directory
-    /// the vendor rule matches on, so the file would be counted as authored
-    /// source; matching the ignores on the raw spelling too keeps it out.
+    /// A filename may legitimately contain " => ", `{` and `}`. Without `-z`
+    /// Git spelled a rename the same way, and resolving one of those stripped
+    /// the directory the vendor rule matches on — `node_modules/a => b.js`
+    /// arrived as `b.js` and was counted as authored source. Under `-z` such a
+    /// name is just a name.
     // Windows forbids `>` in a filename, so the ambiguity this guards against
     // cannot arise there and the fixture cannot even be written.
     #[cfg(not(windows))]
     #[test]
-    fn a_filename_that_looks_like_a_rename_still_matches_the_ignores() {
+    fn a_filename_that_looks_like_a_rename_is_an_ordinary_path() {
         let base = tempdir().unwrap();
         let repo = base.path().join("org/arrows");
         fs::create_dir_all(repo.join("node_modules")).unwrap();
+        fs::create_dir_all(repo.join("src")).unwrap();
         git(&["init", "-q", repo.to_str().unwrap()]);
         let path = repo.to_str().unwrap();
         git(&["-C", path, "config", "user.name", "Arrow Author"]);
         git(&["-C", path, "config", "user.email", "arrow@example.com"]);
         fs::write(repo.join("node_modules/a => b.js"), "one\ntwo\nthree\n").unwrap();
         fs::write(repo.join("node_modules/plain.js"), "x\ny\n").unwrap();
-        fs::write(repo.join("src.rs"), "real\n").unwrap();
+        fs::write(repo.join("src/x => y.rs"), "real\n").unwrap();
+        fs::write(repo.join("src/{braced}.rs"), "real\n").unwrap();
+        fs::write(repo.join("src/{a => b}.rs"), "real\n").unwrap();
         git(&["-C", path, "add", "."]);
         git(&["-C", path, "commit", "-qm", "arrows"]);
 
@@ -695,41 +1188,132 @@ mod tests {
             &[],
             &[],
             false,
+            false,
         );
         assert_eq!(1, commits.len());
-        assert_eq!(1, commits[0].additions, "only src.rs is authored");
+        assert_eq!(3, commits[0].additions, "the three files under src");
         assert_eq!(5, commits[0].ignored_additions, "both vendored files");
+        let mut files = commits[0].files.clone();
+        files.sort();
+        // Every name is reported whole: nothing was resolved away.
+        assert_eq!(
+            vec![
+                "src/x => y.rs".to_string(),
+                "src/{a => b}.rs".to_string(),
+                "src/{braced}.rs".to_string(),
+            ],
+            files
+        );
     }
 
+    /// The exact stream Git wrote for the fixtures that used to be ambiguous:
+    /// a rename out of a vendored directory, a commit with no diff at all, a
+    /// binary file, a filename holding " => ", and a filename holding a tab.
     #[test]
-    fn c_quoted_paths_are_unwrapped_before_anything_looks_at_them() {
-        // Git quotes these regardless of core.quotePath, so the wrapping quote
-        // reaches the parser and used to become part of the extension.
-        assert_eq!("src/a\"b.rs", unquote_path(r#""src/a\"b.rs""#));
-        assert_eq!(
-            "src/back\\slash.rs",
-            unquote_path(r#""src/back\\slash.rs""#)
-        );
-        // Octal escapes are how every non-ASCII byte arrives.
-        assert_eq!(
-            "tests/spørsmål_test.rs",
-            unquote_path(r#""tests/sp\303\270rsm\303\245l_test.rs""#)
-        );
-        assert_eq!("a\tb.rs", unquote_path(r#""a\tb.rs""#));
-        // An ordinary path is returned untouched, quotes and all if they are
-        // part of the name rather than Git's wrapper.
-        assert_eq!("src/main.rs", unquote_path("src/main.rs"));
-        assert_eq!("say \"hi\".rs", unquote_path("say \"hi\".rs"));
-
-        // The whole point: a quoted vendored path must still be ignored.
+    fn the_zero_terminated_stream_is_read_field_by_field() {
+        let stream: &[u8] =
+            b"W\t1111111111111111111111111111111111111111\t2024-05-01T10:00:00+02:00\n\
+             4\t2\t\x00node_modules/a => b.js\x00src/moved.rs\x00\
+             \x00W\t2222222222222222222222222222222222222222\t2024-05-02T10:00:00+02:00\
+             \x00W\t3333333333333333333333333333333333333333\t2024-05-03T10:00:00+02:00\n\
+             3\t1\tnode_modules/a => b.js\x00\
+             -\t-\tassets/logo.png\x00\
+             2\t0\tsrc/tab\there.rs\x00";
         let patterns: Vec<String> = DEFAULT_IGNORES
             .iter()
             .map(|value| (*value).to_string())
             .collect();
-        let globs = compile_globs(&patterns).unwrap().unwrap();
-        let quoted = r#""node_modules/a\"b.js""#;
-        assert!(!globs.is_match(quoted), "the quoted spelling escapes");
-        assert!(globs.is_match(unquote_path(quoted).as_ref()));
+        let ignores = compile_globs(&patterns).unwrap();
+        let commits = parse_git_log(
+            stream,
+            &human_pass(),
+            "repo",
+            "cwd",
+            "root",
+            None,
+            ignores.as_ref(),
+            &HashSet::new(),
+        );
+
+        // The commit in the middle has no diff, so it contributes no file and
+        // is not reported — but its NUL-closed header must not swallow the
+        // commit behind it.
+        assert_eq!(2, commits.len());
+        assert_eq!("1111111111111111111111111111111111111111", commits[0].sha);
+        assert_eq!("3333333333333333333333333333333333333333", commits[1].sha);
+
+        // A rename is credited to where it landed, so leaving node_modules
+        // makes it authored work.
+        assert_eq!(vec!["src/moved.rs".to_string()], commits[0].files);
+        assert_eq!((4, 2), (commits[0].additions, commits[0].deletions));
+        assert_eq!(0, commits[0].ignored_additions);
+
+        // Whereas the file merely *named* `a => b.js` keeps its directory and
+        // stays ignored. The binary counts as zero, and the tab is part of the
+        // name rather than a field separator.
+        assert_eq!(
+            vec![
+                "assets/logo.png".to_string(),
+                "src/tab\there.rs".to_string()
+            ],
+            commits[1].files
+        );
+        assert_eq!((2, 0), (commits[1].additions, commits[1].deletions));
+        assert_eq!(
+            (3, 1),
+            (commits[1].ignored_additions, commits[1].ignored_deletions)
+        );
+    }
+
+    /// Git quotes and escapes a path holding a quote, a backslash or a control
+    /// character whatever `core.quotePath` says — but only when the record
+    /// terminator is a newline. The wrapping quote used to become part of the
+    /// extension and to hide a vendored path from the root-anchored globs.
+    // Windows forbids `"`, `\` and tabs in a filename.
+    #[cfg(not(windows))]
+    #[test]
+    fn paths_git_would_have_quoted_arrive_verbatim() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/hostile");
+        let path = repo.to_str().unwrap().to_string();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("node_modules")).unwrap();
+        fs::write(repo.join("src/say \"hi\".rs"), "one\n").unwrap();
+        fs::write(repo.join("src/back\\slash.rs"), "one\n").unwrap();
+        fs::write(repo.join("src/tab\there.rs"), "one\n").unwrap();
+        fs::write(repo.join("node_modules/a\"b.js"), "generated\n").unwrap();
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "hostile"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(1, commits.len());
+        assert_eq!((3, 0), lines(&commits[0], "source"));
+        assert_eq!(1, commits[0].ignored_additions, "the vendored file");
+        let mut files = commits[0].files.clone();
+        files.sort();
+        assert_eq!(
+            vec![
+                "src/back\\slash.rs".to_string(),
+                "src/say \"hi\".rs".to_string(),
+                "src/tab\there.rs".to_string(),
+            ],
+            files
+        );
     }
 
     #[test]
@@ -787,6 +1371,7 @@ mod tests {
             &[],
             &[],
             false,
+            false,
         );
         assert_eq!(1, commits.len());
         assert_eq!((3, 0), lines(&commits[0], "source"));
@@ -796,21 +1381,101 @@ mod tests {
         assert_eq!(6, commits[0].additions);
     }
 
+    /// The three shapes the old parser had to spell out — a move across
+    /// directories, a rename inside one, and a rename with no edit at all —
+    /// now arrive as a pair of path fields, and each is credited to the path
+    /// the file moved to.
     #[test]
-    fn rename_entries_resolve_to_the_path_the_file_landed_on() {
-        assert_eq!("tests/b.rs", renamed_target("src/a.rs => tests/b.rs"));
-        assert_eq!("tests/b.rs", renamed_target("tests/{a.rs => b.rs}"));
-        assert_eq!(
-            "tests/helper.rs",
-            renamed_target("{src => tests}/helper.rs")
+    fn renames_of_every_shape_report_the_path_moved_to() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/renames");
+        let path = repo.to_str().unwrap().to_string();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        // Rename detection is Git's default, but the test must not depend on
+        // whoever runs it having left it that way.
+        git(&["-C", &path, "config", "diff.renames", "true"]);
+        let body: String = (0..30).map(|line| format!("line {line}\n")).collect();
+        for name in ["across", "inside", "pure"] {
+            fs::write(repo.join(format!("src/{name}.rs")), &body).unwrap();
+        }
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "before"]);
+
+        git(&["-C", &path, "mv", "src/across.rs", "tests/across.rs"]);
+        fs::write(repo.join("tests/across.rs"), format!("{body}extra\n")).unwrap();
+        git(&["-C", &path, "add", "-A"]);
+        git(&["-C", &path, "commit", "-qm", "across directories"]);
+
+        git(&["-C", &path, "mv", "src/inside.rs", "src/inside_new.rs"]);
+        fs::write(repo.join("src/inside_new.rs"), format!("{body}extra\n")).unwrap();
+        git(&["-C", &path, "add", "-A"]);
+        git(&["-C", &path, "commit", "-qm", "inside one directory"]);
+
+        git(&["-C", &path, "mv", "src/pure.rs", "src/pure_new.rs"]);
+        git(&["-C", &path, "commit", "-qm", "no edit at all"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
         );
-        assert_eq!(
-            "src/nested/file.rs",
-            renamed_target("src/{ => nested}/file.rs")
+        // Newest first, and the initial commit last.
+        assert_eq!(4, commits.len());
+        assert_eq!(vec!["src/pure_new.rs".to_string()], commits[0].files);
+        assert_eq!(0, commits[0].additions, "a pure rename edits nothing");
+        assert_eq!(vec!["src/inside_new.rs".to_string()], commits[1].files);
+        assert_eq!(1, commits[1].additions);
+        assert_eq!(vec!["tests/across.rs".to_string()], commits[2].files);
+        assert_eq!(1, commits[2].additions);
+    }
+
+    /// A commit with no diff has no change field for its header to be glued
+    /// to, so Git closes the header with the field's own NUL instead of a
+    /// newline. Misreading that field loses every commit behind it.
+    #[test]
+    fn an_empty_commit_does_not_hide_the_commits_behind_it() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/empty");
+        let path = repo.to_str().unwrap().to_string();
+        fs::write(repo.join("first.rs"), "one\n").unwrap();
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "first"]);
+        git(&["-C", &path, "commit", "-q", "--allow-empty", "-m", "empty"]);
+        fs::write(repo.join("second.rs"), "one\ntwo\n").unwrap();
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "second"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
         );
-        assert_eq!("src/file.rs", renamed_target("src/{nested => }/file.rs"));
-        // An ordinary path is untouched.
-        assert_eq!("src/main.rs", renamed_target("src/main.rs"));
+        assert_eq!(2, commits.len(), "the empty commit touches no file");
+        assert_eq!(vec!["second.rs".to_string()], commits[0].files);
+        assert_eq!(vec!["first.rs".to_string()], commits[1].files);
     }
 
     #[test]
@@ -845,6 +1510,7 @@ mod tests {
             None,
             &[],
             &[],
+            false,
             false,
         );
         let moved = commits
@@ -884,6 +1550,7 @@ mod tests {
             &[],
             &[],
             false,
+            false,
         );
         assert_eq!(1, commits.len());
         // Quoted, octal-escaped paths lose their extension and escape the
@@ -920,6 +1587,7 @@ mod tests {
             Some("acme"),
             &[],
             &[],
+            false,
             false,
         );
         assert_eq!(1, commits.len());

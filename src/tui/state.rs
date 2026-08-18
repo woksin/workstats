@@ -908,6 +908,8 @@ fn group_digits(value: u64) -> String {
 pub(super) fn sample_commit(sha: &str, cwd: &str, files: &[(&str, u64, u64)]) -> GitCommit {
     use chrono::TimeZone;
 
+    use crate::model::Authorship;
+
     let registry = active_registry();
     let mut categories = CategoryTally::default();
     let mut additions = 0;
@@ -932,6 +934,10 @@ pub(super) fn sample_commit(sha: &str, cwd: &str, files: &[(&str, u64, u64)]) ->
         ignored_additions: 0,
         ignored_deletions: 0,
         categories,
+        // The explorer is handed the commits the *report* was built from, and
+        // `main` never passes it the agent-authorship pass — so every commit
+        // that reaches a `Dataset` is one the configured author wrote.
+        authorship: Authorship::default(),
     }
 }
 

@@ -41,6 +41,14 @@ fn csv_fields(report: &Report) -> Vec<String> {
             "ignored_additions",
             "ignored_deletions",
             "net_lines",
+            // Beside the churn columns they qualify, never inside them: a
+            // consumer summing `additions` gets the configured author's own
+            // lines, and has to ask for the agent's by name.
+            "agent_commit_count",
+            "agent_additions",
+            "agent_deletions",
+            "ai_assisted_commit_count",
+            "autofix_assisted_commit_count",
         ]
         .into_iter()
         .map(str::to_string),
@@ -144,6 +152,36 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             "  Ignored Git lines       +{} / -{}",
             number(summary.ignored_additions),
             number(summary.ignored_deletions)
+        );
+    }
+    // Its own line, below the two it is deliberately not part of. The Git
+    // figures above are the configured author's, and code an agent pushed is
+    // landed output rather than evidence anybody was at the keyboard — so it is
+    // shown, and shown as output, in the same breath.
+    if summary.agent_commit_count != 0 {
+        println!(
+            "  Agent-authored          {} commits  +{} / -{}  (output only — no human time)",
+            number(summary.agent_commit_count),
+            number(summary.agent_additions),
+            number(summary.agent_deletions)
+        );
+    }
+    // The opposite case, and it must not read like the line above: these are
+    // commits already counted in "Git commits", described by how they were
+    // written. "of the N above" is the whole claim — a share, not an addition.
+    if summary.ai_assisted_commit_count != 0 || summary.autofix_assisted_commit_count != 0 {
+        let autofix = if summary.autofix_assisted_commit_count == 0 {
+            String::new()
+        } else {
+            format!(
+                "  (+ {} Copilot Autofix)",
+                number(summary.autofix_assisted_commit_count)
+            )
+        };
+        println!(
+            "  Co-authored by AI       {} of the {} commits above{autofix}",
+            number(summary.ai_assisted_commit_count),
+            number(summary.commit_count)
         );
     }
     if let Some(first) = &report.observed.first_seen {
@@ -303,18 +341,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         &report.rows[..report.rows.len().min(top)]
     };
     for row in rows {
-        let mut label = label(row, &report.group_by);
-        if label.chars().count() > 38 {
-            let suffix: String = label
-                .chars()
-                .rev()
-                .take(37)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            label = format!("…{suffix}");
-        }
+        let label = clipped_label(row, &report.group_by);
         if show_tokens {
             println!(
                 "  {label:<38} {:>9} {:>5} {:>9} {:>8} {:>9} {:>10} {:>9}",
@@ -360,6 +387,47 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         );
     }
     println!();
+
+    // A table of its own rather than two more columns above. Every column in
+    // that table is either human involvement or agent *runtime*, and a commit
+    // count set among them — next to a column already called "Agent work",
+    // which is hours — would be read as work somebody did. Here the heading
+    // carries the claim, once, in the place the numbers are.
+    let agent_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.agent_commit_count != 0)
+        .collect();
+    if !agent_rows.is_empty() {
+        println!(
+            "Agent-authored Git output  (landed code you did not type — no human time, no work blocks)"
+        );
+        println!(
+            "  {:<38} {:>9} {:>11} {:>11}",
+            "Work area", "Commits", "Added", "Removed"
+        );
+        println!("  {}", "─".repeat(72));
+        for row in &agent_rows {
+            println!(
+                "  {:<38} {:>9} {:>11} {:>11}",
+                clipped_label(row, &report.group_by),
+                number(row.agent_commit_count),
+                format!("+{}", number(row.agent_additions)),
+                format!("-{}", number(row.agent_deletions))
+            );
+        }
+        // `--top` can hide a row that is *only* agent output — with no human
+        // time it sorts last — so the section says what it left out rather than
+        // quietly disagreeing with the total at the top of the report.
+        let shown: usize = agent_rows.iter().map(|row| row.agent_commit_count).sum();
+        if let Some(hidden) = summary
+            .agent_commit_count
+            .checked_sub(shown)
+            .filter(|hidden| *hidden != 0)
+        {
+            println!("  … {hidden} more in rows not shown; use --top 0");
+        }
+        println!();
+    }
     println!(
         "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
         compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
@@ -371,6 +439,19 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     println!(
         "AI wall removes overlap within each row; rows can overlap each other. Agent work sums parallel sessions."
     );
+    // Printed whenever the run asked for either pass, even if neither found
+    // anything: a reader who turned the flag on needs to know what the report
+    // would have done with a match, and a zero is an answer to that question.
+    if summary.agent_commit_count != 0
+        || summary.ai_assisted_commit_count != 0
+        || summary.autofix_assisted_commit_count != 0
+        || !report.inputs.agent_authors.is_empty()
+        || report.inputs.co_authors
+    {
+        println!(
+            "Agent-authored commits are output, never attendance: they add no human time, no work blocks, and no active work days. A Co-authored-by trailer describes a commit you already wrote — it never adds one."
+        );
+    }
     if report.inputs.repo_filter.is_some() || report.inputs.repo_exact_filter.is_some() {
         println!(
             "Scope note: work blocks are recomputed from the selected repositories, so filtered totals can differ from an all-repo row."
@@ -528,6 +609,11 @@ fn row_field(row: &ReportRow, name: &str) -> String {
         "ignored_additions" => row.ignored_additions.to_string(),
         "ignored_deletions" => row.ignored_deletions.to_string(),
         "net_lines" => row.net_lines.to_string(),
+        "agent_commit_count" => row.agent_commit_count.to_string(),
+        "agent_additions" => row.agent_additions.to_string(),
+        "agent_deletions" => row.agent_deletions.to_string(),
+        "ai_assisted_commit_count" => row.ai_assisted_commit_count.to_string(),
+        "autofix_assisted_commit_count" => row.autofix_assisted_commit_count.to_string(),
         "input_tokens" => row.input_tokens.to_string(),
         "output_tokens" => row.output_tokens.to_string(),
         "cache_read_tokens" => row.cache_read_tokens.to_string(),
@@ -567,6 +653,27 @@ fn composition_field(row: &ReportRow, name: &str) -> Option<String> {
         "additions" => entry.additions.to_string(),
         _ => entry.deletions.to_string(),
     })
+}
+
+/// The first column of every row table.
+const LABEL_WIDTH: usize = 38;
+
+/// A row's label, clipped to `LABEL_WIDTH` from the left. The tail is what is
+/// kept because the distinguishing part of a long path is its end.
+fn clipped_label(row: &ReportRow, dimensions: &[String]) -> String {
+    let label = label(row, dimensions);
+    if label.chars().count() <= LABEL_WIDTH {
+        return label;
+    }
+    let suffix: String = label
+        .chars()
+        .rev()
+        .take(LABEL_WIDTH - 1)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("…{suffix}")
 }
 
 fn label(row: &ReportRow, dimensions: &[String]) -> String {
@@ -754,6 +861,66 @@ mod tests {
         assert!(position("net_lines") < position("test_files"));
     }
 
+    /// The split the feature exists for, at the machine-readable boundary. A
+    /// consumer summing `commit_count`, `additions` or `deletions` gets the
+    /// configured author's own work and nothing else; the agent's output has to
+    /// be asked for by name. Nothing here can be totalled into human time,
+    /// because none of these columns is time.
+    #[test]
+    fn the_csv_reports_agent_output_beside_your_own_and_never_inside_it() {
+        let fields = csv_fields(&report_with(vec!["repo".to_string()]));
+        let position = |name: &str| {
+            fields
+                .iter()
+                .position(|field| field == name)
+                .unwrap_or_else(|| panic!("missing column {name} in {fields:?}"))
+        };
+        // Beside the churn columns they qualify, and still ahead of the
+        // registry-driven area columns.
+        assert!(position("net_lines") < position("agent_commit_count"));
+        assert!(position("autofix_assisted_commit_count") < position("test_files"));
+
+        let mut row = row_with(Vec::new());
+        row.commit_count = 3;
+        row.additions = 30;
+        row.deletions = 4;
+        row.agent_commit_count = 7;
+        row.agent_additions = 700;
+        row.agent_deletions = 90;
+        row.ai_assisted_commit_count = 2;
+        row.autofix_assisted_commit_count = 1;
+        assert_eq!("3", row_field(&row, "commit_count"));
+        assert_eq!("30", row_field(&row, "additions"));
+        assert_eq!("4", row_field(&row, "deletions"));
+        assert_eq!("7", row_field(&row, "agent_commit_count"));
+        assert_eq!("700", row_field(&row, "agent_additions"));
+        assert_eq!("90", row_field(&row, "agent_deletions"));
+        assert_eq!("2", row_field(&row, "ai_assisted_commit_count"));
+        assert_eq!("1", row_field(&row, "autofix_assisted_commit_count"));
+        // Seven agent commits carrying 790 changed lines, and not one second of
+        // human work follows from them.
+        assert_eq!("0.0", row_field(&row, "human_estimated_seconds"));
+        assert_eq!("0", row_field(&row, "work_block_count"));
+        assert_eq!("0", row_field(&row, "human_active_days"));
+    }
+
+    /// The tail is what identifies a long path, so it is the end that survives.
+    #[test]
+    fn a_row_label_is_clipped_from_the_left() {
+        let dimensions = vec!["repo".to_string()];
+        let labelled = |value: &str| {
+            let mut row = row_with(Vec::new());
+            row.key.insert("repo".to_string(), value.to_string());
+            clipped_label(&row, &dimensions)
+        };
+        assert_eq!("widget", labelled("widget"));
+        let long = format!("{}/widget", "deep/".repeat(20));
+        let clipped = labelled(&long);
+        assert_eq!(LABEL_WIDTH, clipped.chars().count());
+        assert!(clipped.starts_with('…'), "{clipped}");
+        assert!(clipped.ends_with("/widget"), "{clipped}");
+    }
+
     #[test]
     fn composition_columns_report_zero_for_an_untouched_area() {
         let row = row_with(Vec::new());
@@ -784,6 +951,11 @@ mod tests {
             ignored_additions: 0,
             ignored_deletions: 0,
             net_lines: 0,
+            agent_commit_count: 0,
+            agent_additions: 0,
+            agent_deletions: 0,
+            ai_assisted_commit_count: 0,
+            autofix_assisted_commit_count: 0,
             composition,
             change_shapes: Vec::new(),
             input_tokens: 0,
@@ -816,6 +988,7 @@ mod tests {
                 gap_cap_seconds: 0.0,
                 composition: String::new(),
                 change_shapes: "",
+                agent_output: "",
                 scope: "",
             },
             observed: Observed {
@@ -845,6 +1018,11 @@ mod tests {
                 deletions: 0,
                 ignored_additions: 0,
                 ignored_deletions: 0,
+                agent_commit_count: 0,
+                agent_additions: 0,
+                agent_deletions: 0,
+                ai_assisted_commit_count: 0,
+                autofix_assisted_commit_count: 0,
                 composition: Vec::new(),
                 change_shapes: Vec::new(),
                 active_days: 0,
@@ -868,6 +1046,8 @@ mod tests {
                 included_providers: Vec::new(),
                 excluded_providers: Vec::new(),
                 author: String::new(),
+                agent_authors: Vec::new(),
+                co_authors: false,
                 repo_filter: None,
                 repo_exact_filter: None,
                 human_idle: String::new(),
