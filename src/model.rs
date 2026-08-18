@@ -165,6 +165,11 @@ pub struct GitCommit {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Diagnostics {
     pub malformed_lines: u64,
+    /// Records refused because they carried prompt or response text. That is
+    /// the privacy boundary working, not a broken file, so it is counted and
+    /// reported apart from `malformed_lines`.
+    #[serde(default)]
+    pub content_rejections: u64,
     pub unreadable_files: u64,
     pub approximate_cwds: u64,
     pub skipped_sessions: u64,
@@ -185,6 +190,7 @@ impl Diagnostics {
 
     pub fn merge(&mut self, other: &Diagnostics) {
         self.malformed_lines += other.malformed_lines;
+        self.content_rejections += other.content_rejections;
         self.unreadable_files += other.unreadable_files;
         self.approximate_cwds += other.approximate_cwds;
         self.skipped_sessions += other.skipped_sessions;
@@ -208,7 +214,8 @@ pub struct Methodology {
     pub ai_time: &'static str,
     pub deduplication: &'static str,
     pub gap_cap_seconds: f64,
-    pub composition: &'static str,
+    /// Names the configured categories, which are not known at compile time.
+    pub composition: String,
     pub change_shapes: &'static str,
     pub scope: &'static str,
 }

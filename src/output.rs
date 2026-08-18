@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 
-use crate::classify::Category;
+use crate::classify::active_registry;
 use crate::model::{CompositionEntry, Diagnostics, Report, ReportRow};
 
 pub fn print_json(report: &Report) -> Result<()> {
@@ -15,7 +15,9 @@ pub fn print_json(report: &Report) -> Result<()> {
     Ok(())
 }
 
-pub fn print_csv(report: &Report) -> Result<()> {
+/// CSV field names. The per-area columns follow the configured category
+/// registry, so a custom category adds columns and a replaced one renames them.
+fn csv_fields(report: &Report) -> Vec<String> {
     let mut fields = report.group_by.clone();
     fields.extend(
         [
@@ -41,9 +43,9 @@ pub fn print_csv(report: &Report) -> Result<()> {
         .into_iter()
         .map(str::to_string),
     );
-    for category in Category::ALL {
+    for category in active_registry().names() {
         for metric in ["files", "additions", "deletions"] {
-            fields.push(format!("{}_{metric}", category.as_str()));
+            fields.push(format!("{category}_{metric}"));
         }
     }
     fields.extend(
@@ -63,6 +65,11 @@ pub fn print_csv(report: &Report) -> Result<()> {
         .into_iter()
         .map(str::to_string),
     );
+    fields
+}
+
+pub fn print_csv(report: &Report) -> Result<()> {
+    let fields = csv_fields(report);
     let mut writer = csv::Writer::from_writer(io::stdout().lock());
     writer.write_record(&fields)?;
     for row in &report.rows {
@@ -82,6 +89,10 @@ pub fn print_csv(report: &Report) -> Result<()> {
     writer.flush()?;
     Ok(())
 }
+
+/// Enough diagnostic messages to see what went wrong without burying the
+/// report; the rest stay in `--format json`.
+const MAX_PRINTED_MESSAGES: usize = 5;
 
 pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
     let summary = &report.summary;
@@ -348,6 +359,39 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             diagnostics.approximate_cwds
         );
     }
+    if diagnostics.content_rejections != 0 {
+        println!(
+            "Privacy: {} record(s) carrying prompt or response text were skipped, as designed.",
+            diagnostics.content_rejections
+        );
+    }
+    // Without these a mistyped --history or --events path produces a clean
+    // looking report with silently missing data.
+    for message in diagnostics.messages.iter().take(MAX_PRINTED_MESSAGES) {
+        println!("Warning: {}", safe_message(message));
+    }
+    if diagnostics.messages.len() > MAX_PRINTED_MESSAGES {
+        println!(
+            "Warning: … {} more; use --format json for all of them.",
+            diagnostics.messages.len() - MAX_PRINTED_MESSAGES
+        );
+    }
+}
+
+/// A message quotes a path the tool did not choose, so it can carry control
+/// characters into a terminal.
+fn safe_message(value: &str) -> String {
+    value
+        .chars()
+        .take(200)
+        .map(|character| {
+            if character.is_control() {
+                '·'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 fn row_field(row: &ReportRow, name: &str) -> String {
@@ -393,9 +437,7 @@ fn row_field(row: &ReportRow, name: &str) -> String {
 fn composition_field(row: &ReportRow, name: &str) -> Option<String> {
     let (category, metric) = name.rsplit_once('_')?;
     if !matches!(metric, "files" | "additions" | "deletions")
-        || !Category::ALL
-            .into_iter()
-            .any(|known| known.as_str() == category)
+        || active_registry().index_of(category).is_none()
     {
         return None;
     }
@@ -449,8 +491,11 @@ fn named_month(value: &str) -> Option<String> {
     names.get(month).map(|name| format!("{name} {year}"))
 }
 
+/// Spreadsheets read a leading `= + - @` as a formula. A negative number is not
+/// a formula though, and this output is made for pipes, so a cell that parses
+/// as a number is left exactly as it is.
 fn neutralize_formula(value: String) -> String {
-    if value.starts_with(['=', '+', '-', '@']) {
+    if value.starts_with(['=', '+', '-', '@']) && value.parse::<f64>().is_err() {
         format!("'{value}")
     } else {
         value
@@ -486,8 +531,8 @@ fn test_to_source_ratio(composition: &[CompositionEntry]) -> Option<f64> {
             .find(|entry| entry.category == name)
             .map_or(0, |entry| entry.additions + entry.deletions)
     };
-    let source = touched(Category::Source.as_str());
-    (source != 0).then(|| touched(Category::Test.as_str()) as f64 / source as f64)
+    let source = touched("source");
+    (source != 0).then(|| touched("test") as f64 / source as f64)
 }
 
 fn compact_tokens(value: u64) -> String {
@@ -549,11 +594,163 @@ fn spark(values: &[f64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Inputs, Methodology, Observed, Summary};
 
     #[test]
     fn spreadsheet_formula_cells_are_neutralized() {
         assert_eq!("'=2+2", neutralize_formula("=2+2".into()));
         assert_eq!("safe", neutralize_formula("safe".into()));
+        assert_eq!("'@sum", neutralize_formula("@sum".into()));
+        assert_eq!("'-lookup", neutralize_formula("-lookup".into()));
+    }
+
+    #[test]
+    fn negative_numbers_stay_numbers() {
+        // `net_lines` is routinely negative and the CSV is made for pipes.
+        assert_eq!("-1", neutralize_formula("-1".into()));
+        assert_eq!("-1234.5", neutralize_formula("-1234.5".into()));
+        assert_eq!("+42", neutralize_formula("+42".into()));
+        assert_eq!("-1e3", neutralize_formula("-1e3".into()));
+    }
+
+    #[test]
+    fn csv_columns_follow_the_category_registry() {
+        let fields = csv_fields(&report_with(vec!["repo".to_string()]));
+        let registry = active_registry();
+        for category in registry.names() {
+            assert!(
+                fields.contains(&format!("{category}_files")),
+                "missing {category}_files in {fields:?}"
+            );
+        }
+        // Group-by columns come first and the areas keep registry order.
+        assert_eq!("repo", fields[0]);
+        let position = |name: &str| fields.iter().position(|field| field == name);
+        assert!(position("test_files") < position("source_files"));
+        assert!(position("net_lines") < position("test_files"));
+    }
+
+    #[test]
+    fn composition_columns_report_zero_for_an_untouched_area() {
+        let row = row_with(Vec::new());
+        assert_eq!(
+            Some("0".to_string()),
+            composition_field(&row, "assets_files")
+        );
+        assert_eq!(None, composition_field(&row, "assets_pixels"));
+        assert_eq!(None, composition_field(&row, "nonsense_files"));
+    }
+
+    fn row_with(composition: Vec<CompositionEntry>) -> ReportRow {
+        ReportRow {
+            key: BTreeMap::new(),
+            active_seconds: 0.0,
+            parallel_agent_seconds: 0.0,
+            ai_wall_seconds: 0.0,
+            human_estimated_seconds: 0.0,
+            human_signal_count: 0,
+            work_block_count: 0,
+            session_count: 0,
+            commit_count: 0,
+            foreground_session_count: 0,
+            subagent_session_count: 0,
+            file_count: 0,
+            additions: 0,
+            deletions: 0,
+            ignored_additions: 0,
+            ignored_deletions: 0,
+            net_lines: 0,
+            composition,
+            change_shapes: Vec::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            total_tokens: 0,
+            active_days: 0,
+            human_active_days: 0,
+            calendar_days: 0,
+            average_human_seconds_per_active_day: 0.0,
+            average_active_seconds_per_active_day: 0.0,
+            average_active_seconds_per_calendar_day: 0.0,
+            first_seen: None,
+            last_seen: None,
+            providers: Vec::new(),
+            models: Vec::new(),
+        }
+    }
+
+    fn report_with(group_by: Vec<String>) -> Report {
+        Report {
+            methodology: Methodology {
+                human_work: "",
+                human_idle_threshold_seconds: 0.0,
+                review_credit_seconds: 0.0,
+                human_estimate_caveat: "",
+                ai_time: "",
+                deduplication: "",
+                gap_cap_seconds: 0.0,
+                composition: String::new(),
+                change_shapes: "",
+                scope: "",
+            },
+            observed: Observed {
+                first_seen: None,
+                last_seen: None,
+            },
+            summary: Summary {
+                human_estimated_seconds: 0.0,
+                human_active_days: 0,
+                average_human_seconds_per_active_day: 0.0,
+                work_block_count: 0,
+                human_signal_count: 0,
+                prompt_signal_count: 0,
+                foreground_session_edge_signal_count: 0,
+                commit_signal_count: 0,
+                deduplicated_active_seconds: 0.0,
+                attributed_active_seconds: 0.0,
+                agent_wall_seconds: 0.0,
+                parallel_agent_seconds: 0.0,
+                session_count: 0,
+                foreground_session_count: 0,
+                subagent_session_count: 0,
+                foreground_sessions_with_commits: 0,
+                foreground_sessions_without_commits: 0,
+                commit_count: 0,
+                additions: 0,
+                deletions: 0,
+                ignored_additions: 0,
+                ignored_deletions: 0,
+                composition: Vec::new(),
+                change_shapes: Vec::new(),
+                active_days: 0,
+                provider_seconds: BTreeMap::new(),
+                model_seconds: BTreeMap::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                total_tokens: 0,
+                provider_tokens: BTreeMap::new(),
+                model_tokens: BTreeMap::new(),
+            },
+            group_by,
+            rows: Vec::new(),
+            diagnostics: Diagnostics::default(),
+            inputs: Inputs {
+                git_root: String::new(),
+                git_scan_roots: Vec::new(),
+                history_sources: BTreeMap::new(),
+                included_providers: Vec::new(),
+                excluded_providers: Vec::new(),
+                author: String::new(),
+                repo_filter: None,
+                repo_exact_filter: None,
+                human_idle: String::new(),
+                review_credit: String::new(),
+                cache: None,
+            },
+        }
     }
 
     #[test]

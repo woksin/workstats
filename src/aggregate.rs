@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::classify::{
-    Category, CategoryTally, Shape, ShapeTally, change_shape, classify, tally_merge, touched_lines,
-};
+use crate::classify::{CategoryTally, ShapeTally, active_registry, change_shape};
 use crate::model::{
     CompositionEntry, GitCommit, HumanSignal, Interval, Methodology, Observed, ReportRow, Session,
     ShapeEntry, Summary, TokenUsage,
@@ -292,9 +290,9 @@ pub fn build_report(
         row.deletions += commit.deletions;
         row.ignored_additions += commit.ignored_additions;
         row.ignored_deletions += commit.ignored_deletions;
-        tally_merge(&mut row.categories, &commit.categories);
+        row.categories.merge(&commit.categories);
         if let Some(shape) = change_shape(&commit.categories) {
-            row.shapes[shape.index()] += 1;
+            row.shapes.add(shape);
         }
         row.active_days.insert(local_date(commit.timestamp));
         include_time(row, commit.timestamp, commit.timestamp);
@@ -467,9 +465,9 @@ pub fn build_report(
     let mut summary_shapes = ShapeTally::default();
     let mut summary_files: HashSet<&str> = HashSet::new();
     for commit in &filtered_commits {
-        tally_merge(&mut summary_categories, &commit.categories);
+        summary_categories.merge(&commit.categories);
         if let Some(shape) = change_shape(&commit.categories) {
-            summary_shapes[shape.index()] += 1;
+            summary_shapes.add(shape);
         }
         summary_files.extend(commit.files.iter().map(String::as_str));
     }
@@ -537,7 +535,10 @@ pub fn build_report(
             ai_time: "consecutive structural activity signals capped at the idle gap; exact intervals are merged when a source records them",
             deduplication: "headline time is the union of all AI intervals; grouped AI totals may overlap across parallel repos/providers",
             gap_cap_seconds: duration_seconds(gap_cap),
-            composition: "changed Git lines bucketed into source/test/docs/config/assets/other from the file path alone; this is churn, not the size of the codebase",
+            composition: format!(
+                "changed Git lines bucketed into {} from the file path alone; this is churn, not the size of the codebase",
+                active_registry().names().collect::<Vec<_>>().join("/")
+            ),
             change_shapes: "each commit described by the area holding at least 60% of its changed lines and by its addition/deletion balance; commit messages and file contents are never read",
             scope: "local retained histories, explicit event logs, and locally available Git repositories only",
         },
@@ -606,18 +607,20 @@ fn composition_entries<'a>(
     files: impl IntoIterator<Item = &'a str>,
     tally: &CategoryTally,
 ) -> Vec<CompositionEntry> {
-    let mut counts = [0_usize; Category::ALL.len()];
+    let registry = active_registry();
+    let mut counts = vec![0_usize; registry.len()];
     for path in files {
-        counts[classify(path).index()] += 1;
+        if let Some(count) = counts.get_mut(registry.classify(path)) {
+            *count += 1;
+        }
     }
-    let total = touched_lines(tally) as f64;
-    let mut entries: Vec<_> = Category::ALL
-        .into_iter()
+    let total = tally.touched() as f64;
+    let mut entries: Vec<_> = (0..registry.len())
         .filter_map(|category| {
-            let lines = tally[category.index()];
-            let files = counts[category.index()];
+            let lines = tally.get(category);
+            let files = counts[category];
             (files != 0 || lines.touched() != 0).then(|| CompositionEntry {
-                category: category.as_str().to_string(),
+                category: registry.name(category).to_string(),
                 files,
                 additions: lines.additions,
                 deletions: lines.deletions,
@@ -640,21 +643,17 @@ fn composition_entries<'a>(
 
 /// Commit counts per diff shape, largest first.
 fn shape_entries(tally: &ShapeTally) -> Vec<ShapeEntry> {
-    let total: usize = tally.iter().sum();
-    let mut entries: Vec<_> = Shape::ALL
-        .into_iter()
-        .filter(|shape| tally[shape.index()] != 0)
-        .map(|shape| {
-            let commits = tally[shape.index()];
-            ShapeEntry {
-                shape: shape.as_str().to_string(),
-                commits,
-                share_of_classified_commits: if total == 0 {
-                    0.0
-                } else {
-                    round3(commits as f64 / total as f64)
-                },
-            }
+    let total = tally.total();
+    let mut entries: Vec<_> = tally
+        .iter()
+        .map(|(shape, commits)| ShapeEntry {
+            shape: shape.as_str().to_string(),
+            commits,
+            share_of_classified_commits: if total == 0 {
+                0.0
+            } else {
+                round3(commits as f64 / total as f64)
+            },
         })
         .collect();
     entries.sort_by(|left, right| {
@@ -862,7 +861,7 @@ fn iso(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::tally_add;
+    use crate::classify::classify;
     use crate::model::{ActivityPoint, ExactInterval, TokenEvent};
     use crate::timeutil::parse_timestamp;
 
@@ -871,7 +870,7 @@ mod tests {
         let mut additions = 0;
         let mut deletions = 0;
         for (path, added, removed) in files {
-            tally_add(&mut categories, classify(path), *added, *removed);
+            categories.add(classify(path), *added, *removed);
             additions += added;
             deletions += removed;
         }
