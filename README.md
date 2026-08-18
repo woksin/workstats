@@ -114,16 +114,7 @@ optional.
 No Rust toolchain is required. Every release includes a `SHA256SUMS` file.
 
 <table>
-<tr><td width="145"><b>Homebrew</b><br><sub>macOS · Linux</sub></td><td>
-
-```bash
-brew tap woksin/workstats
-brew trust woksin/workstats   # Homebrew 6 gates third-party taps
-brew install workstats
-```
-
-</td></tr>
-<tr><td><b>macOS</b></td><td>
+<tr><td width="145"><b>macOS</b></td><td>
 
 ```bash
 # Apple silicon
