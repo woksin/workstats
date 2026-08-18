@@ -32,6 +32,8 @@ WORKSTATS  human involvement across local projects
   Work blocks          6  (24 foreground session edges + 184 prompts + 31 commits)
   Git commits             31
   Git lines               +8,421 / -2,107
+  Agent-authored          14 commits  +6,204 / -1,118  (output only — no human time)
+  Co-authored by AI       9 of the 31 commits above
   Observed                2026-08-01 → 2026-08-18
 
 AI activity  (context only — these are not human hours)
@@ -65,7 +67,20 @@ By repo  (human involvement first; AI wall clock shown as context)
   api                                       5h 50m     2    2h 55m       18    6h 20m    21h 04m      9.8M
   web                                       3h 39m     2    1h 49m       11    4h 14m    12h 30m      6.1M
   cli                                       0h 55m     1    0h 55m        2    0h 44m     3h 32m      2.5M
+
+Agent-authored Git output  (landed code you did not type — no human time, no work blocks)
+  Work area                                Commits       Added     Removed
+  ────────────────────────────────────────────────────────────────────────
+  api                                            9      +4,102        -712
+  web                                            5      +2,102        -406
 ```
+
+The two agent lines in the summary and the block at the end appear only when a
+run asks for them, with [`--agent-commits` and
+`--co-authors`](#agent-authored-commits). Agent-authored commits are shown
+because they are real output, and shown *apart* because none of them is evidence
+that anyone was at the keyboard: they add no human time, no work blocks, and no
+active human days.
 
 That is the printed report. [`workstats ui`](#explore-it-interactively) opens
 the same numbers as a drill-down explorer — repository, month, file area,
@@ -83,7 +98,8 @@ setup and review evidence without treating autonomous output as attendance.
 | Signal | What it answers | How it is treated |
 |---|---|---|
 | **Human-work estimate** | “How much time was plausibly spent developing or supervising?” | Prompts, foreground session boundaries, and authored commits form non-overlapping involvement blocks with setup/review credit. |
-| **Git output** | “What changed?” | Commits, files, additions, deletions, and ignored generated/vendor lines. |
+| **Git output** | “What changed?” | Commits, files, additions, deletions, and ignored generated/vendor lines — all of them authored by the identity `--author` names. |
+| **Agent-authored Git output** | “What landed that I did not type?” | Commits a coding agent authored, matched by Git identity in a second pass and reported in their own columns and their own section. **Never human time**: no work blocks, no setup/review credit, no active *human* days, and never added into the Git-output figures above. A `Co-authored-by:` trailer is the other case — it describes a commit you already wrote, so it is a share of your commits and never an addition to them. |
 | **Agent wall clock** | “How long was any agent active?” | Overlapping agent intervals count once. |
 | **Parallel agent work** | “How much automation ran?” | Concurrent sessions are summed, so this can exceed wall time. |
 | **AI tokens** | “How many tokens did agents use?” | Input, output, cache-read, and cache-creation counts read from local transcripts; not an intervaled/deduplicated metric like wall clock, so grouped totals just sum. |
@@ -247,6 +263,7 @@ workstats --year last                      # filter to the previous calendar yea
 workstats --provider codex,gemini --group-by model
 workstats --exclude-provider copilot
 workstats --repo-exact my-project          # infer its checkout from matching AI sessions
+workstats --agent-commits                  # also read commits a coding agent authored
 workstats --raw                            # provider/model detail (alias --show-agent-work)
 workstats classify src/main.rs             # which file area a path lands in, and why
 ```
@@ -264,7 +281,11 @@ you narrow it with `--repo`, `--repo-exact`, `--since`/`--until`,
 not is an error naming which of the two was wrong, not an all-zero report.
 
 Your Git author defaults to `git config --global user.email`, falling back to
-`user.name`. Override it with `--author REGEX` or `WORKSTATS_AUTHOR`.
+`user.name`. Override it with `--author REGEX` or `WORKSTATS_AUTHOR`. That one
+identity is the whole of what a report describes by default; commits a coding
+agent authored are read only when you ask, and even then are reported apart from
+your own and never as human time — see
+[Agent-authored commits](#agent-authored-commits).
 
 ### Explore it interactively
 
@@ -433,8 +454,10 @@ runs parse only what changed.
 
 ## How the estimate works
 
-1. Foreground human prompts and authored Git commits provide direct evidence of
-   involvement without reading prompt or response text.
+1. Foreground human prompts and commits **you** authored provide direct evidence
+   of involvement without reading prompt or response text. A commit a coding
+   agent authored provides none, and there is no route by which one can become
+   human time — see [Agent-authored commits](#agent-authored-commits).
 2. The start and end of each foreground session add bounded setup/follow-up
    evidence. Internal assistant and tool events do not keep a human block alive;
    meta messages, sidechains, and subagent sessions do not add human time.
@@ -619,6 +642,14 @@ and supports `--format json` and `--format csv`.
   update` or opt into `--check-updates` (see [Updating](#updating));
 - no credential discovery and no attempt to sign in to providers;
 - no prompt or response bodies in reports or the cache;
+- Git is read for commit metadata only — the commit id, the author date, and
+  `--numstat`'s per-path line counts. The second pass
+  [`--agent-commits`](#agent-authored-commits) runs is the same read with a
+  different `--author`, over the history already on disk, and it makes no network
+  call. `--co-authors` widens that read by exactly the *values* of
+  `Co-authored-by:` trailers, asked for by name; no other part of a commit
+  message is ever requested, and commit messages are never read to classify
+  anything;
 - no file contents in reports or the cache either — the explorer's diff viewer
   is the single place a tracked file is ever read, and what it reads is
   display-only ([details below](#the-diff-viewer-is-the-one-place-file-contents-are-read));
@@ -806,6 +837,115 @@ Source roots are customizable without exposing local paths in the repository:
 
 Or repeat `--source-rule 'REGEX=NAME'` on the command line. Rules are limited to
 a deliberately safe regex subset and bounded in size/count.
+
+### Agent-authored commits
+
+Once a branch has been fetched, work a coding agent pushed is ordinary local Git
+history — and `--author` does not see it, because the agent is the author. Two
+opt-in flags read it, with no network access of any kind:
+
+```bash
+workstats --agent-commits                             # the built-in agent identities
+workstats --agent-commits='<bot@example\.com>'        # just this one instead
+workstats --co-authors                                # flag your own AI-assisted commits
+```
+
+`--agent-commits` runs a **second `git log` pass** over the same repositories,
+asking for the agent's commits instead of yours. It is a second pass rather than
+a wider `--author` on the first for one reason: these commits must never reach
+the collection the human estimate is built from. They are landed output and zero
+evidence that anyone was present, so they contribute **no human time, no work
+blocks, no setup/review credit, and no active human days** — only their own
+commit and line counts, plus the calendar day they landed on. A repository whose
+history is nothing but agent commits reports `Estimated human work  0h 00m`, and
+that is the correct answer.
+
+The built-in identities are matched on the **tail of the e-mail address**, never
+on the number in front of it:
+
+| Identity | Matched by |
+|---|---|
+| GitHub Copilot coding agent | `+Copilot@users.noreply.github.com>` |
+| Copilot on github.com | `<copilot@github.com>` |
+| Claude | `+claude[bot]@users.noreply.github.com>` and `<noreply@anthropic.com>` |
+
+GitHub has issued more than one numeric id for the same Copilot account —
+`198982749+Copilot@…` and `223556219+Copilot@…` both occur in real history — so
+anything keyed on the number finds part of an agent's work and silently misses
+the rest. Matching the address also covers every display name that account
+commits under; `Copilot` and `copilot-swe-agent[bot]` share one address.
+Automation that is not an AI agent is deliberately absent: `github-actions` and
+`dependabot` push far more commits than Copilot does, and counting a version bump
+as agent output would say something false about both.
+
+`--agent-commits=REGEX` **replaces** the built-in identities rather than adding
+to them — one pattern can only honestly mean "just this one". The `=` is
+required, so that a bare `--agent-commits` can mean "the built-in ones" without
+swallowing whatever follows it. The value is handed to `git log --author` raw,
+the same contract `--author` has, so it is a *basic* regular expression: `+`,
+`?`, `(`, `)` and `|` are literals there, and a backslash is what promotes them
+to operators.
+
+`--co-authors` is the opposite case and a separate decision. It reads the
+`Co-authored-by:` trailers on **your own** commits so a commit you wrote with an
+agent can be described as such. It never adds a commit: `Co-authored by AI  9 of
+the 31 commits above` is a share of what was already counted, and the human
+estimate is byte-identical with and without the flag. Trailers naming Copilot
+Autofix are counted separately from assisted development, because code scanning
+and writing code with an assistant are different activities. Only the trailer
+*values* are requested from Git, so no other part of a commit message is ever
+read.
+
+Agent output stays out of the figures `--author` promises are yours. It has its
+own summary line, its own report section, its own `agent_commit_count` /
+`agent_additions` / `agent_deletions` / `ai_assisted_commit_count` /
+`autofix_assisted_commit_count` fields in JSON and columns in CSV, and its own
+`git-agent` row under `--group-by provider`. It is not folded into `commit_count`,
+`additions`, `deletions`, [work composition](#what-was-worked-on), or change
+shapes — those describe the work you authored.
+
+### Copilot activity that never reaches your clone
+
+Two things Copilot does on github.com leave no trace in a clone: pull requests
+the coding agent opened, and code reviews it left. The default refspec fetches
+`refs/heads/*` only, so `refs/pull/*` is never on disk, and a review suggestion
+the author declined leaves no artifact at all.
+
+[`contrib/copilot-github-sync.sh`](contrib/copilot-github-sync.sh) covers them:
+
+```bash
+contrib/copilot-github-sync.sh --since 2026-01-01 ~/src/api ~/src/web
+contrib/copilot-github-sync.sh --dry-run ~/src/api          # print, record nothing
+contrib/copilot-github-sync.sh --jsonl backfill.jsonl ~/src/api   # fast first backfill
+```
+
+Each argument is a local clone; the slug comes from its `origin` remote and the
+clone's own path becomes the event's `cwd`, so the events land on the same report
+row as the rest of that repository's work. Every event is written with
+`--role subagent`, which is the same lever the built-in adapters use: it
+contributes to AI wall clock and session counts and exactly zero to the human
+estimate.
+
+**It is a script, on purpose, and not a flag.** Reading either of those means
+calling the GitHub API, and an HTTP client inside the binary would end two of the
+guarantees in [Privacy boundary](#privacy-boundary) at once: `workstats` makes no
+network calls, and it performs no credential discovery — it never reads a
+keyring, a token file, or `GH_TOKEN`. The second is the expensive one. From then
+on the tool would have to be audited for how it holds a token, how it keeps one
+out of `--format json`, and what a poisoned cache could do with one. So the
+network call is made outside, by your own authenticated `gh`, with your own
+credentials, only when you run it. What crosses back in is the content-free
+record [`workstats record`](#add-any-tool-or-api) already accepts — a provider, an
+identifier, a directory, a model name, and timestamps. No titles, no bodies, no
+review text; the events-v1 schema rejects records carrying any of those.
+
+It needs `gh` on `PATH` and authenticated (`gh auth status`), and says which of
+the two is missing rather than failing mid-run. A clone it cannot read — no
+GitHub remote, or a repository this account cannot search — is named on stderr
+and skipped; the remaining clones are still done and the run exits non-zero, so
+a scheduled partial sync does not look like a clean one. A squash-merged agent
+pull request is visible both ways — as an agent-authored commit and as an event
+recorded here — so use one or the other per repository.
 
 ## Platforms
 

@@ -39,6 +39,11 @@ struct Bucket {
     deletions: u64,
     ignored_additions: u64,
     ignored_deletions: u64,
+    agent_commits: HashSet<String>,
+    agent_additions: u64,
+    agent_deletions: u64,
+    ai_assisted_commits: HashSet<String>,
+    autofix_assisted_commits: HashSet<String>,
     categories: CategoryTally,
     shapes: ShapeTally,
     tokens: TokenUsage,
@@ -114,10 +119,17 @@ fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
     signals
 }
 
+/// `agent_commits` arrives separately from `commits` because it comes from a
+/// separate `git log` pass, but which side a commit belongs on is decided by
+/// the commit itself. `authorship` is the authority here, so swapping the two
+/// slices at a call site would change nothing about the report — and the human
+/// timeline is reachable only through `GitCommit::human_signal`, which hands
+/// back nothing at all for agent-authored work.
 #[allow(clippy::too_many_arguments)]
 pub fn build_report(
     sessions: &[Session],
     commits: &[GitCommit],
+    agent_commits: &[GitCommit],
     gap_cap: Duration,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
@@ -130,13 +142,14 @@ pub fn build_report(
         .flat_map(|session| build_session_intervals(session, gap_cap))
         .filter_map(|interval| clip_interval(&interval, since, until))
         .collect();
-    let filtered_commits: Vec<_> = commits
+    let (filtered_agent_commits, filtered_commits): (Vec<_>, Vec<_>) = commits
         .iter()
+        .chain(agent_commits)
         .filter(|commit| {
             since.is_none_or(|bound| commit.timestamp >= bound)
                 && until.is_none_or(|bound| commit.timestamp < bound)
         })
-        .collect();
+        .partition(|commit| commit.authorship.is_agent_authored());
     let filtered_tokens: Vec<_> = sessions
         .iter()
         .flat_map(|session| {
@@ -156,16 +169,14 @@ pub fn build_report(
         })
         .collect();
     let mut human_signals = foreground_human_signals(sessions);
-    human_signals.extend(filtered_commits.iter().map(|commit| HumanSignal {
-        timestamp: commit.timestamp,
-        provider: "git".to_string(),
-        session_id: commit.sha.clone(),
-        cwd: commit.cwd.clone(),
-        repo: commit.repo.clone(),
-        root: commit.root.clone(),
-        kind: "commit".to_string(),
-        model: "—".to_string(),
-    }));
+    // `filter_map`, not `map`: a commit decides for itself whether it is
+    // evidence anyone was at the keyboard, and an agent-authored one answers
+    // `None`. See `GitCommit::human_signal`.
+    human_signals.extend(
+        filtered_commits
+            .iter()
+            .filter_map(|commit| commit.human_signal()),
+    );
     let filtered_human_signals: Vec<_> = human_signals
         .into_iter()
         .filter(|signal| {
@@ -295,6 +306,31 @@ pub fn build_report(
         if let Some(shape) = change_shape(&commit.categories) {
             row.shapes.add(shape);
         }
+        // A share of the commits just counted, never an addition to them.
+        if commit.authorship.is_agent_assisted() {
+            row.ai_assisted_commits.insert(commit.sha.clone());
+        }
+        if commit.authorship.is_autofix_assisted() {
+            row.autofix_assisted_commits.insert(commit.sha.clone());
+        }
+        row.active_days.insert(local_date(commit.timestamp));
+        include_time(row, commit.timestamp, commit.timestamp);
+    }
+
+    // Agent output is kept out of the churn figures above on purpose: `--author`
+    // is this tool's statement about whose work is being measured, and lines an
+    // agent pushed are not the developer's to claim. What they do contribute is
+    // calendar coverage — the day an agent landed code is a day AI worked on
+    // this repository — and nothing whatever to the human estimate.
+    for commit in &filtered_agent_commits {
+        let key = dimensions
+            .iter()
+            .map(|dimension| safe_value(&commit_value(commit, dimension)))
+            .collect();
+        let row = bucket(&mut buckets, key, dimensions);
+        row.agent_commits.insert(commit.sha.clone());
+        row.agent_additions += commit.additions;
+        row.agent_deletions += commit.deletions;
         row.active_days.insert(local_date(commit.timestamp));
         include_time(row, commit.timestamp, commit.timestamp);
     }
@@ -333,6 +369,11 @@ pub fn build_report(
                 ignored_additions: row.ignored_additions,
                 ignored_deletions: row.ignored_deletions,
                 net_lines: row.additions as i64 - row.deletions as i64,
+                agent_commit_count: row.agent_commits.len(),
+                agent_additions: row.agent_additions,
+                agent_deletions: row.agent_deletions,
+                ai_assisted_commit_count: row.ai_assisted_commits.len(),
+                autofix_assisted_commit_count: row.autofix_assisted_commits.len(),
                 composition: composition_entries(
                     row.files.iter().map(String::as_str),
                     &row.categories,
@@ -410,6 +451,9 @@ pub fn build_report(
         all_times.extend([interval.start, interval.end]);
     }
     all_times.extend(filtered_human_signals.iter().map(|signal| signal.timestamp));
+    // Observed at, not worked at: an agent commit is a moment this report saw
+    // activity, even though it contributes no human interval to bound.
+    all_times.extend(filtered_agent_commits.iter().map(|commit| commit.timestamp));
 
     let mut active_dates: HashSet<_> = intervals
         .iter()
@@ -423,6 +467,7 @@ pub fn build_report(
     active_dates.extend(
         filtered_commits
             .iter()
+            .chain(filtered_agent_commits.iter())
             .map(|commit| local_date(commit.timestamp)),
     );
     let human_dates: HashSet<_> = filtered_human_signals
@@ -462,6 +507,22 @@ pub fn build_report(
         .filter(|key| session_roles.get(*key).copied().unwrap_or(false))
         .count();
     let unique_commits: HashSet<_> = filtered_commits.iter().map(|commit| &commit.sha).collect();
+    let unique_agent_commits: HashSet<_> = filtered_agent_commits
+        .iter()
+        .map(|commit| &commit.sha)
+        .collect();
+    // Shas rather than a running count, so a commit reachable from two scan
+    // roots is described once — the same discipline `unique_commits` uses.
+    let mut ai_assisted_commits: HashSet<&String> = HashSet::new();
+    let mut autofix_assisted_commits: HashSet<&String> = HashSet::new();
+    for commit in &filtered_commits {
+        if commit.authorship.is_agent_assisted() {
+            ai_assisted_commits.insert(&commit.sha);
+        }
+        if commit.authorship.is_autofix_assisted() {
+            autofix_assisted_commits.insert(&commit.sha);
+        }
+    }
     let mut summary_categories = CategoryTally::default();
     let mut summary_shapes = ShapeTally::default();
     let mut summary_files: HashSet<&str> = HashSet::new();
@@ -541,6 +602,7 @@ pub fn build_report(
                 active_registry().names().collect::<Vec<_>>().join("/")
             ),
             change_shapes: "each commit described by the area holding at least 60% of its changed lines and by its addition/deletion balance; commit messages and file contents are never read",
+            agent_output: "commits a coding agent authored are matched by Git identity, reported apart from your own, and contribute no human time; a Co-authored-by trailer flags a commit you already wrote rather than adding another",
             scope: "local retained histories, explicit event logs, and locally available Git repositories only",
         },
         observed: Observed {
@@ -584,6 +646,17 @@ pub fn build_report(
                 .iter()
                 .map(|item| item.ignored_deletions)
                 .sum(),
+            agent_commit_count: unique_agent_commits.len(),
+            agent_additions: filtered_agent_commits
+                .iter()
+                .map(|item| item.additions)
+                .sum(),
+            agent_deletions: filtered_agent_commits
+                .iter()
+                .map(|item| item.deletions)
+                .sum(),
+            ai_assisted_commit_count: ai_assisted_commits.len(),
+            autofix_assisted_commit_count: autofix_assisted_commits.len(),
             composition: composition_entries(summary_files.iter().copied(), &summary_categories),
             change_shapes: shape_entries(&summary_shapes),
             active_days: active_dates.len(),
@@ -792,7 +865,17 @@ fn commit_value(commit: &GitCommit, dimension: &str) -> String {
         "repo" => commit.repo.clone(),
         "root" => commit.root.clone(),
         "cwd" => commit.cwd.clone(),
-        "provider" => "git".to_string(),
+        // Grouping by provider is asking "where did this come from?", and
+        // folding an agent's commits into the row holding the developer's own
+        // would answer it wrongly. Every other grouping still puts them on the
+        // same repository, day or directory row, in their own columns.
+        "provider" => if commit.authorship.is_agent_authored() {
+            "git-agent"
+        } else {
+            "git"
+        }
+        .to_string(),
+        // A commit records no model, whoever wrote it.
         "model" => "—".to_string(),
         "day" => local_date(commit.timestamp),
         "month" => local_month(commit.timestamp),
@@ -875,7 +958,7 @@ fn iso(value: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::classify::classify;
-    use crate::model::{ActivityPoint, ExactInterval, TokenEvent};
+    use crate::model::{ActivityPoint, Authorship, ExactInterval, TokenEvent};
     use crate::timeutil::parse_timestamp;
 
     fn commit(sha: &str, repo: &str, at: &str, files: &[(&str, u64, u64)]) -> GitCommit {
@@ -899,6 +982,14 @@ mod tests {
             ignored_additions: 0,
             ignored_deletions: 0,
             categories,
+            authorship: Authorship::default(),
+        }
+    }
+
+    fn agent_commit(sha: &str, repo: &str, at: &str, files: &[(&str, u64, u64)]) -> GitCommit {
+        GitCommit {
+            authorship: Authorship::agent(),
+            ..commit(sha, repo, at, files)
         }
     }
 
@@ -948,6 +1039,7 @@ mod tests {
         let report = build_report(
             &sessions,
             &[],
+            &[],
             Duration::minutes(5),
             None,
             None,
@@ -977,6 +1069,7 @@ mod tests {
         let report = build_report(
             &sessions,
             &[],
+            &[],
             Duration::minutes(5),
             None,
             None,
@@ -1005,6 +1098,7 @@ mod tests {
         )];
         let report = build_report(
             &sessions,
+            &[],
             &[],
             Duration::minutes(5),
             None,
@@ -1036,6 +1130,7 @@ mod tests {
         let report = build_report(
             &[foreground, subagent],
             &[],
+            &[],
             Duration::minutes(5),
             None,
             None,
@@ -1057,6 +1152,7 @@ mod tests {
         )];
         let report = build_report(
             &sessions,
+            &[],
             &[],
             Duration::minutes(5),
             None,
@@ -1080,6 +1176,7 @@ mod tests {
         let report = build_report(
             &sessions,
             &[],
+            &[],
             Duration::minutes(5),
             None,
             None,
@@ -1100,6 +1197,7 @@ mod tests {
         ];
         let report = build_report(
             &sessions,
+            &[],
             &[],
             Duration::minutes(5),
             None,
@@ -1139,6 +1237,7 @@ mod tests {
         let report = build_report(
             &[],
             &commits,
+            &[],
             Duration::minutes(5),
             None,
             None,
@@ -1189,6 +1288,123 @@ mod tests {
         assert_eq!(202, report.rows[0].composition[0].additions);
     }
 
+    /// The number this whole tool exists to protect. A repository holding
+    /// nothing but a coding agent's commits describes a developer who did not
+    /// touch it, and every one of those commits would otherwise cluster into a
+    /// work block carrying setup and review credit. Real machines hold
+    /// thousands of them, so the failure is measured in weeks, not minutes.
+    #[test]
+    fn agent_authored_commits_are_output_and_not_one_second_of_human_time() {
+        let commits: Vec<_> = (0..5)
+            .map(|day| {
+                agent_commit(
+                    &format!("bot{day}"),
+                    "repo",
+                    &format!("2026-01-0{}T10:00:00Z", day + 1),
+                    &[("src/lib.rs", 100, 20)],
+                )
+            })
+            .collect();
+        let report = build_report(
+            &[],
+            &[],
+            &commits,
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        assert_eq!(0.0, report.summary.human_estimated_seconds);
+        assert_eq!(0, report.summary.work_block_count);
+        assert_eq!(0, report.summary.human_signal_count);
+        assert_eq!(0, report.summary.commit_signal_count);
+        assert_eq!(0, report.summary.human_active_days);
+
+        // It is still output, and still visible.
+        assert_eq!(0, report.summary.commit_count, "not the developer's own");
+        assert_eq!(0, report.summary.additions);
+        assert_eq!(5, report.summary.agent_commit_count);
+        assert_eq!(500, report.summary.agent_additions);
+        assert_eq!(100, report.summary.agent_deletions);
+        assert_eq!(5, report.summary.active_days);
+        assert_eq!(5, report.rows[0].agent_commit_count);
+        assert_eq!(0.0, report.rows[0].human_estimated_seconds);
+
+        // Which side a commit lands on is the commit's own answer, so passing
+        // the same history through the other parameter changes nothing.
+        let swapped = build_report(
+            &[],
+            &commits,
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        assert_eq!(0.0, swapped.summary.human_estimated_seconds);
+        assert_eq!(5, swapped.summary.agent_commit_count);
+    }
+
+    /// A commit the developer wrote with an agent is already counted once. The
+    /// trailer says how it was written, so it must change the description of
+    /// that commit and nothing else — same count, same signal, same estimate.
+    #[test]
+    fn a_co_authored_commit_is_described_differently_and_counted_the_same() {
+        let plain = commit(
+            "a",
+            "repo",
+            "2026-01-01T10:00:00Z",
+            &[("src/lib.rs", 10, 2)],
+        );
+        let mut assisted = plain.clone();
+        assisted
+            .authorship
+            .note_co_author("Copilot <223556219+Copilot@users.noreply.github.com>");
+        assisted
+            .authorship
+            .note_co_author("Copilot Autofix powered by AI <62310815+github-advanced-security[bot]@users.noreply.github.com>");
+
+        let before = build_report(
+            &[],
+            std::slice::from_ref(&plain),
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        let after = build_report(
+            &[],
+            std::slice::from_ref(&assisted),
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+
+        assert_eq!(1, after.summary.commit_count, "one commit, not two");
+        assert_eq!(1, after.summary.commit_signal_count);
+        assert_eq!(0, after.summary.agent_commit_count);
+        assert_eq!(
+            before.summary.human_estimated_seconds, after.summary.human_estimated_seconds,
+            "a trailer is not extra work"
+        );
+        assert_eq!(before.summary.additions, after.summary.additions);
+        assert_eq!(1, after.summary.ai_assisted_commit_count);
+        assert_eq!(1, after.summary.autofix_assisted_commit_count);
+        assert_eq!(1, after.rows[0].ai_assisted_commit_count);
+        assert_eq!(0, before.summary.ai_assisted_commit_count);
+    }
+
     #[test]
     fn foreground_sessions_pair_with_commits_only_in_repos_git_actually_scanned() {
         let near = session("near", "repo", vec![], vec![point("2026-01-01T09:30:00Z")]);
@@ -1208,6 +1424,7 @@ mod tests {
         let report = build_report(
             &[near, far, unscanned],
             &commits,
+            &[],
             Duration::minutes(5),
             None,
             None,
@@ -1247,6 +1464,7 @@ mod tests {
         });
         let report = build_report(
             &[a, b],
+            &[],
             &[],
             Duration::minutes(5),
             None,
@@ -1313,6 +1531,7 @@ mod tests {
                 vec![point("2026-01-01T10:00:00Z")],
                 vec![],
             )],
+            &[],
             &[],
             Duration::minutes(5),
             None,

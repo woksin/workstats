@@ -30,7 +30,7 @@ use ai::{
     read_gemini_sessions_indexed, read_opencode_sessions_indexed,
 };
 use cache::TranscriptCache;
-use git::{default_git_author, read_git_commits};
+use git::{DEFAULT_AGENT_AUTHORS, default_git_author, read_agent_commits, read_git_commits};
 use model::{Diagnostics, Inputs, Report, Session};
 use output::{print_csv, print_json, print_table};
 use paths::{
@@ -305,6 +305,25 @@ struct ReportArguments {
     path_exclude: Vec<String>,
     #[arg(long, help = "Include generated/vendor Git paths")]
     no_ignore: bool,
+    // Off by default because `--author` is this tool's statement about whose
+    // work a report describes, and a second identity is a second answer to
+    // that. `=REGEX` is handed to Git raw, the same contract `--author` has,
+    // and it *replaces* the built-in identities rather than adding to them —
+    // "just these" is the only thing a single pattern can honestly mean.
+    #[arg(
+        long,
+        value_name = "AUTHOR_REGEX",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        help = "Also read commits a coding agent authored, reported apart from your own and never as human time; =REGEX replaces the built-in identities"
+    )]
+    agent_commits: Option<String>,
+    #[arg(
+        long,
+        help = "Read Co-authored-by: trailers, to flag your own commits as AI-assisted; identities only, never the message"
+    )]
+    co_authors: bool,
     #[arg(long, help = "Disable color in interactive output")]
     no_color: bool,
     #[arg(long, help = "Disable the interactive progress animation")]
@@ -447,6 +466,24 @@ fn scan_directory(
         );
     }
     Ok(directory)
+}
+
+/// The Git identities the second, agent-authorship pass matches.
+///
+/// Empty is the default and means no second pass runs at all, not that it runs
+/// unfiltered — `read_agent_commits` spawns nothing for an empty list, so the
+/// feature costs nothing when it is off. A bare `--agent-commits` takes the
+/// built-in identities; `--agent-commits=REGEX` replaces them, because one
+/// pattern can only honestly mean "just this one".
+fn agent_author_patterns(argument: Option<&str>) -> Vec<String> {
+    match argument {
+        None => Vec::new(),
+        Some(value) if value.trim().is_empty() => DEFAULT_AGENT_AUTHORS
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect(),
+        Some(pattern) => vec![pattern.to_string()],
+    }
 }
 
 /// The grouping dimensions for one run, validated. Split out of `run` so the
@@ -706,8 +743,10 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         .repo
         .as_deref()
         .or(arguments.repo_exact.as_deref());
+    let agent_authors = agent_author_patterns(arguments.agent_commits.as_deref());
     let mut git_scan_roots = Vec::new();
     let mut commits = Vec::new();
+    let mut agent_commits = Vec::new();
     if !arguments.no_git {
         git_scan_roots.push(directory.clone());
         if repo_filter.is_some() {
@@ -743,18 +782,45 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
                 &csv_globs(&arguments.path),
                 &csv_globs(&arguments.path_exclude),
                 arguments.no_ignore,
+                arguments.co_authors,
+            ));
+            // A separate pass over the same repositories rather than a wider
+            // `--author` on the one above: these commits must never reach the
+            // collection the human estimate is built from.
+            agent_commits.extend(read_agent_commits(
+                root,
+                &agent_authors,
+                &mut resolver,
+                &mut diagnostics,
+                depth,
+                since,
+                until,
+                scoped_filter,
+                &csv_globs(&arguments.path),
+                &csv_globs(&arguments.path_exclude),
+                arguments.no_ignore,
             ));
         }
+        let mut seen_agent_commits = HashSet::new();
+        agent_commits.retain(|commit| seen_agent_commits.insert(commit.sha.clone()));
         let mut seen_commits = HashSet::new();
-        commits.retain(|commit| seen_commits.insert(commit.sha.clone()));
+        commits.retain(|commit| {
+            // An `--author` wide enough to match a bot — a developer literally
+            // named Copilot, or a deliberately broad regex — would otherwise
+            // put one commit on both sides. Agent authorship wins: the cost of
+            // being wrong the other way is inventing hours nobody worked.
+            !seen_agent_commits.contains(&commit.sha) && seen_commits.insert(commit.sha.clone())
+        });
         if let Some(exact) = &arguments.repo_exact {
             commits.retain(|commit| exact_repo(&commit.repo, &commit.cwd, exact));
+            agent_commits.retain(|commit| exact_repo(&commit.repo, &commit.cwd, exact));
         }
     }
     progress.set("Estimating human involvement");
     let built = build_report(
         &sessions,
         &commits,
+        &agent_commits,
         gap_cap,
         since,
         until,
@@ -799,6 +865,8 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
             included_providers: included.into_iter().collect(),
             excluded_providers: excluded.into_iter().collect(),
             author,
+            agent_authors,
+            co_authors: arguments.co_authors,
             repo_filter: arguments.repo,
             repo_exact_filter: arguments.repo_exact,
             human_idle: arguments.human_idle,
@@ -1493,6 +1561,36 @@ mod tests {
             scan_directory(None, None, Some(missing)).unwrap_err()
         );
         assert!(error.contains("current working directory"), "{error}");
+    }
+
+    /// Nothing happens unless the run asks for it, and asking for it with a
+    /// pattern replaces the built-in identities rather than joining them.
+    #[test]
+    fn agent_commits_are_off_until_asked_for_and_the_pattern_replaces_the_defaults() {
+        assert!(
+            report_arguments(&[]).agent_commits.is_none(),
+            "the second pass must not run by default"
+        );
+        assert!(agent_author_patterns(None).is_empty());
+
+        let bare = report_arguments(&["--agent-commits"]);
+        assert_eq!(Some(""), bare.agent_commits.as_deref());
+        assert_eq!(
+            DEFAULT_AGENT_AUTHORS.len(),
+            agent_author_patterns(bare.agent_commits.as_deref()).len()
+        );
+
+        let custom = report_arguments(&["--agent-commits=my-bot@example.com"]);
+        assert_eq!(
+            vec!["my-bot@example.com".to_string()],
+            agent_author_patterns(custom.agent_commits.as_deref())
+        );
+
+        // Reading trailers is its own decision: it widens what is read out of a
+        // commit message, so it does not ride along with the second pass.
+        assert!(!report_arguments(&["--agent-commits"]).co_authors);
+        assert!(report_arguments(&["--co-authors"]).co_authors);
+        assert!(report_arguments(&["--co-authors"]).agent_commits.is_none());
     }
 
     #[test]

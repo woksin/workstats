@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::process::{Command, Output};
 
 use serde_json::Value;
@@ -14,6 +15,41 @@ fn run(arguments: &[&str]) -> Output {
 
 fn git(arguments: &[&str]) -> Output {
     Command::new("git").args(arguments).output().unwrap()
+}
+
+/// Writes `body` to `file` and commits it to `repo` as `author`.
+///
+/// The committer is always the fixture identity; only the *author* varies,
+/// because `--author` and `--agent-commits` both filter on authorship. Each
+/// `message` becomes its own paragraph, which is how a `Co-authored-by:`
+/// trailer is attached to a commit.
+fn commit_as(repo: &str, file: &str, body: &str, author: &str, message: &[&str]) {
+    let target = Path::new(repo).join(file);
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, body).unwrap();
+    assert!(git(&["-C", repo, "add", "."]).status.success());
+    let author = format!("--author={author}");
+    let mut arguments = vec![
+        "-C",
+        repo,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-q",
+        author.as_str(),
+    ];
+    for part in message {
+        arguments.push("-m");
+        arguments.push(part);
+    }
+    let output = git(&arguments);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -442,4 +478,156 @@ fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
             .iter()
             .any(|root| root.as_str() == Some(&expected_root))
     );
+}
+
+/// The invariant the whole agent-authorship feature rests on, driven end to end
+/// through the real binary and a real `git log` rather than through the model.
+///
+/// A coding agent's commits are landed output and *zero* evidence that anybody
+/// was at the keyboard. The unit tests pin that on `GitCommit::human_signal`;
+/// what only a fixture can check is that the second `git log` pass finds the
+/// agent by the identity it actually commits under, keeps its work out of the
+/// figures `--author` promises are the developer's, and reports the split at
+/// the JSON boundary other tools read.
+#[test]
+fn agent_authored_commits_are_reported_as_output_and_never_as_human_time() {
+    let temporary = tempdir().unwrap();
+    let project = temporary.path().join("api");
+    fs::create_dir_all(&project).unwrap();
+    assert!(git(&["init", project.to_str().unwrap()]).status.success());
+    let path = project.to_str().unwrap();
+
+    // The numeric prefix is the point of the fixture: GitHub has issued more
+    // than one for the same Copilot account, so an identity keyed on the number
+    // finds some of an agent's work and silently misses the rest. Only the
+    // address suffix is matched, and this address carries a prefix that is not
+    // in any list in the source.
+    const AGENT: &str = "Copilot <5551212+Copilot@users.noreply.github.com>";
+    const HUMAN: &str = "Fixture <fixture@example.com>";
+
+    commit_as(path, "src/lib.rs", "one\ntwo\n", HUMAN, &["mine"]);
+    commit_as(
+        path,
+        "src/lib.rs",
+        "one\ntwo\nthree\n",
+        HUMAN,
+        &[
+            "mine, with help",
+            "Co-authored-by: Copilot <5551212+Copilot@users.noreply.github.com>",
+        ],
+    );
+    commit_as(
+        path,
+        "src/agent.rs",
+        "a\nb\nc\nd\ne\nf\n",
+        AGENT,
+        &["Initial plan"],
+    );
+    commit_as(
+        path,
+        "src/agent.rs",
+        "a\nb\nc\nd\ne\nf\ng\nh\n",
+        AGENT,
+        &["Address review feedback"],
+    );
+
+    let report = |author: &str, extra: &[&str]| -> Value {
+        let mut arguments = vec![
+            "--dir",
+            path,
+            "--author",
+            author,
+            "--no-ai",
+            "--no-cache",
+            "--no-progress",
+            "--format",
+            "json",
+        ];
+        arguments.extend_from_slice(extra);
+        let output = run(&arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let seconds = |report: &Value, field: &str| -> f64 {
+        report["summary"][field]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{field} is not a number in {:?}", report["summary"]))
+    };
+
+    // Nothing happens until the run asks for it, and asking for it must not
+    // change a single number the report already produced.
+    let quiet = report("fixture@example.com", &[]);
+    assert_eq!(2, quiet["summary"]["commit_count"]);
+    assert_eq!(3, quiet["summary"]["additions"]);
+    assert_eq!(0, quiet["summary"]["agent_commit_count"]);
+    assert_eq!(0, quiet["summary"]["ai_assisted_commit_count"]);
+
+    let both = report("fixture@example.com", &["--agent-commits", "--co-authors"]);
+    assert_eq!(
+        2, both["summary"]["commit_count"],
+        "the agent's commits are not the developer's"
+    );
+    assert_eq!(3, both["summary"]["additions"], "nor are the agent's lines");
+    assert_eq!(
+        seconds(&quiet, "human_estimated_seconds"),
+        seconds(&both, "human_estimated_seconds"),
+        "the second pass moved the estimate"
+    );
+    assert_eq!(
+        quiet["summary"]["work_block_count"],
+        both["summary"]["work_block_count"]
+    );
+    assert_eq!(
+        quiet["summary"]["human_active_days"],
+        both["summary"]["human_active_days"]
+    );
+
+    // It is still output, and still visible.
+    assert_eq!(2, both["summary"]["agent_commit_count"]);
+    assert_eq!(8, both["summary"]["agent_additions"]);
+    assert_eq!(0, both["summary"]["agent_deletions"]);
+    assert_eq!(2, both["rows"][0]["agent_commit_count"]);
+    assert!(
+        !both["inputs"]["agent_authors"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a report is only reproducible if it says which identities it matched"
+    );
+    // A trailer describes a commit already counted above; it never adds one.
+    assert_eq!(1, both["summary"]["ai_assisted_commit_count"]);
+    assert_eq!(0, both["summary"]["autofix_assisted_commit_count"]);
+
+    // The failure mode this feature exists to prevent: a history in which the
+    // configured author wrote nothing at all and an agent wrote everything.
+    // Real machines hold repositories exactly like this.
+    let agent_only = report("nobody@example.com", &["--agent-commits"]);
+    assert_eq!(0.0, seconds(&agent_only, "human_estimated_seconds"));
+    assert_eq!(0, agent_only["summary"]["work_block_count"]);
+    assert_eq!(0, agent_only["summary"]["human_active_days"]);
+    assert_eq!(0, agent_only["summary"]["human_signal_count"]);
+    assert_eq!(0, agent_only["summary"]["commit_signal_count"]);
+    assert_eq!(0, agent_only["summary"]["commit_count"]);
+    assert_eq!(0, agent_only["summary"]["additions"]);
+    assert_eq!(2, agent_only["summary"]["agent_commit_count"]);
+    assert_eq!(8, agent_only["summary"]["agent_additions"]);
+    // Calendar coverage is the one thing it does contribute: the day an agent
+    // landed code is a day this repository saw work, just not a human's.
+    assert_eq!(1, agent_only["summary"]["active_days"]);
+    assert_eq!(2, agent_only["rows"][0]["agent_commit_count"]);
+    assert_eq!(0.0, agent_only["rows"][0]["human_estimated_seconds"]);
+
+    // `--agent-commits=REGEX` replaces the built-in identities rather than
+    // joining them, so a pattern naming nobody finds nobody — the author scan
+    // is untouched either way.
+    let narrowed = report(
+        "fixture@example.com",
+        &["--agent-commits=someone-else@example.com"],
+    );
+    assert_eq!(0, narrowed["summary"]["agent_commit_count"]);
+    assert_eq!(2, narrowed["summary"]["commit_count"]);
 }

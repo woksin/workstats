@@ -14,6 +14,42 @@ tag are the generated list of pull requests.
 
 ### Added
 
+- `--agent-commits` reads commits a coding agent authored and reports them as
+  output, never as human time. Once a branch has been fetched, that work is
+  ordinary local Git history, and `--author` cannot see it because the agent is
+  the author — so a second `git log` pass over the same repositories asks for
+  the agent's commits instead of yours. **They add no human time, no work
+  blocks, no setup/review credit, and no active human days**, and they are never
+  folded into the commit, line, work-composition, or change-shape figures
+  `--author` promises are yours: they get their own summary line, their own
+  report section, their own `agent_commit_count` / `agent_additions` /
+  `agent_deletions` fields in JSON and columns in CSV, and their own `git-agent`
+  row under `--group-by provider`. A repository whose history is nothing but
+  agent commits reports `Estimated human work  0h 00m`. The built-in identities
+  — GitHub's Copilot coding agent, Copilot on github.com, and Claude — are
+  matched on the tail of the e-mail address rather than on the numeric prefix,
+  because GitHub has issued more than one id for the same Copilot account and
+  anything keyed on the number finds part of an agent's work and silently misses
+  the rest. `github-actions` and `dependabot` are deliberately not agents.
+  `--agent-commits=REGEX` replaces the built-in identities rather than adding to
+  them, and takes the same *basic* regular expression `--author` does.
+- `--co-authors` reads the `Co-authored-by:` trailers on your own commits, so a
+  commit you wrote with an agent can be described as such. It flags a commit
+  already counted rather than adding one: the commit count, the changed lines,
+  and the human estimate are identical with and without it. Copilot Autofix is
+  counted separately from assisted development, because code scanning and
+  writing code with an assistant are different activities. Only the trailer
+  *values* are requested from Git; no other part of a commit message is read.
+- `contrib/copilot-github-sync.sh` records the Copilot activity a clone cannot
+  see — pull requests the coding agent opened and reviews it left — as
+  `workstats record` events. It is a script rather than a flag on purpose:
+  reading either means calling the GitHub API, and an HTTP client inside the
+  binary would end both the "no network calls" and the "no credential discovery"
+  guarantees. The call is made outside by your own authenticated `gh`, and what
+  crosses back in is the content-free record the `record` subcommand already
+  accepts — a provider, an identifier, a directory, a model name, and
+  timestamps, with no titles, bodies, or review text. Every event is written
+  with `--role subagent`, so nothing it records can become human time.
 - Configurable file areas. The six built-in areas are now a registry rather
   than a fixed set: a `categories` block in the config file adds rules to
   `source`, `test`, `docs`, `config`, `assets`, or `other`, and any name the
@@ -161,6 +197,31 @@ tag are the generated list of pull requests.
   `node_modules/pakke_æøå.js` was counted as authored work. The same holds for
   a path holding a quote, a backslash, or a control character, which Git quotes
   whatever that setting says — `node_modules/a"b.js` is ignored again.
+- A file whose name genuinely contains ` => ` is no longer mistaken for a
+  renamed file. Git spelled a rename the same way, so `node_modules/a => b.js`
+  arrived as `b.js`: it lost the directory the vendor rule matches on and was
+  counted as authored source. Names holding `{`, `}`, a tab, or a newline are
+  read correctly for the same reason. A file moved *out* of an ignored
+  directory now counts as authored work from the commit that moved it, rather
+  than staying ignored because of where it used to live.
+- A path that is not valid UTF-8 no longer costs a repository the rest of its
+  history. One such path ended the read, so every commit behind it disappeared
+  from the report — silently, and with no warning. Those paths are now reported
+  in their closest printable spelling and the scan continues.
+- A Git author whose address contains `+` — `person+work@example.com`, the
+  common form of a plus-addressed identity — no longer reports an empty
+  history. `git log --author` takes a *basic* regular expression, in which `+`
+  is already a literal and a backslash is what turns it into an operator, so
+  escaping it asked Git for "one or more `n`" and matched nothing that address
+  had ever committed. The same held for `?`, `(`, `)`, `{`, `}`, and `|` in an
+  author name such as `A (Team)`.
+- A release whose binaries failed to upload can no longer sit at `Latest` with
+  nothing to download. The release workflow now checks the finished release
+  against the assets it was supposed to carry, marks it a prerelease and fails
+  the run when any are missing or when `SHA256SUMS` does not cover every binary
+  — so `Latest`, `releases/latest/download/…`, and `workstats update` keep
+  pointing at the last complete release. Re-running the failed jobs attaches
+  the rest and restores the release to `Latest` automatically.
 - CSV no longer breaks negative numbers. Formula neutralisation prefixed an
   apostrophe to any cell starting with `-`, so a negative `net_lines` shipped as
   `'-1`. Cells that parse as numbers are now left alone; genuine formulas are

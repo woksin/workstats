@@ -17,6 +17,13 @@ name: Release
 # A run with no merged pull request behind it — or one carrying none of those
 # labels — releases nothing. To force a version by hand, run this workflow
 # with an explicit `version`; left at the 0.0.0 placeholder it stays a no-op.
+#
+# The release object is created before any binary exists, so a build that
+# falls over leaves a version people can see and cannot download. The last job
+# holds the finished release up against the list of assets it was supposed to
+# carry, fails the run when they are not all there, and takes the release out
+# of `Latest` until they are — see `Check the release is complete` for what
+# that failure does and how to get back out of it.
 
 on:
   push:
@@ -77,8 +84,17 @@ jobs:
       run:
         shell: bash
     strategy:
+      # Not fail-fast: one platform losing the network should not throw away
+      # five builds that were going to succeed. It does mean a failure here
+      # leaves the release short of exactly the assets it could not build,
+      # which is what the `verify` job is there to notice.
       fail-fast: false
       matrix:
+        # Six platforms, and the `verify` job carries the same six by asset
+        # name. A platform added, dropped or renamed here has to be added,
+        # dropped or renamed there too: that list is what decides whether a
+        # release is complete, and it has no way of working out on its own
+        # that a seventh was meant to exist.
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
@@ -447,3 +463,188 @@ jobs:
           fi
 
           echo "Tap published workstats ${VERSION}." >> "$GITHUB_STEP_SUMMARY"
+
+  verify:
+    name: Check the release is complete
+    # `if: always()` alongside a `needs` on every other job is the entire point
+    # of this one, and the reason it could not have been folded into `attach`
+    # or `homebrew`. Those two are wired downstream of the builds, so a build
+    # that fails skips them — and a skipped job reports nothing. That is how
+    # 1.2.0 went out: one build lost DNS while installing the toolchain,
+    # `attach` and `homebrew` were skipped rather than failed, and all anybody
+    # saw was a release sitting at `Latest` with no assets on it and a tap
+    # still advertising the version before. Every guard added to those jobs
+    # was, by construction, in the one place that does not run when this goes
+    # wrong. This job runs whatever happened upstream.
+    #
+    # The `publish` condition stays because a run that released nothing has no
+    # release to check. If the `release` job itself failed there is no output
+    # to read and this is skipped as well, which is the right answer: that run
+    # is already red, and the release object is created by that job's post
+    # step, so a failure there leaves nothing behind to go stale.
+    if: always() && needs.release.outputs.publish == 'true'
+    needs: [release, binaries, attach, homebrew]
+    runs-on: ubuntu-latest
+
+    # No checkout: `gh` reads the release over the API, and GH_REPO is what
+    # tells it which repository that is.
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.release.outputs.tag }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - name: Does the release carry every asset?
+        run: |
+          set -euo pipefail
+
+          # Written out here rather than derived from the build matrix on
+          # purpose: a check that learns what "complete" means from the run it
+          # is checking would call a release with no binaries at all complete,
+          # which is precisely the case it exists to catch. Six platforms,
+          # plus the checksum file `workstats update` reads before it installs
+          # anything.
+          expected=(
+            workstats-macos-arm64.tar.gz
+            workstats-macos-x86_64.tar.gz
+            workstats-linux-x86_64.tar.gz
+            workstats-linux-arm64.tar.gz
+            workstats-windows-x86_64.exe
+            workstats-windows-x86.exe
+            SHA256SUMS
+          )
+
+          # Marking the release a prerelease is the one repair this job can
+          # make, and both the missing-binaries case and the incomplete-
+          # checksums case want it, so it lives in one place.
+          #
+          # It is not cosmetic. `Latest` is what the releases page offers,
+          # what `releases/latest/download/…` resolves to, and what
+          # `workstats update` asks the API for — so a half-published release
+          # holding `Latest` is the actual damage: a version everyone is
+          # pointed at, nobody can install, and which shadows the last one
+          # that worked. A prerelease keeps its tag, its notes and whichever
+          # assets did land, all still downloadable at the same URLs; it
+          # simply stops being the release users are sent to, and the last
+          # complete release takes that back until this one is whole.
+          demote() {
+            if [ "$(jq -r '.isPrerelease' <<<"$release")" != "true" ]; then
+              gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+                -F prerelease=true -f make_latest=false >/dev/null
+            fi
+          }
+
+          # Three looks before believing the answer, as in the tap job's
+          # read-back and for the same reason: `gh release upload` in the
+          # attach job and the API that lists what it uploaded are not the
+          # same system, and a release read moments after the last upload can
+          # still be a step behind. An asset that is still arriving is listed
+          # with state "starter", so "uploaded and not empty" is the only
+          # shape that counts as attached.
+          release=""
+          for attempt in 1 2 3; do
+            release=$(gh release view "$TAG" --json databaseId,assets,isDraft,isPrerelease) || release=""
+            if [ -n "$release" ] &&
+              [ "$(jq '[.assets[] | select(.state == "uploaded" and .size > 0)] | length' <<<"$release")" -ge "${#expected[@]}" ]; then
+              break
+            fi
+            [ "$attempt" = 3 ] || sleep 5
+          done
+
+          # Unknown is not the same as broken, and guessing either way would
+          # be worse than saying so — nothing is demoted here, because the
+          # release may be perfectly fine and unreachable only for as long as
+          # the API is.
+          if [ -z "$release" ]; then
+            echo "::error title=Could not read release $TAG::The release could not be read back from the API, so whether $TAG carries its binaries is unknown. Check the releases page by hand before telling anyone this version is out. Re-running this job is safe and will answer the question once the API has recovered."
+            exit 1
+          fi
+
+          release_id=$(jq -r '.databaseId' <<<"$release")
+
+          missing=()
+          for name in "${expected[@]}"; do
+            jq -e --arg name "$name" \
+              'any(.assets[]; .name == $name and .state == "uploaded" and .size > 0)' \
+              <<<"$release" >/dev/null || missing+=("$name")
+          done
+
+          # The motivating failure. The message has to carry the way out of it
+          # or it only moves the confusion somewhere else: the release object
+          # and its tag already exist, the upload step runs with --clobber, so
+          # re-running the jobs that failed is the whole fix. Which button
+          # matters is worth spelling out, because "Re-run all jobs" sits next
+          # to the one that is wanted and would send the version through the
+          # release action a second time.
+          if [ "${#missing[@]}" -gt 0 ]; then
+            demote
+            recovery="Nothing has to be re-cut: the release object and its tag already exist, and the upload step runs with --clobber. Use \"Re-run failed jobs\" on $RUN_URL — not \"Re-run all jobs\", which would work the version out again — and the builds that failed will attach their binaries, after which this job restores $TAG to Latest on its own."
+            echo "::error title=$TAG is missing ${#missing[@]} of ${#expected[@]} release assets::Missing: ${missing[*]}. $TAG has been marked a prerelease, so Latest points at the last complete release rather than at one nobody can download. $recovery"
+            {
+              echo "### $TAG went out incomplete"
+              echo
+              echo "Missing from the release:"
+              for name in "${missing[@]}"; do
+                echo "- \`$name\`"
+              done
+              echo
+              echo "Marked a prerelease, so \`Latest\` points at the last complete release instead."
+              echo
+              echo "$recovery"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Every asset attached but the release unpublished is the same
+          # outcome by another road: a draft is invisible to the releases
+          # page, to `releases/latest/download/…` and to `workstats update`.
+          # Nothing this job could do about it is safe to do unasked —
+          # publishing a draft somebody left deliberately would be worse than
+          # the draft — so it says so and stops.
+          if [ "$(jq -r '.isDraft' <<<"$release")" = "true" ]; then
+            echo "::error title=$TAG is still a draft::All ${#expected[@]} assets are attached, but the release is a draft, which is invisible to the releases page, to releases/latest/download/… and to workstats update. Publish it from the releases page, then re-run this job."
+            exit 1
+          fi
+
+          # SHA256SUMS is not decoration. `workstats update` downloads it,
+          # finds the line naming the asset it is about to install, and
+          # refuses the download when the digest does not match — so a
+          # checksum file that never names a platform is a platform that
+          # cannot self-update, however many binaries hang off the release.
+          # Read the published file back out of the release and insist every
+          # binary is in it, in the same spirit as the tap job reading its
+          # formula back out of the tap.
+          gh release download "$TAG" --pattern SHA256SUMS --clobber
+          cat SHA256SUMS
+
+          unlisted=()
+          for name in "${expected[@]}"; do
+            # SHA256SUMS does not list itself, and is not meant to: nothing
+            # verifies the verifier.
+            [ "$name" = SHA256SUMS ] && continue
+            grep -qE "^[0-9a-f]{64}[[:space:]]+\*?${name}\$" SHA256SUMS || unlisted+=("$name")
+          done
+
+          if [ "${#unlisted[@]}" -gt 0 ]; then
+            demote
+            echo "::error title=SHA256SUMS on $TAG does not cover every binary::Not listed: ${unlisted[*]}. workstats update refuses any download it cannot check a digest for, so those platforms cannot move to $TAG. $TAG has been marked a prerelease, so Latest points at the last complete release. Re-run the failed jobs on $RUN_URL: the attach job rebuilds SHA256SUMS from the packaged artifacts and re-uploads it with --clobber."
+            exit 1
+          fi
+
+          # The other half of the demotion above: a re-run that fixed the
+          # builds arrives here with everything attached and puts the release
+          # back where it belongs. Conditional on purpose — a release that
+          # went out cleanly the first time must not have this job touching it
+          # at all — and safe to key off the prerelease flag alone, because
+          # this workflow has no way to cut a prerelease deliberately, so a
+          # prerelease carrying a full set of assets can only be one an
+          # earlier attempt demoted.
+          if [ "$(jq -r '.isPrerelease' <<<"$release")" = "true" ]; then
+            gh api --method PATCH "repos/$GH_REPO/releases/$release_id" \
+              -F prerelease=false -f make_latest=true >/dev/null
+            echo "::notice title=$TAG restored to Latest::All ${#expected[@]} assets are attached, so the prerelease mark left by an earlier attempt has been removed."
+            echo "Restored **$TAG** to Latest: all ${#expected[@]} assets are attached, and SHA256SUMS covers every binary." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "**$TAG** publishes all ${#expected[@]} assets, and SHA256SUMS covers every binary." >> "$GITHUB_STEP_SUMMARY"
+          fi

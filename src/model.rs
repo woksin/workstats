@@ -147,6 +147,88 @@ impl Interval {
     }
 }
 
+/// Co-author identities that mean an AI agent helped write the commit.
+///
+/// Matched against the *value* of a `Co-authored-by:` trailer, lowercased. The
+/// e-mail suffix is the only stable part: GitHub has issued at least two
+/// numeric ids for the one Copilot identity — `198982749+Copilot@` and
+/// `223556219+Copilot@` both occur in this machine's history — so a matcher
+/// keyed on the number silently stops finding half of them the day GitHub
+/// issues a third.
+const AGENT_CO_AUTHORS: &[&str] = &[
+    "+copilot@users.noreply.github.com",
+    "<copilot@github.com>",
+    "copilot-swe-agent[bot]",
+    "+claude[bot]@users.noreply.github.com",
+    "<noreply@anthropic.com>",
+];
+
+/// Copilot Autofix is GitHub's code-scanning remediation, not an interactive
+/// assistant, and it is counted apart from one. Its display name is literally
+/// "Copilot Autofix powered by AI", so it has to be tested for *first*: any
+/// rule looking for the word Copilot claims it, and then every security fix in
+/// the report reads as assisted development.
+const AUTOFIX_CO_AUTHORS: &[&str] = &[
+    "github-code-quality[bot]@",
+    "github-advanced-security[bot]@",
+];
+
+/// Who Git records as having written a commit, and which AI identities the
+/// commit names beside them.
+///
+/// The distinction is the reason this tool exists. A commit a coding agent
+/// authored is landed code the developer never typed, so treating it as
+/// evidence that someone was at the keyboard would inflate the single number
+/// the report exists to keep honest. A commit the developer wrote *with* an
+/// agent is the opposite case: it is already counted, once, and the co-author
+/// trailer only records how it was written. That is why assistance is a flag on
+/// a commit rather than a signal in its own right — nothing here can turn a
+/// trailer into a second piece of work, because nothing here builds a commit
+/// out of one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Authorship {
+    agent_authored: bool,
+    agent_assisted: bool,
+    autofix_assisted: bool,
+}
+
+impl Authorship {
+    /// A commit a coding agent authored. `Authorship::default()` is the other
+    /// case — the configured author wrote it — so a commit is human unless a
+    /// pass says otherwise.
+    pub const fn agent() -> Self {
+        Self {
+            agent_authored: true,
+            agent_assisted: false,
+            autofix_assisted: false,
+        }
+    }
+
+    /// Records one `Co-authored-by:` value against the commit that carries it.
+    /// Only the identity is looked at; the trailer is the sole part of a commit
+    /// message this tool ever reads, and it is read for *who*, never for what.
+    pub fn note_co_author(&mut self, value: &str) {
+        let value = value.to_ascii_lowercase();
+        if AUTOFIX_CO_AUTHORS.iter().any(|name| value.contains(name)) {
+            self.autofix_assisted = true;
+        } else if AGENT_CO_AUTHORS.iter().any(|name| value.contains(name)) {
+            self.agent_assisted = true;
+        }
+    }
+
+    pub fn is_agent_authored(&self) -> bool {
+        self.agent_authored
+    }
+
+    pub fn is_agent_assisted(&self) -> bool {
+        self.agent_assisted
+    }
+
+    pub fn is_autofix_assisted(&self) -> bool {
+        self.autofix_assisted
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GitCommit {
     pub sha: String,
@@ -160,6 +242,33 @@ pub struct GitCommit {
     pub ignored_additions: u64,
     pub ignored_deletions: u64,
     pub categories: CategoryTally,
+    pub authorship: Authorship,
+}
+
+impl GitCommit {
+    /// What this commit is evidence of, on the human timeline — or `None` when
+    /// a coding agent authored it.
+    ///
+    /// Every route from a commit into that timeline runs through here. There is
+    /// no other way to build a `HumanSignal` from a commit, so agent-authored
+    /// work cannot reach the human estimate by being overlooked in a `map`: the
+    /// caller is handed an `Option` it has to deal with, and the only thing it
+    /// can do with `None` is drop it.
+    pub fn human_signal(&self) -> Option<HumanSignal> {
+        if self.authorship.is_agent_authored() {
+            return None;
+        }
+        Some(HumanSignal {
+            timestamp: self.timestamp,
+            provider: "git".to_string(),
+            session_id: self.sha.clone(),
+            cwd: self.cwd.clone(),
+            repo: self.repo.clone(),
+            root: self.root.clone(),
+            kind: "commit".to_string(),
+            model: "—".to_string(),
+        })
+    }
 }
 
 /// Enough stored warnings to see what went wrong without the report becoming
@@ -237,6 +346,10 @@ pub struct Methodology {
     /// Names the configured categories, which are not known at compile time.
     pub composition: String,
     pub change_shapes: &'static str,
+    /// How commits a coding agent authored are treated. Stated in the report
+    /// itself because the number a reader is most likely to misread is the one
+    /// that looks like their own output but is not.
+    pub agent_output: &'static str,
     pub scope: &'static str,
 }
 
@@ -289,6 +402,20 @@ pub struct Summary {
     pub deletions: u64,
     pub ignored_additions: u64,
     pub ignored_deletions: u64,
+    /// Commits a coding agent authored, and their churn. Kept beside the
+    /// figures above rather than added into them: `--author` is this tool's
+    /// promise about whose work is being measured, and code an agent pushed to
+    /// a branch is output, not evidence of anyone's day.
+    pub agent_commit_count: usize,
+    pub agent_additions: u64,
+    pub agent_deletions: u64,
+    /// Commits already counted above that name an AI agent as co-author. A
+    /// share of `commit_count`, never an addition to it.
+    pub ai_assisted_commit_count: usize,
+    /// Commits already counted above that carry a Copilot Autofix trailer.
+    /// Separate from `ai_assisted_commit_count` because code scanning and
+    /// assisted development are different activities.
+    pub autofix_assisted_commit_count: usize,
     pub composition: Vec<CompositionEntry>,
     pub change_shapes: Vec<ShapeEntry>,
     pub active_days: usize,
@@ -322,6 +449,13 @@ pub struct ReportRow {
     pub ignored_additions: u64,
     pub ignored_deletions: u64,
     pub net_lines: i64,
+    /// The same split as on `Summary`: agent-authored output beside the row's
+    /// own, never inside it.
+    pub agent_commit_count: usize,
+    pub agent_additions: u64,
+    pub agent_deletions: u64,
+    pub ai_assisted_commit_count: usize,
+    pub autofix_assisted_commit_count: usize,
     pub composition: Vec<CompositionEntry>,
     pub change_shapes: Vec<ShapeEntry>,
     pub input_tokens: u64,
@@ -349,6 +483,13 @@ pub struct Inputs {
     pub included_providers: Vec<String>,
     pub excluded_providers: Vec<String>,
     pub author: String,
+    /// The `--author` patterns the second, agent-identity pass ran with; empty
+    /// when the run did not ask for one. Recorded because the patterns are
+    /// overridable, so a report is only reproducible if it says which ones it
+    /// matched.
+    pub agent_authors: Vec<String>,
+    /// Whether `Co-authored-by:` trailers were read at all.
+    pub co_authors: bool,
     pub repo_filter: Option<String>,
     pub repo_exact_filter: Option<String>,
     pub human_idle: String,
@@ -399,6 +540,75 @@ mod tests {
             "a merged total must be the warnings raised, not the messages kept"
         );
         assert_eq!(MAX_STORED_MESSAGES, left.messages.len());
+    }
+
+    fn dated(sha: &str, authorship: Authorship) -> GitCommit {
+        GitCommit {
+            sha: sha.to_string(),
+            timestamp: DateTime::from_timestamp(1_767_225_600, 0).unwrap(),
+            repo: "repo".into(),
+            cwd: "/repo".into(),
+            root: "root".into(),
+            additions: 10,
+            deletions: 1,
+            files: vec!["src/lib.rs".into()],
+            ignored_additions: 0,
+            ignored_deletions: 0,
+            categories: CategoryTally::default(),
+            authorship,
+        }
+    }
+
+    /// The one lever that keeps the estimate honest. A commit a coding agent
+    /// wrote is real output and zero evidence that anybody was present, and
+    /// there is deliberately no second way to ask.
+    #[test]
+    fn an_agent_authored_commit_is_never_evidence_a_human_was_there() {
+        assert!(dated("a", Authorship::default()).human_signal().is_some());
+        assert!(dated("b", Authorship::agent()).human_signal().is_none());
+
+        // Assistance never changes the answer: the developer still wrote it.
+        let mut assisted = Authorship::default();
+        assisted.note_co_author("Copilot <223556219+Copilot@users.noreply.github.com>");
+        let commit = dated("c", assisted);
+        assert!(commit.human_signal().is_some());
+        assert!(commit.authorship.is_agent_assisted());
+        assert!(!commit.authorship.is_agent_authored());
+    }
+
+    /// GitHub has issued more than one numeric id for the same Copilot
+    /// identity, so anything matching on the number rots quietly. Both ids in
+    /// this machine's history are pinned here.
+    #[test]
+    fn copilot_is_recognised_by_its_address_and_not_by_its_number() {
+        for value in [
+            "Copilot <198982749+Copilot@users.noreply.github.com>",
+            "Copilot <223556219+Copilot@users.noreply.github.com>",
+            "copilot-swe-agent[bot] <198982749+Copilot@users.noreply.github.com>",
+            "Copilot <copilot@github.com>",
+            "Claude Opus 5 (1M context) <noreply@anthropic.com>",
+        ] {
+            let mut authorship = Authorship::default();
+            authorship.note_co_author(value);
+            assert!(authorship.is_agent_assisted(), "{value} went unrecognised");
+            assert!(!authorship.is_autofix_assisted(), "{value} is not Autofix");
+        }
+
+        // "Copilot Autofix powered by AI" contains the word every rule above
+        // looks for, so testing for it second would misfile every security fix
+        // as assisted development.
+        let mut autofix = Authorship::default();
+        autofix.note_co_author(
+            "Copilot Autofix powered by AI <223894421+github-code-quality[bot]@users.noreply.github.com>",
+        );
+        assert!(autofix.is_autofix_assisted());
+        assert!(!autofix.is_agent_assisted());
+
+        // Automation that is not an AI agent stays out of both counts.
+        let mut human = Authorship::default();
+        human.note_co_author("dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>");
+        human.note_co_author("Colleague <colleague@example.com>");
+        assert_eq!(Authorship::default(), human);
     }
 
     #[test]
