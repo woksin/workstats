@@ -603,6 +603,9 @@ mod tests {
     /// it exactly like a rename. Resolving one of those strips the directory
     /// the vendor rule matches on, so the file would be counted as authored
     /// source; matching the ignores on the raw spelling too keeps it out.
+    // Windows forbids `>` in a filename, so the ambiguity this guards against
+    // cannot arise there and the fixture cannot even be written.
+    #[cfg(not(windows))]
     #[test]
     fn a_filename_that_looks_like_a_rename_still_matches_the_ignores() {
         let base = tempdir().unwrap();
@@ -811,7 +814,9 @@ mod tests {
         let mut diagnostics = Diagnostics::default();
         // A source-root label that appears in neither the repo name nor the
         // path, so only the root can satisfy the filter.
-        let rule = SourceRule::new(r"^.+/widget$", "acme-portfolio").unwrap();
+        // No separator in the pattern: the same rule has to match a POSIX path
+        // and a Windows one, where the components are joined with backslashes.
+        let rule = SourceRule::new(r"^.+widget$", "acme-portfolio").unwrap();
         let mut resolver = PathResolver::with_home(vec![rule], base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),

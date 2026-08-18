@@ -1206,22 +1206,20 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
     // across working directories or roles would collapse to whichever record came last
     // — reporting foreground work as a subagent. Codex and Copilot suffix the cwd for
     // the same reason.
-    let mut variants: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for (provider, session_id, _, _) in sessions.keys() {
-        *variants
-            .entry((provider.clone(), session_id.clone()))
-            .or_default() += 1;
-    }
+    //
+    // The suffix is unconditional rather than applied only when one file holds
+    // several variants: a rotated or split log puts the same stream in two
+    // files, and suffixing per file would give the same session two different
+    // ids and count it twice. Deriving the id from the record alone keeps it
+    // stable however the records are distributed.
     result.sessions = sessions
         .into_iter()
-        .map(|((provider, session_id, cwd, is_subagent), mut session)| {
-            if variants[&(provider, session_id)] > 1 {
-                session.session_id = if is_subagent {
-                    format!("{}:{cwd}:subagent", session.session_id)
-                } else {
-                    format!("{}:{cwd}", session.session_id)
-                };
-            }
+        .map(|((_, _, cwd, is_subagent), mut session)| {
+            session.session_id = if is_subagent {
+                format!("{}:{cwd}:subagent", session.session_id)
+            } else {
+                format!("{}:{cwd}", session.session_id)
+            };
             session
         })
         .collect();
@@ -1358,17 +1356,24 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                 )?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
-                    let (Some(session_id), Some(milliseconds), Some(data)) = (
-                        sqlite_text(row, 0),
-                        sqlite_number(row, 1),
-                        sqlite_text(row, 2),
-                    ) else {
+                    // The session check comes before the other two cells on
+                    // purpose: this table is the legacy mirror of
+                    // `session_message`, so rows already covered there are
+                    // skipped by design and a NULL in one of them is not a
+                    // damaged database worth warning about.
+                    let Some(session_id) = sqlite_text(row, 0) else {
                         skipped_rows += 1;
                         continue;
                     };
                     if current_session_ids.contains(&session_id) {
                         continue;
                     }
+                    let (Some(milliseconds), Some(data)) =
+                        (sqlite_number(row, 1), sqlite_text(row, 2))
+                    else {
+                        skipped_rows += 1;
+                        continue;
+                    };
                     let Some(session) = sessions.get_mut(&session_id) else {
                         continue;
                     };
@@ -2605,7 +2610,13 @@ mod tests {
         let parsed = parse_event_file(&path, MAX_JSONL_LINE_BYTES);
         assert_eq!("cursor", parsed.sessions[0].provider);
         assert_eq!(1, parsed.sessions.len());
-        assert_eq!("task-one", parsed.sessions[0].session_id);
+        // The cwd is always appended, so the same stream keeps one id however
+        // the records are split across files.
+        assert!(
+            parsed.sessions[0].session_id.starts_with("task-one:"),
+            "unexpected id {}",
+            parsed.sessions[0].session_id
+        );
         assert_eq!(1, parsed.sessions[0].human_points.len());
         assert_eq!(1, parsed.sessions[0].exact_intervals.len());
         assert_eq!(1, parsed.diagnostics.content_rejections);
