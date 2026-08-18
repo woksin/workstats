@@ -364,7 +364,7 @@ kind*, without opening a single file or reading a single commit message.
 | Area | Matched by |
 |---|---|
 | `source` | Known source extensions — `.rs`, `.go`, `.ts`, `.py`, `.sql`, `.css`, and friends. |
-| `test` | A `tests/`, `spec/`, `__tests__/`, `fixtures/`, or `benches/` directory, or a name such as `user_spec.rb`, `Button.test.tsx`, `UserServiceTest.java`. |
+| `test` | A `tests/`, `spec/`, `__tests__/`, `fixtures/`, or `benches/` directory; a sibling test project such as `Arc.Core.Specs/` or `Fundamentals.Tests/`; a BDD behaviour folder such as `for_Subject/when_something/given/`; or a name such as `user_spec.rb`, `Button.test.tsx`, `UserServiceTest.java`, `when_binding.cs`. |
 | `docs` | `.md`, `.rst`, `.adoc`, a `docs/` directory, or a `README`/`LICENSE`/`CHANGELOG`-style name. |
 | `config` | Manifests, CI, and tooling — `.toml`, `.yml`, `.json`, `Dockerfile`, `Makefile`, `.github/**`. |
 | `assets` | Images, fonts, media, and other binaries. |
