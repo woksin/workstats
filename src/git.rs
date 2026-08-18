@@ -396,7 +396,8 @@ fn parse_git_log(
         let (Some(added), Some(removed)) = (added, removed) else {
             continue;
         };
-        let raw = fields.last().copied().unwrap_or_default();
+        let unquoted = unquote_path(fields.last().copied().unwrap_or_default());
+        let raw: &str = &unquoted;
         let resolved = renamed_target(raw);
         let file_path: &str = &resolved;
         if includes.is_some_and(|patterns| !patterns.is_match(file_path)) {
@@ -430,6 +431,65 @@ fn parse_git_log(
 /// resolved to where the file ended up before any of them sees it. Renames are
 /// left on (`--no-renames` would turn every large move into thousands of
 /// phantom added and deleted lines).
+/// Git wraps a path in quotes and escapes it whenever it holds a quote, a
+/// backslash, or a control character — `core.quotePath=false` suppresses the
+/// escaping of non-ASCII bytes but not this. The wrapping quote is what does the
+/// damage: it becomes part of the extension, so `a"b.js` classifies as `other`,
+/// and it defeats the root-anchored ignore globs, so a quoted
+/// `node_modules/...` is counted as authored work.
+fn unquote_path(field: &str) -> Cow<'_, str> {
+    let Some(inner) = field
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return Cow::Borrowed(field);
+    };
+    let raw = inner.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] != b'\\' {
+            out.push(raw[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(&escape) = raw.get(index) else {
+            break;
+        };
+        index += 1;
+        match escape {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            // Up to three octal digits, which is how every non-ASCII byte and
+            // every control character arrives.
+            b'0'..=b'7' => {
+                let mut value = u32::from(escape - b'0');
+                for _ in 0..2 {
+                    match raw.get(index) {
+                        Some(&digit @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(digit - b'0');
+                            index += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(value as u8);
+            }
+            other => out.push(other),
+        }
+    }
+    // A path that is not valid UTF-8 cannot be classified or matched
+    // meaningfully, and inventing replacement characters would only move the
+    // problem, so it keeps the spelling Git gave us.
+    String::from_utf8(out).map_or(Cow::Borrowed(field), Cow::Owned)
+}
+
 fn renamed_target(field: &str) -> Cow<'_, str> {
     let Some(arrow) = field.find(" => ") else {
         return Cow::Borrowed(field);
@@ -639,6 +699,37 @@ mod tests {
         assert_eq!(1, commits.len());
         assert_eq!(1, commits[0].additions, "only src.rs is authored");
         assert_eq!(5, commits[0].ignored_additions, "both vendored files");
+    }
+
+    #[test]
+    fn c_quoted_paths_are_unwrapped_before_anything_looks_at_them() {
+        // Git quotes these regardless of core.quotePath, so the wrapping quote
+        // reaches the parser and used to become part of the extension.
+        assert_eq!("src/a\"b.rs", unquote_path(r#""src/a\"b.rs""#));
+        assert_eq!(
+            "src/back\\slash.rs",
+            unquote_path(r#""src/back\\slash.rs""#)
+        );
+        // Octal escapes are how every non-ASCII byte arrives.
+        assert_eq!(
+            "tests/spørsmål_test.rs",
+            unquote_path(r#""tests/sp\303\270rsm\303\245l_test.rs""#)
+        );
+        assert_eq!("a\tb.rs", unquote_path(r#""a\tb.rs""#));
+        // An ordinary path is returned untouched, quotes and all if they are
+        // part of the name rather than Git's wrapper.
+        assert_eq!("src/main.rs", unquote_path("src/main.rs"));
+        assert_eq!("say \"hi\".rs", unquote_path("say \"hi\".rs"));
+
+        // The whole point: a quoted vendored path must still be ignored.
+        let patterns: Vec<String> = DEFAULT_IGNORES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        let globs = compile_globs(&patterns).unwrap().unwrap();
+        let quoted = r#""node_modules/a\"b.js""#;
+        assert!(!globs.is_match(quoted), "the quoted spelling escapes");
+        assert!(globs.is_match(unquote_path(quoted).as_ref()));
     }
 
     #[test]
