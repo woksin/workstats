@@ -147,6 +147,37 @@ tag are the generated list of pull requests.
 
 ### Fixed
 
+- **A whole Copilot Chat session was being dropped for exceeding a stale size
+  ceiling.** The VS Code chat parser refused any session over 16 MiB, a limit
+  set when the largest session anyone had seen was 6.4 MB. Sessions grow with
+  use: of the 26 on the machine this was measured on, the largest is now
+  17.9 MB, so it was refused outright — 23 turns across three weeks and 49
+  minutes of measured agent time, gone — with the next one down only 1.6 MB
+  clear of the same fate. The ceiling is now 64 MiB, about 3.8× the largest
+  real session rather than 0.9×, and a compile-time assertion keeps it in that
+  relation to the largest observed size rather than to a number someone liked.
+  Raising it costs nothing measurable: the parser reads into narrow structs
+  rather than a `serde_json::Value`, so peak memory tracks the number of turns
+  and not the file size — 0.16 MB for the 17.9 MB session, where a `Value` tree
+  of the same file costs 50 MB — and a full run's peak memory is unchanged.
+- **A resolved Copilot repository disagreement is no longer a warning.** When
+  the Copilot CLI's session store names a repository the session's own working
+  directory contradicts, the directory decides and the report is right. Nothing
+  is lost and there is nothing the reader can act on — it is Copilot's metadata
+  that is wrong, on a session that closed months ago — yet it printed as a
+  `Warning:` on every run, forever, once per session. `Diagnostics` now has a
+  second channel for facts the run resolved by itself: the table says
+  `Note: N Copilot sessions had repository metadata that disagreed …` once, and
+  `--format json` carries `diagnostics.notes` and `repository_conflicts` for
+  anyone who wants to know which ones. Genuine problems — a skipped session, an
+  unreadable file — are still warnings.
+- **A clipped warning no longer loses the file name it is about.** Messages
+  quoting a path were cut at 200 characters from the left, which on the VS Code
+  `workspaceStorage` paths that actually overrun removed the file name and the
+  reason after it and left a line naming neither. The middle is elided instead,
+  so the leading directories and the file name both survive; the total stays
+  bounded at 200 characters, and both halves still go through the same control
+  character and bidi substitution as before.
 - **Claude Code token totals were roughly doubled and are now correct.** Claude
   Code writes one transcript record per content block of a single API response
   — the text block, then one per tool call — and every one of them repeats the
@@ -171,7 +202,7 @@ tag are the generated list of pull requests.
   CLI's own session store, instead of landing under the transcript directory
   with an approximate location. A directory the event log did record still
   wins, and a session store naming a repository the directory contradicts is
-  reported as a warning rather than silently preferred.
+  recorded rather than silently preferred.
 - A single unreadable row in the OpenCode database no longer discards every
   OpenCode session. OpenCode stores `time_created` as a numeric column that
   SQLite may hold as a floating-point value, which aborted the whole read. Bad

@@ -273,7 +273,8 @@ impl GitCommit {
 
 /// Enough stored warnings to see what went wrong without the report becoming
 /// the log. Past it `warn` keeps counting but stops keeping, so `messages` is
-/// a sample and `warning_count` is the total.
+/// a sample and `warning_count` is the total. `note` is bounded by the same
+/// number for the same reason.
 pub const MAX_STORED_MESSAGES: usize = 100;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -292,12 +293,25 @@ pub struct Diagnostics {
     pub cache_misses: u64,
     pub cache_writes: u64,
     pub pruned_files: u64,
+    /// Copilot sessions whose store row named a repository the session's own
+    /// working directory contradicts. Counted rather than warned about: the
+    /// directory already decided, so nothing is lost and nothing is actionable
+    /// — see `note`.
+    #[serde(default)]
+    pub repository_conflicts: u64,
     /// Every warning raised, including the ones past `MAX_STORED_MESSAGES`
     /// that were never stored. `messages.len()` is a floor, so a report that
     /// wants the real number has to read this one.
     #[serde(default)]
     pub warning_count: u64,
     pub messages: Vec<String>,
+    /// The same floor-and-total pair as `messages`/`warning_count`, for notes.
+    #[serde(default)]
+    pub note_count: u64,
+    /// Facts the run resolved by itself, kept out of `messages` so they never
+    /// print as warnings. See `note`.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl Diagnostics {
@@ -305,6 +319,22 @@ impl Diagnostics {
         self.warning_count += 1;
         if self.messages.len() < MAX_STORED_MESSAGES {
             self.messages.push(message.into());
+        }
+    }
+
+    /// Something the run noticed, resolved correctly, and has no work to hand
+    /// the reader: the report is right and there is nothing they could change.
+    ///
+    /// It is a separate channel from `warn` because history does not change.
+    /// A resolved fact about a session that was written months ago reappears on
+    /// every single run, forever, and a `Warning:` line the reader can only ever
+    /// ignore is how they learn to ignore the ones that mean something. Notes
+    /// are counted for the summary and carried in `--format json`, so anyone
+    /// who wants the detail can still have it.
+    pub fn note(&mut self, message: impl Into<String>) {
+        self.note_count += 1;
+        if self.notes.len() < MAX_STORED_MESSAGES {
+            self.notes.push(message.into());
         }
     }
 
@@ -319,6 +349,7 @@ impl Diagnostics {
         self.cache_misses += other.cache_misses;
         self.cache_writes += other.cache_writes;
         self.pruned_files += other.pruned_files;
+        self.repository_conflicts += other.repository_conflicts;
         // Only the warnings `other` could not store are added here: the loop
         // below goes through `warn`, which counts every message it replays, so
         // adding `other.warning_count` as well would count those twice. The
@@ -330,6 +361,11 @@ impl Diagnostics {
             .saturating_sub(other.messages.len() as u64);
         for message in &other.messages {
             self.warn(message.clone());
+        }
+        // Notes merge by the same rule, and for the same reason.
+        self.note_count += other.note_count.saturating_sub(other.notes.len() as u64);
+        for note in &other.notes {
+            self.note(note.clone());
         }
     }
 }
@@ -611,6 +647,47 @@ mod tests {
         assert_eq!(Authorship::default(), human);
     }
 
+    /// The point of the second channel: a note is recorded, but it is never a
+    /// warning, so a run whose only finding is one it resolved itself has
+    /// nothing to warn about.
+    #[test]
+    fn a_note_is_recorded_without_ever_becoming_a_warning() {
+        let mut diagnostics = Diagnostics::default();
+        diagnostics.note("repository metadata disagreed; the directory decided");
+        assert_eq!(1, diagnostics.note_count);
+        assert_eq!(1, diagnostics.notes.len());
+        assert_eq!(0, diagnostics.warning_count);
+        assert!(diagnostics.messages.is_empty());
+
+        // And the reverse, so neither channel can drift into the other.
+        diagnostics.warn("history not found");
+        assert_eq!(1, diagnostics.note_count);
+        assert_eq!(1, diagnostics.warning_count);
+    }
+
+    #[test]
+    fn notes_are_bounded_and_merged_on_the_same_terms_as_warnings() {
+        let mut left = Diagnostics::default();
+        let mut right = Diagnostics::default();
+        for (target, prefix) in [(&mut left, "left"), (&mut right, "right")] {
+            for index in 0..MAX_STORED_MESSAGES + 7 {
+                target.note(format!("{prefix} {index}"));
+            }
+            target.repository_conflicts = 3;
+        }
+        assert_eq!(MAX_STORED_MESSAGES, left.notes.len());
+        left.merge(&right);
+        assert_eq!(
+            2 * MAX_STORED_MESSAGES as u64 + 14,
+            left.note_count,
+            "a merged total must be the notes raised, not the notes kept"
+        );
+        assert_eq!(MAX_STORED_MESSAGES, left.notes.len());
+        assert_eq!(6, left.repository_conflicts);
+        // Merging notes must not manufacture a warning out of nothing.
+        assert_eq!(0, left.warning_count);
+    }
+
     #[test]
     fn merging_a_countless_diagnostics_falls_back_to_its_stored_messages() {
         // Messages that never went through `warn`, which is what deserialising
@@ -618,11 +695,15 @@ mod tests {
         // about it, and they must not be lost from the total.
         let older = Diagnostics {
             messages: vec!["stale".to_string()],
+            notes: vec!["stale note".to_string()],
             ..Diagnostics::default()
         };
         let mut current = warned(2, "current");
+        current.note("current note");
         current.merge(&older);
         assert_eq!(3, current.warning_count);
         assert_eq!(3, current.messages.len());
+        assert_eq!(2, current.note_count);
+        assert_eq!(2, current.notes.len());
     }
 }

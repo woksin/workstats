@@ -129,6 +129,23 @@ const MODEL_WIDTH: usize = 34;
 /// printed.
 const MAX_MESSAGE_CHARACTERS: usize = 200;
 
+/// How much of an over-long message is kept from its end.
+///
+/// The clip used to take the first `MAX_MESSAGE_CHARACTERS` characters, which on
+/// the messages that actually overrun — the ones quoting a VS Code
+/// `workspaceStorage` path — cut off the file name and the reason after it and
+/// left a line naming no file and no fault. So the middle goes instead: the
+/// leading directories say where to look, the tail says which file and why, and
+/// the reader can act on either half. Eighty characters is what the longest real
+/// tail needs — `chatSessions/`, a 36-character UUID name, `.json`, and the
+/// `: reason` a parse failure appends — leaving the rest of the budget to the
+/// head.
+const MESSAGE_TAIL_CHARACTERS: usize = 80;
+
+/// The ellipsis has to come out of the budget, or the "bounded" message is one
+/// character longer than the bound.
+const _: () = assert!(MESSAGE_TAIL_CHARACTERS + 1 < MAX_MESSAGE_CHARACTERS);
+
 /// One user-facing spelling for "no model named". The pipeline carries three:
 /// `unknown` where a transcript never named one, `<synthetic>` where a provider
 /// writes its own placeholder, and `—` for a Git commit, which has no model at
@@ -549,6 +566,9 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             number(diagnostics.content_rejections)
         );
     }
+    if let Some(note) = repository_conflict_note(diagnostics.repository_conflicts) {
+        println!("{note}");
+    }
     // Without these a mistyped --history or --events path produces a clean
     // looking report with silently missing data.
     for message in diagnostics.messages.iter().take(MAX_PRINTED_MESSAGES) {
@@ -557,6 +577,25 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     if let Some(note) = hidden_messages_note(diagnostics.warning_count) {
         println!("{note}");
     }
+}
+
+/// One line for every Copilot session whose stored repository slug disagreed
+/// with the directory it ran in, however many there were.
+///
+/// A `Warning:` per session was the old behaviour, and it was wrong twice over:
+/// the same closed sessions produce the same lines on every run forever, and
+/// there is nothing the reader can do about any of them, because the tool has
+/// already resolved each one the only way it can. The count says how much of it
+/// there is; `--format json` carries `diagnostics.notes` for anyone who wants
+/// to know which sessions.
+fn repository_conflict_note(conflicts: u64) -> Option<String> {
+    if conflicts == 0 {
+        return None;
+    }
+    Some(format!(
+        "Note: {} repository metadata that disagreed with the directory it ran in; the directory decided, and --format json names them.",
+        counted(conflicts, "Copilot session had", "Copilot sessions had")
+    ))
 }
 
 /// The footer for the warnings that were not printed. `raised` counts every
@@ -652,17 +691,23 @@ fn safe_text(value: &str) -> String {
 
 /// A message quotes a path the tool did not choose, so it can carry control
 /// characters — and characters that reorder the line around them — into a
-/// terminal.
+/// terminal. Both halves of a clipped message go through `safe_text`, so
+/// eliding the middle removes characters from the line without removing any
+/// substitution from it.
 fn safe_message(value: &str) -> String {
-    let mut safe = safe_text(
+    let length = value.chars().count();
+    if length <= MAX_MESSAGE_CHARACTERS {
+        return safe_text(value);
+    }
+    let head = MAX_MESSAGE_CHARACTERS - MESSAGE_TAIL_CHARACTERS - 1;
+    let mut safe = safe_text(&value.chars().take(head).collect::<String>());
+    safe.push('…');
+    safe.push_str(&safe_text(
         &value
             .chars()
-            .take(MAX_MESSAGE_CHARACTERS)
+            .skip(length - MESSAGE_TAIL_CHARACTERS)
             .collect::<String>(),
-    );
-    if value.chars().nth(MAX_MESSAGE_CHARACTERS).is_some() {
-        safe.push('…');
-    }
+    ));
     safe
 }
 
@@ -1385,9 +1430,59 @@ mod tests {
         assert_eq!(hebrew, safe_message(hebrew));
         let long = "x".repeat(MAX_MESSAGE_CHARACTERS + 10);
         let clipped = safe_message(&long);
-        assert_eq!(MAX_MESSAGE_CHARACTERS + 1, clipped.chars().count());
-        assert!(clipped.ends_with('…'));
-        assert!(!safe_message("x").ends_with('…'));
+        assert_eq!(MAX_MESSAGE_CHARACTERS, clipped.chars().count());
+        assert!(clipped.contains('…'));
+        assert!(!safe_message("x").contains('…'));
+
+        // Clipping must not open a hole in the substitution: a crafted sequence
+        // that lands in the surviving tail is still replaced there.
+        let crafted = format!("{}\u{202e}gnp.exe", "x".repeat(MAX_MESSAGE_CHARACTERS));
+        assert!(safe_message(&crafted).ends_with("·gnp.exe"));
+        assert!(!safe_message(&crafted).contains('\u{202e}'));
+    }
+
+    /// A path clipped from the right names no file, which is the one thing the
+    /// reader needs from it. The VS Code storage paths that overrun are all
+    /// prefix and no distinguishing middle, so the tail is where the answer is.
+    #[test]
+    fn a_clipped_message_keeps_both_ends_of_the_path_it_names() {
+        let message = format!(
+            "invalid Copilot Chat session skipped: {}: expected value at line 1 column 1",
+            "/Users/developer/Library/Application Support/Code/User/workspaceStorage/09c19254ffca3de9e091008e6c353dad/chatSessions/dbf298ce-ee35-4035-a07c-fe167b32e091.json"
+        );
+        assert!(message.chars().count() > MAX_MESSAGE_CHARACTERS);
+        let clipped = safe_message(&message);
+
+        assert_eq!(MAX_MESSAGE_CHARACTERS, clipped.chars().count());
+        // What the reader acts on: which tool, roughly where, exactly which
+        // file, and why it failed.
+        assert!(clipped.starts_with("invalid Copilot Chat session skipped: /Users/developer/"));
+        assert!(
+            clipped.contains("dbf298ce-ee35-4035-a07c-fe167b32e091.json"),
+            "the file name is what identifies the session: {clipped}"
+        );
+        assert!(
+            clipped.ends_with("expected value at line 1 column 1"),
+            "{clipped}"
+        );
+        assert!(clipped.contains('…'), "{clipped}");
+    }
+
+    /// The whole point of the second channel: however many sessions carry
+    /// metadata Copilot got wrong, the reader is interrupted once, not once per
+    /// session per run.
+    #[test]
+    fn a_resolved_repository_conflict_costs_one_line_no_matter_how_many() {
+        assert_eq!(None, repository_conflict_note(0));
+        let one = repository_conflict_note(1).unwrap();
+        assert!(one.starts_with("Note: "), "{one}");
+        assert!(!one.contains("Warning"), "{one}");
+        assert!(one.contains("1 Copilot session had"), "{one}");
+        let many = repository_conflict_note(12).unwrap();
+        assert!(many.contains("12 Copilot sessions had"), "{many}");
+        assert_eq!(1, many.lines().count(), "{many}");
+        // The detail has to stay reachable, or this is suppression.
+        assert!(many.contains("--format json"), "{many}");
     }
 
     #[test]
