@@ -8,7 +8,6 @@ use crate::model::{
     CompositionEntry, GitCommit, HumanSignal, Interval, Methodology, Observed, ReportRow, Session,
     ShapeEntry, Summary, TokenUsage,
 };
-use crate::output::is_direction_override;
 use crate::timeutil::{
     build_human_intervals, build_session_intervals, calendar_days, clip_interval, local_date,
     local_month, split_interval, union_seconds,
@@ -236,7 +235,7 @@ pub fn build_report(
         let values = signal_values(signal);
         let key = dimensions
             .iter()
-            .map(|name| safe_value(&values[name]))
+            .map(|name| bounded_value(&values[name]))
             .collect();
         let row = bucket(&mut buckets, key, dimensions);
         row.human_signals.insert((
@@ -273,7 +272,7 @@ pub fn build_report(
         let values = session_values(session, &model, first);
         let key = dimensions
             .iter()
-            .map(|name| safe_value(&values[name]))
+            .map(|name| bounded_value(&values[name]))
             .collect();
         let row = bucket(&mut buckets, key, dimensions);
         row.sessions.insert(session_key.clone());
@@ -293,7 +292,7 @@ pub fn build_report(
     for commit in &filtered_commits {
         let key = dimensions
             .iter()
-            .map(|dimension| safe_value(&commit_value(commit, dimension)))
+            .map(|dimension| bounded_value(&commit_value(commit, dimension)))
             .collect();
         let row = bucket(&mut buckets, key, dimensions);
         row.commits.insert(commit.sha.clone());
@@ -325,7 +324,7 @@ pub fn build_report(
     for commit in &filtered_agent_commits {
         let key = dimensions
             .iter()
-            .map(|dimension| safe_value(&commit_value(commit, dimension)))
+            .map(|dimension| bounded_value(&commit_value(commit, dimension)))
             .collect();
         let row = bucket(&mut buckets, key, dimensions);
         row.agent_commits.insert(commit.sha.clone());
@@ -338,7 +337,7 @@ pub fn build_report(
     for token in &filtered_tokens {
         let key = dimensions
             .iter()
-            .map(|dimension| safe_value(&token_value(token, dimension)))
+            .map(|dimension| bounded_value(&token_value(token, dimension)))
             .collect();
         let row = bucket(&mut buckets, key, dimensions);
         row.tokens += token.usage;
@@ -817,7 +816,7 @@ fn keys_for_interval(interval: &Interval, dimensions: &[String]) -> Vec<(Vec<Str
             let values = interval_values(&piece, &calendar_key);
             let key = dimensions
                 .iter()
-                .map(|name| safe_value(&values[name]))
+                .map(|name| bounded_value(&values[name]))
                 .collect();
             (key, piece)
         })
@@ -911,34 +910,43 @@ fn include_time(row: &mut Bucket, first: DateTime<Utc>, last: DateTime<Utc>) {
     row.last_seen = Some(row.last_seen.map_or(last, |value| value.max(last)));
 }
 
+/// Longer than any real repository path, and short enough that a pathological
+/// one cannot be stored once per bucket and written once per row.
+const MAX_KEY_CHARACTERS: usize = 4096;
+
 /// A grouping key is a repository path, a working directory, or a model name —
-/// none of it text this tool chose. The same value is printed as a table cell,
-/// so it gets the treatment `safe_message` gives a warning: control characters
-/// would hand an escape sequence to the terminal, and a direction override
-/// would let a crafted path reorder the row around it. Both become the
-/// replacement character, and the same substitution reaches JSON and CSV so
-/// that every format names a row identically.
+/// none of it text this tool chose. It is bounded here, and otherwise carried
+/// exactly as it is on disk.
 ///
-/// That reach is why `is_direction_override` stops short of LRM and RLM. They
-/// open no directional scope, so they cannot spoof a row, but they are real
-/// characters in Hebrew and Arabic paths — replacing them here would hand a
-/// downstream consumer a repository name that no longer matches the checkout.
-fn safe_value(value: &str) -> String {
-    value
-        .chars()
-        .take(4096)
-        .map(|character| {
-            if character.is_control() || is_direction_override(character) {
-                '�'
-            } else {
-                character
-            }
-        })
-        .collect()
+/// Character replacement used to happen here too, so that the table, JSON and
+/// CSV all named a row the same way. That is the wrong place for it twice over.
+/// A key is an *identifier*: `jq` and spreadsheets join on it, and this tool's
+/// own explorer joins on it in `tui::state::join_report_seconds`, so a
+/// substituted character silently breaks the match against the checkout it
+/// names. And because the bucket is keyed by this value, two repositories
+/// differing only in a replaced character collapsed into one row and
+/// under-counted both.
+///
+/// Safety belongs with the destination that needs it, so that is where it now
+/// lives: `output::safe_text` replaces control characters and direction
+/// overrides on the way to the table and the CSV — both of which a terminal
+/// draws — and the explorer does the same in `tui::views`. JSON is left
+/// faithful, because RFC 8259 escaping already renders a control character
+/// inert there and a consumer parsing it needs the name the checkout has.
+fn bounded_value(value: &str) -> String {
+    value.chars().take(MAX_KEY_CHARACTERS).collect()
 }
 
+/// Three decimals, and never a negative zero. `round_ties_even` keeps the sign
+/// of what it was given, so a total that reaches zero from below — a negative
+/// zero, or a tiny negative float left by summing — rounds to `-0.0`, which
+/// `serde_json` writes as `-0.0` and a reader takes for a bug. Every derived
+/// seconds field in the report is rounded here, so normalising the sign once
+/// covers all of them. The comparison is `== 0.0` because that is the one test
+/// IEEE 754 answers `true` for both zeroes.
 fn round3(value: f64) -> f64 {
-    (value * 1000.0).round_ties_even() / 1000.0
+    let rounded = (value * 1000.0).round_ties_even() / 1000.0;
+    if rounded == 0.0 { 0.0 } else { rounded }
 }
 
 fn duration_seconds(value: Duration) -> f64 {
@@ -1489,45 +1497,105 @@ mod tests {
         assert_eq!(60, repo_b.total_tokens);
     }
 
+    /// A key is an identifier a consumer joins on, so it is bounded and
+    /// otherwise left alone. What makes a crafted name safe to *look* at is the
+    /// renderer that draws it — `output::safe_text` for the table and the CSV,
+    /// `tui::views::safe_chars` for the explorer — and neither is reached by
+    /// this value on its way into JSON.
     #[test]
-    fn a_grouping_key_cannot_repaint_or_reorder_the_row_it_names() {
-        // U+202E would print the rest of the cell right-to-left, so a checkout
-        // called `gnp.exe` could name a row that reads `exe.png`.
-        assert_eq!("repo\u{fffd}name", safe_value("repo\u{202e}name"));
+    fn a_grouping_key_is_the_name_the_checkout_has() {
+        // U+202E would print the rest of a *cell* right-to-left, so a checkout
+        // called `gnp.exe` could name a row that reads `exe.png`. The cell is
+        // where that is dealt with; the key still says which checkout it is.
+        assert_eq!("repo\u{202e}name", bounded_value("repo\u{202e}name"));
+        assert_eq!("a\u{1b}b", bounded_value("a\u{1b}b"));
+        assert_eq!("~/src/prosjekt-æøå", bounded_value("~/src/prosjekt-æøå"));
+        // The one thing that is not carried through: a key long enough to be
+        // pathological, which is stored once per bucket and written once per
+        // row.
         assert_eq!(
-            "a\u{fffd}b\u{fffd}c\u{fffd}",
-            safe_value("a\u{2066}b\u{202c}c\u{202a}")
+            MAX_KEY_CHARACTERS,
+            bounded_value(&"x".repeat(MAX_KEY_CHARACTERS + 904))
+                .chars()
+                .count()
         );
-        assert_eq!("a\u{fffd}b", safe_value("a\u{1b}b"));
-        // Anything a terminal draws as itself is left alone, including the
-        // scripts a direction override is otherwise legitimately used with.
-        assert_eq!("~/src/prosjekt-æøå", safe_value("~/src/prosjekt-æøå"));
-        assert_eq!(4096, safe_value(&"x".repeat(5000)).chars().count());
+    }
+
+    /// Two checkouts that differ only in a character the report used to replace
+    /// are two checkouts. Replacing before bucketing merged them, so one row
+    /// claimed both repositories' work and the other repository vanished from
+    /// the report.
+    #[test]
+    fn two_repositories_that_differ_by_one_hidden_character_stay_two_rows() {
+        let report = build_report(
+            &[
+                session(
+                    "a",
+                    "repo\u{202e}name",
+                    vec![point("2026-01-01T10:00:00Z")],
+                    vec![],
+                ),
+                session(
+                    "b",
+                    "repo\u{202d}name",
+                    vec![point("2026-01-01T11:00:00Z")],
+                    vec![],
+                ),
+            ],
+            &[],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+        assert_eq!(2, report.rows.len());
+        // And each row is named by the directory it is actually in, so the
+        // explorer's own join in `tui::state::join_report_seconds` — and any
+        // `jq` join a reader writes — still matches the checkout.
+        let names: HashSet<&String> = report
+            .rows
+            .iter()
+            .filter_map(|row| row.key.get("repo"))
+            .collect();
+        assert!(names.contains(&"repo\u{202e}name".to_string()), "{names:?}");
+        assert!(names.contains(&"repo\u{202d}name".to_string()), "{names:?}");
     }
 
     #[test]
     fn a_right_to_left_checkout_keeps_the_name_it_has_on_disk() {
-        // U+200F is a directional mark, not a scope: it cannot reorder the row
-        // it names, and it is ordinary content in a Hebrew directory name. A
-        // key is what JSON and CSV consumers join on, so mangling one here
-        // would leave them unable to match this row to the checkout. Escaped
-        // rather than written literally so that this file carries no invisible
-        // characters of its own.
+        // U+200F is a directional mark, not a scope, and it is ordinary content
+        // in a Hebrew directory name. Escaped rather than written literally so
+        // that this file carries no invisible characters of its own.
         let hebrew = "~/\u{5de}\u{5e1}\u{5de}\u{5db}\u{5d9}\u{5dd}\u{200f}/workstats";
-        assert_eq!(hebrew, safe_value(hebrew));
-        // The mark U+200E and the override U+202D both nudge text leftward and
-        // both are invisible, so the pair is asserted together: only the one
-        // that opens a scope is replaced.
-        assert_eq!("report\u{200e}-2026", safe_value("report\u{200e}-2026"));
-        assert_eq!("report\u{fffd}-2026", safe_value("report\u{202d}-2026"));
+        assert_eq!(hebrew, bounded_value(hebrew));
+        assert_eq!("report\u{200e}-2026", bounded_value("report\u{200e}-2026"));
     }
 
+    /// `-0.0` is a fine `f64` and a terrible report field: `serde_json` writes
+    /// it as `-0.0`, and a history with no human time in it reads as though
+    /// something went negative.
     #[test]
-    fn a_crafted_repository_name_is_neutralised_in_every_format() {
+    fn a_zero_total_is_never_reported_as_a_negative_zero() {
+        assert!(round3(-0.0).is_sign_positive());
+        // What summing produces in practice: a residue too small to round to
+        // anything, on the wrong side of zero.
+        assert!(round3(-0.000_000_1).is_sign_positive());
+        assert_eq!("0.0", serde_json::to_string(&round3(-0.0)).unwrap());
+        // Rounding itself is unchanged, ties included, and a value that really
+        // is negative keeps its sign.
+        assert_eq!(0.062, round3(0.0625));
+        assert_eq!(-0.062, round3(-0.0625));
+        assert_eq!(-1.5, round3(-1.5));
+
+        // The fields a reader parses, end to end: a report with no human
+        // involvement at all still says `0.0`.
         let report = build_report(
             &[session(
                 "a",
-                "repo\u{202e}name",
+                "repo",
                 vec![point("2026-01-01T10:00:00Z")],
                 vec![],
             )],
@@ -1540,11 +1608,13 @@ mod tests {
             Duration::minutes(15),
             Duration::minutes(5),
         );
-        // The key is sanitised once, here, so the table, JSON and CSV all carry
-        // the same name for the row rather than three spellings of it.
-        assert_eq!(
-            Some(&"repo\u{fffd}name".to_string()),
-            report.rows[0].key.get("repo")
-        );
+        for value in [
+            report.summary.human_estimated_seconds,
+            report.summary.average_human_seconds_per_active_day,
+            report.summary.parallel_agent_seconds,
+            report.rows[0].human_estimated_seconds,
+        ] {
+            assert!(value.is_sign_positive(), "{value} carries a negative zero");
+        }
     }
 }

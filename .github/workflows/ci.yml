@@ -4,6 +4,24 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Only the `tap` job runs on the schedule; every other job below sits it
+  # out. The tap check is the one thing here that can start failing without
+  # anybody touching this repository — the Homebrew tap the README sends
+  # people to lives in a different repository and can be deleted, renamed or
+  # made private at any time, and nothing in a commit to this one would say
+  # so. Everything else is a question about the code in the tree, which only
+  # a push or a pull request can change, so a nightly rebuild of it would burn
+  # runner time to re-answer a question nobody asked.
+  #
+  # Keeping the other jobs off the schedule is also what makes the nightly run
+  # worth looking at: it does exactly one thing, so a red one means the tap is
+  # broken and nothing else. A daily run that could go red for a new clippy
+  # lint as easily as for a dead tap is a daily run people learn to ignore.
+  #
+  # Not at the top of the hour: scheduled runs queue behind everyone else's
+  # midnight cron and can be delayed by many minutes.
+  schedule:
+    - cron: "17 7 * * *"
   workflow_dispatch:
 
 permissions:
@@ -15,6 +33,10 @@ env:
 jobs:
   test:
     name: ${{ matrix.os }}
+    # This and the three Rust jobs after it ask about the code in the tree, so
+    # they run when the tree changes and stay out of the nightly tap check —
+    # see the `schedule` comment above.
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -59,6 +81,7 @@ jobs:
 
   fmt:
     name: rustfmt
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -67,6 +90,7 @@ jobs:
 
   msrv:
     name: Rust 1.88
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -78,6 +102,7 @@ jobs:
 
   docs:
     name: rustdoc
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -86,3 +111,179 @@ jobs:
       - run: cargo doc --no-deps --document-private-items --locked
         env:
           RUSTDOCFLAGS: -D warnings
+
+  tap:
+    name: Homebrew tap
+    runs-on: ubuntu-latest
+
+    # The README used to say `brew tap woksin/workstats` while
+    # woksin/homebrew-workstats did not exist, and every reader who tried it
+    # got `fatal: could not read Username for 'https://github.com': terminal
+    # prompts disabled` — Git asking for credentials because an anonymous
+    # request for a repository that is not there is indistinguishable from one
+    # for a repository you are not allowed to see. It survived several
+    # releases because the only thing watching the tap was a release job gated
+    # on a secret nobody had set, which skipped and reported success.
+    #
+    # release.yml has since grown two guards, and neither of them covers this.
+    # One fails the release when the README advertises a tap and the deploy
+    # key is missing; the other reads the formula back out of the tap after
+    # pushing it. Both take for granted the thing that was actually wrong: that
+    # the repository the README names exists at all and can be reached by
+    # somebody who is not us. Delete the tap tomorrow and every release still
+    # goes out green — the read-back would fail, but only on the next release,
+    # which might be weeks of broken instructions later. This job asks the one
+    # question neither of them asks — can somebody who is not signed in
+    # actually tap what the README tells them to tap — and asks it on every
+    # push and pull request and again every night, so a tap that breaks while
+    # nobody is committing is found within a day rather than at the next
+    # release.
+    #
+    # It needs no secrets, which is why it can run on a pull request from a
+    # fork as happily as on the schedule.
+    steps:
+      # A sparse checkout of the README alone, exactly as release.yml's tap
+      # job does it and for the same reason: the README is the only file this
+      # job has an opinion about.
+      #
+      # persist-credentials: false is the load-bearing part. Left at its
+      # default, checkout leaves this repository's token in .git/config as an
+      # Authorization header applied to every https://github.com/ URL — not
+      # merely to this repository's — and the probe below would silently
+      # inherit it and stop being anonymous. See that step for why anonymous
+      # is the entire point, and for the second override that keeps this true
+      # even if this line is ever dropped.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Can a signed-out reader tap what the README advertises?
+        env:
+          # No terminal, so a request that needs credentials fails instead of
+          # hanging forever waiting for a username. It also reproduces the
+          # original breakage verbatim, which is what makes the failure
+          # message below quotable rather than paraphrased.
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+
+          if [ ! -f README.md ]; then
+            echo "No README.md, so nothing advertises a tap." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # The same two instruction shapes release.yml's `Is the tap
+          # configured?` guard greps for — `brew tap woksin/workstats` and the
+          # fully-qualified `brew install woksin/workstats/workstats` — with
+          # the owner left open and the tap captured rather than merely
+          # matched. Two files asking the same question of the same README
+          # have to agree on what counts as advertising a tap; what neither
+          # may do is keep its own copy of the answer. Reading the tap out of
+          # the README instead of naming it here is the whole reason this
+          # check cannot drift away from the instructions it verifies: change
+          # the README to point somewhere else and this follows it there.
+          #
+          # The trailing /workstats of the fully-qualified form is not part of
+          # the match — the character class stops at the second slash — so
+          # both spellings yield the same `owner/tap` pair.
+          taps=$(grep -oE 'brew (tap|install) [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' README.md \
+            | awk '{ print $3 }' | sort -u) || taps=""
+
+          # A README with no Homebrew instructions is a legitimate state and
+          # was this project's state until recently: there is then no promise
+          # to break, so there is nothing to fail. Quietly, too — a warning on
+          # every pull request for a tap nobody claimed to have would be noise,
+          # and noise is what people stop reading.
+          if [ -z "$taps" ]; then
+            echo "README.md advertises no Homebrew install, so there is no tap to check." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          failed=0
+          while read -r tap; do
+            # `brew tap woksin/workstats` clones github.com/woksin/homebrew-workstats.
+            # The `homebrew-` prefix is Homebrew's convention and is why the
+            # README and release.yml's TAP_REPO never spell the same name.
+            repo="${tap%%/*}/homebrew-${tap#*/}"
+            url="https://github.com/${repo}"
+
+            # `git ls-remote` rather than an API call, because it is what
+            # `brew tap` itself does: it answers "can this be cloned", not
+            # "does a page render".
+            #
+            # Both -c overrides exist to keep the request anonymous, and they
+            # cover different leaks. `credential.helper=` stops a helper the
+            # runner image happens to have configured from supplying an
+            # identity. The `extraheader` one undoes what checkout writes into
+            # .git/config: that key is applied to every URL under
+            # https://github.com/, not just to this repository's, so a bare
+            # ls-remote run from the workspace really does send this
+            # repository's token to the tap. Clearing `credential.helper` does
+            # not stop it and neither does the unscoped `http.extraheader` —
+            # only the URL-scoped key does. persist-credentials: false on the
+            # checkout above is the primary defence; this is the seatbelt, so
+            # that quietly restoring the default there cannot turn the check
+            # authenticated without anybody noticing. Authenticated is the one
+            # thing it must never be: a token can reach a private repository
+            # that no reader can `brew tap`, so it would pass in exactly the
+            # case worth failing — a green check that proves nothing, which is
+            # the failure this whole job was added to end.
+            #
+            # Three looks before believing a failure, the same idiom as
+            # release.yml's formula read-back and its asset check, and for the
+            # same reason: one unlucky second of network is not a deleted
+            # repository.
+            reachable=false
+            for attempt in 1 2 3; do
+              if git -c credential.helper= -c http.https://github.com/.extraheader= \
+                ls-remote "$url" HEAD >/dev/null 2>&1; then
+                reachable=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep 5
+            done
+
+            if [ "$reachable" = true ]; then
+              echo "\`brew tap $tap\` resolves: $url is public and clonable." >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            # Git cannot tell us why it failed in a way worth branching on —
+            # missing, private and unreachable all arrive as the same refusal,
+            # which is the very confusion that hid the original bug. So ask
+            # GitHub over plain HTTP, still signed out, purely to classify the
+            # failure. A 404 is the one answer that cannot be a bad minute:
+            # signed out, GitHub returns it both for a repository that never
+            # existed and for one it will not admit exists, and either way no
+            # reader can tap it. Anything else — a timeout, a 5xx, a 429, the
+            # 000 curl reports when it never got a reply — is a question mark,
+            # and a question mark must not turn a pull request red.
+            code=$(curl -sSL -o /dev/null -w '%{http_code}' \
+              --max-time 20 --retry 2 --retry-delay 2 --retry-all-errors "$url") || code=000
+
+            if [ "$code" = 404 ]; then
+              failed=1
+              echo "::error title=Homebrew tap $repo is not there::README.md tells readers to install workstats from the tap $tap, which is the repository $url. Cloning it anonymously failed three times and GitHub answers 404 for it signed out, so it has been deleted, made private, or renamed with nothing left at the old name. Everyone following the README's Homebrew instructions is getting \"fatal: could not read Username for 'https://github.com': terminal prompts disabled\". Either restore $repo as a public repository or take the Homebrew instructions out of README.md — a tap that is advertised and a tap that exists have to be the same set."
+              {
+                echo "### The tap README.md advertises is unreachable"
+                echo
+                echo "- Advertised: \`brew tap $tap\`"
+                echo "- Expected repository: $url"
+                echo "- Anonymous clone: failed on all three attempts"
+                echo "- Anonymous HTTP status: \`404\`"
+                echo
+                echo "Restore \`$repo\` as a public repository, or remove the Homebrew instructions from \`README.md\`."
+              } >> "$GITHUB_STEP_SUMMARY"
+            else
+              # Green, but never silent: reporting success into thin air is
+              # the exact habit that let the original tap stay broken for
+              # several releases. An annotation shows up in the run header and
+              # in the Actions list, where somebody will actually see it.
+              echo "::warning title=Could not reach $url::README.md advertises the tap $tap, cloning $url anonymously failed three times, and asking GitHub for it returned $code rather than a 404 — so whether the tap is gone or GitHub was briefly unreachable is unknown, and this check will not guess. It fails only on a 404, the one answer that cannot be a network hiccup. Re-run this job to ask again; if it keeps landing here, clone $url by hand before trusting what README.md tells people."
+              echo "Could not reach $url (HTTP $code). Not failing on an inconclusive answer." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "$taps"
+
+          exit "$failed"
