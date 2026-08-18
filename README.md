@@ -36,6 +36,25 @@ AI activity  (context only — these are not human hours)
   Parallel agent work      37h 06m  (3.3× concurrency)
   Sessions                 74  (12 foreground, 62 subagents)
   Tokens                   18.4M  (2.1M in, 640.3k out, 15.7M cached)
+  Committed output         9 of 12 foreground sessions in repos with visible commits
+                           3 left no commit — reading, review, or uncommitted work
+
+Work composition  (changed Git lines by file area)
+  Area         Files       Added     Removed   Share
+  ──────────────────────────────────────────────────
+  source         214      +5,900      -1,500     70%
+  test            63      +1,700        -400     20%
+  docs            18        +520        -140      6%
+  config          11        +301         -67      3%
+  Test lines per source line  0.28
+
+Change shapes  (from diff composition only — commit messages are never read)
+  Shape        Commits   Share
+  ────────────────────────────
+  new code          14     45%
+  revision           9     29%
+  tests              5     16%
+  docs               3     10%
 
 By repo
   Work area                         Human  Days   Avg/day  Commits   AI wall    Tokens
@@ -61,6 +80,8 @@ setup and review evidence without treating autonomous output as attendance.
 | **Agent wall clock** | “How long was any agent active?” | Overlapping agent intervals count once. |
 | **Parallel agent work** | “How much automation ran?” | Concurrent sessions are summed, so this can exceed wall time. |
 | **AI tokens** | “How many tokens did agents use?” | Input, output, cache-read, and cache-creation counts read from local transcripts; not an intervaled/deduplicated metric like wall clock, so grouped totals just sum. |
+| **Work composition** | “Where did the output land?” | Changed lines bucketed into source, test, docs, config, assets, and other from the file path alone. |
+| **Change shapes** | “What did the work look like?” | Each commit described by its dominant file area and its addition/deletion balance. Never read from the commit message. |
 
 That makes the dashboard useful without pretending it is a stopwatch, an
 attendance system, or a universal productivity score.
@@ -332,6 +353,63 @@ workstats --human-idle 30m --review-credit 10m  # more conservative
 miss meetings, thinking away from a recorded session, deleted history, and work
 performed on another machine. Treat it as a realistic local heuristic, never
 payroll data.
+
+## What was worked on
+
+Time answers *how much*. Two path-derived breakdowns answer *where* and *what
+kind*, without opening a single file or reading a single commit message.
+
+**Work composition** buckets every changed line by the area its file belongs to:
+
+| Area | Matched by |
+|---|---|
+| `source` | Known source extensions — `.rs`, `.go`, `.ts`, `.py`, `.sql`, `.css`, and friends. |
+| `test` | A `tests/`, `spec/`, `__tests__/`, `fixtures/`, or `benches/` directory, or a name such as `user_spec.rb`, `Button.test.tsx`, `UserServiceTest.java`. |
+| `docs` | `.md`, `.rst`, `.adoc`, a `docs/` directory, or a `README`/`LICENSE`/`CHANGELOG`-style name. |
+| `config` | Manifests, CI, and tooling — `.toml`, `.yml`, `.json`, `Dockerfile`, `Makefile`, `.github/**`. |
+| `assets` | Images, fonts, media, and other binaries. |
+| `other` | Anything left unclassified, kept visible instead of forced into a bucket. |
+
+A file is classified once, by path, in that order — so `tests/fixtures/data.json`
+is a test rather than config. This measures **churn, not codebase size**: it is
+the volume of work that landed in each area, not how much test or source code
+the repository currently contains.
+
+**Change shapes** describe each commit by the area holding at least 60% of its
+changed lines, and — for source-dominant commits — by its addition/deletion
+balance:
+
+| Shape | Diff |
+|---|---|
+| `new code` | Source-dominant, deletions under a quarter of additions. |
+| `revision` | Source-dominant, additions and deletions comparable. |
+| `removal` | Deletions more than double additions. |
+| `tests` / `docs` / `config` / `assets` | Dominated by that area. |
+| `mixed` | No area reached 60%. |
+
+These name the *shape of the diff*, never the author's intent. A commit
+message that says "refactor" has no bearing on the label, because the message
+is never read. Note that a feature is not a countable unit here; source-area
+additions and `new code` commits are the closest honest proxy.
+
+**Committed output** compares foreground AI sessions against authored commits:
+a session counts as having produced output when a commit lands in the same
+repository within one `--human-idle` window of it. Only sessions in
+repositories that Git actually scanned are counted at all — AI history spans
+the whole machine while `--dir` usually does not, and an unscanned repository
+says nothing either way. The remainder genuinely covers reading, review, and
+uncommitted work, which local structure cannot tell apart.
+
+Both breakdowns appear in the dashboard, per row in JSON, and as
+`{area}_files` / `{area}_additions` / `{area}_deletions` columns in CSV. They
+respect `--path`, `--path-exclude`, and the generated/vendor ignores, so
+narrowing the scope narrows the breakdown too:
+
+```bash
+workstats --format json | jq '.summary.composition'
+workstats --group-by month --format csv > areas-by-month.csv
+workstats --path 'src/**'                  # composition of one subtree
+```
 
 ## Privacy boundary
 

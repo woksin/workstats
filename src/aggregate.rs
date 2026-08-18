@@ -3,9 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 
+use crate::classify::{
+    Category, CategoryTally, Shape, ShapeTally, change_shape, classify, tally_merge, touched_lines,
+};
 use crate::model::{
-    GitCommit, HumanSignal, Interval, Methodology, Observed, ReportRow, Session, Summary,
-    TokenUsage,
+    CompositionEntry, GitCommit, HumanSignal, Interval, Methodology, Observed, ReportRow, Session,
+    ShapeEntry, Summary, TokenUsage,
 };
 use crate::timeutil::{
     build_human_intervals, build_session_intervals, calendar_days, clip_interval, local_date,
@@ -37,6 +40,8 @@ struct Bucket {
     deletions: u64,
     ignored_additions: u64,
     ignored_deletions: u64,
+    categories: CategoryTally,
+    shapes: ShapeTally,
     tokens: TokenUsage,
     first_seen: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
@@ -287,6 +292,10 @@ pub fn build_report(
         row.deletions += commit.deletions;
         row.ignored_additions += commit.ignored_additions;
         row.ignored_deletions += commit.ignored_deletions;
+        tally_merge(&mut row.categories, &commit.categories);
+        if let Some(shape) = change_shape(&commit.categories) {
+            row.shapes[shape.index()] += 1;
+        }
         row.active_days.insert(local_date(commit.timestamp));
         include_time(row, commit.timestamp, commit.timestamp);
     }
@@ -325,6 +334,11 @@ pub fn build_report(
                 ignored_additions: row.ignored_additions,
                 ignored_deletions: row.ignored_deletions,
                 net_lines: row.additions as i64 - row.deletions as i64,
+                composition: composition_entries(
+                    row.files.iter().map(String::as_str),
+                    &row.categories,
+                ),
+                change_shapes: shape_entries(&row.shapes),
                 input_tokens: row.tokens.input_tokens,
                 output_tokens: row.tokens.output_tokens,
                 cache_read_tokens: row.tokens.cache_read_tokens,
@@ -449,6 +463,24 @@ pub fn build_report(
         .filter(|key| session_roles.get(*key).copied().unwrap_or(false))
         .count();
     let unique_commits: HashSet<_> = filtered_commits.iter().map(|commit| &commit.sha).collect();
+    let mut summary_categories = CategoryTally::default();
+    let mut summary_shapes = ShapeTally::default();
+    let mut summary_files: HashSet<&str> = HashSet::new();
+    for commit in &filtered_commits {
+        tally_merge(&mut summary_categories, &commit.categories);
+        if let Some(shape) = change_shape(&commit.categories) {
+            summary_shapes[shape.index()] += 1;
+        }
+        summary_files.extend(commit.files.iter().map(String::as_str));
+    }
+    let (foreground_sessions_with_commits, foreground_sessions_without_commits) =
+        foreground_session_output(
+            sessions,
+            &filtered_commits,
+            &eligible_session_keys,
+            &session_roles,
+            human_idle,
+        );
     let human_signal_keys: HashSet<_> = filtered_human_signals
         .iter()
         .map(|signal| {
@@ -505,6 +537,8 @@ pub fn build_report(
             ai_time: "consecutive structural activity signals capped at the idle gap; exact intervals are merged when a source records them",
             deduplication: "headline time is the union of all AI intervals; grouped AI totals may overlap across parallel repos/providers",
             gap_cap_seconds: duration_seconds(gap_cap),
+            composition: "changed Git lines bucketed into source/test/docs/config/assets/other from the file path alone; this is churn, not the size of the codebase",
+            change_shapes: "each commit described by the area holding at least 60% of its changed lines and by its addition/deletion balance; commit messages and file contents are never read",
             scope: "local retained histories, explicit event logs, and locally available Git repositories only",
         },
         observed: Observed {
@@ -535,6 +569,8 @@ pub fn build_report(
             session_count: eligible_session_keys.len(),
             foreground_session_count,
             subagent_session_count,
+            foreground_sessions_with_commits,
+            foreground_sessions_without_commits,
             commit_count: unique_commits.len(),
             additions: filtered_commits.iter().map(|item| item.additions).sum(),
             deletions: filtered_commits.iter().map(|item| item.deletions).sum(),
@@ -546,6 +582,8 @@ pub fn build_report(
                 .iter()
                 .map(|item| item.ignored_deletions)
                 .sum(),
+            composition: composition_entries(summary_files.iter().copied(), &summary_categories),
+            change_shapes: shape_entries(&summary_shapes),
             active_days: active_dates.len(),
             provider_seconds,
             model_seconds,
@@ -560,6 +598,125 @@ pub fn build_report(
         group_by: dimensions.to_vec(),
         rows,
     }
+}
+
+/// Distinct changed paths and changed lines per file area, largest first.
+/// Areas with nothing in them are left out rather than emitted as zeroes.
+fn composition_entries<'a>(
+    files: impl IntoIterator<Item = &'a str>,
+    tally: &CategoryTally,
+) -> Vec<CompositionEntry> {
+    let mut counts = [0_usize; Category::ALL.len()];
+    for path in files {
+        counts[classify(path).index()] += 1;
+    }
+    let total = touched_lines(tally) as f64;
+    let mut entries: Vec<_> = Category::ALL
+        .into_iter()
+        .filter_map(|category| {
+            let lines = tally[category.index()];
+            let files = counts[category.index()];
+            (files != 0 || lines.touched() != 0).then(|| CompositionEntry {
+                category: category.as_str().to_string(),
+                files,
+                additions: lines.additions,
+                deletions: lines.deletions,
+                share_of_changed_lines: if total == 0.0 {
+                    0.0
+                } else {
+                    round3(lines.touched() as f64 / total)
+                },
+            })
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        (right.additions + right.deletions)
+            .cmp(&(left.additions + left.deletions))
+            .then_with(|| right.files.cmp(&left.files))
+            .then_with(|| left.category.cmp(&right.category))
+    });
+    entries
+}
+
+/// Commit counts per diff shape, largest first.
+fn shape_entries(tally: &ShapeTally) -> Vec<ShapeEntry> {
+    let total: usize = tally.iter().sum();
+    let mut entries: Vec<_> = Shape::ALL
+        .into_iter()
+        .filter(|shape| tally[shape.index()] != 0)
+        .map(|shape| {
+            let commits = tally[shape.index()];
+            ShapeEntry {
+                shape: shape.as_str().to_string(),
+                commits,
+                share_of_classified_commits: if total == 0 {
+                    0.0
+                } else {
+                    round3(commits as f64 / total as f64)
+                },
+            }
+        })
+        .collect();
+    entries.sort_by(|left, right| {
+        right
+            .commits
+            .cmp(&left.commits)
+            .then_with(|| left.shape.cmp(&right.shape))
+    });
+    entries
+}
+
+/// Splits foreground sessions into those that have an authored commit in the
+/// same repo within one idle window and those that do not, answering "did this
+/// session leave committed output?".
+///
+/// Only sessions in repos that produced commits in scope are counted at all.
+/// Git is usually scanned over one directory while AI history covers the whole
+/// machine, so a session in an unscanned repo says nothing about output and
+/// would otherwise inflate the "no commit" side. What remains genuinely covers
+/// reading, review, and uncommitted work, which local structure cannot tell
+/// apart without reading transcript text.
+fn foreground_session_output(
+    sessions: &[Session],
+    commits: &[&GitCommit],
+    eligible: &HashSet<SessionKey>,
+    roles: &HashMap<SessionKey, bool>,
+    human_idle: Duration,
+) -> (usize, usize) {
+    let mut by_repo: HashMap<&str, Vec<DateTime<Utc>>> = HashMap::new();
+    for commit in commits {
+        by_repo
+            .entry(commit.repo.as_str())
+            .or_default()
+            .push(commit.timestamp);
+    }
+    for times in by_repo.values_mut() {
+        times.sort_unstable();
+    }
+    let mut with: HashSet<&SessionKey> = HashSet::new();
+    let mut comparable: HashSet<&SessionKey> = HashSet::new();
+    for session in sessions {
+        let key = (session.provider.clone(), session.session_id.clone());
+        let Some(key) = eligible.get(&key) else {
+            continue;
+        };
+        if roles.get(key).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(times) = by_repo.get(session.repo.as_str()) else {
+            continue;
+        };
+        comparable.insert(key);
+        let (Some(first), Some(last)) = (session.first_seen(), session.last_seen()) else {
+            continue;
+        };
+        let (start, end) = (first - human_idle, last + human_idle);
+        let index = times.partition_point(|time| *time < start);
+        if times.get(index).is_some_and(|time| *time <= end) {
+            with.insert(key);
+        }
+    }
+    (with.len(), comparable.len() - with.len())
 }
 
 fn bucket<'a>(
@@ -705,8 +862,33 @@ fn iso(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::classify::tally_add;
     use crate::model::{ActivityPoint, ExactInterval, TokenEvent};
     use crate::timeutil::parse_timestamp;
+
+    fn commit(sha: &str, repo: &str, at: &str, files: &[(&str, u64, u64)]) -> GitCommit {
+        let mut categories = CategoryTally::default();
+        let mut additions = 0;
+        let mut deletions = 0;
+        for (path, added, removed) in files {
+            tally_add(&mut categories, classify(path), *added, *removed);
+            additions += added;
+            deletions += removed;
+        }
+        GitCommit {
+            sha: sha.into(),
+            timestamp: parse_timestamp(at).unwrap(),
+            repo: repo.into(),
+            cwd: format!("/{repo}"),
+            root: "root".into(),
+            additions,
+            deletions,
+            files: files.iter().map(|(path, ..)| (*path).to_string()).collect(),
+            ignored_additions: 0,
+            ignored_deletions: 0,
+            categories,
+        }
+    }
 
     fn session(
         id: &str,
@@ -918,6 +1100,113 @@ mod tests {
             Some(&"2026-05".to_string()),
             report.rows[0].key.get("month")
         );
+    }
+
+    #[test]
+    fn git_output_is_split_into_file_areas_and_change_shapes() {
+        let commits = vec![
+            commit(
+                "a",
+                "repo",
+                "2026-01-01T10:00:00Z",
+                &[("src/lib.rs", 200, 4)],
+            ),
+            commit(
+                "b",
+                "repo",
+                "2026-01-02T10:00:00Z",
+                &[("tests/lib_test.rs", 120, 0)],
+            ),
+            commit(
+                "c",
+                "repo",
+                "2026-01-03T10:00:00Z",
+                &[("README.md", 30, 5), ("src/lib.rs", 2, 1)],
+            ),
+        ];
+        let report = build_report(
+            &[],
+            &commits,
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+
+        let area = |name: &str| {
+            report
+                .summary
+                .composition
+                .iter()
+                .find(|entry| entry.category == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {name} composition"))
+        };
+        let source = area("source");
+        assert_eq!(202, source.additions);
+        assert_eq!(5, source.deletions);
+        // src/lib.rs is touched by two commits but counts as one changed file.
+        assert_eq!(1, source.files);
+        assert_eq!(120, area("test").additions);
+        assert_eq!(30, area("docs").additions);
+        let shares: f64 = report
+            .summary
+            .composition
+            .iter()
+            .map(|entry| entry.share_of_changed_lines)
+            .sum();
+        assert!((shares - 1.0).abs() < 0.01, "shares summed to {shares}");
+
+        let shapes: Vec<_> = report
+            .summary
+            .change_shapes
+            .iter()
+            .map(|entry| (entry.shape.as_str(), entry.commits))
+            .collect();
+        assert!(shapes.contains(&("new code", 1)), "{shapes:?}");
+        assert!(shapes.contains(&("tests", 1)), "{shapes:?}");
+        assert!(shapes.contains(&("docs", 1)), "{shapes:?}");
+
+        // A single-repo run puts the whole breakdown on the one row too.
+        assert_eq!(
+            report.summary.composition.len(),
+            report.rows[0].composition.len()
+        );
+        assert_eq!(202, report.rows[0].composition[0].additions);
+    }
+
+    #[test]
+    fn foreground_sessions_pair_with_commits_only_in_repos_git_actually_scanned() {
+        let near = session("near", "repo", vec![], vec![point("2026-01-01T09:30:00Z")]);
+        let far = session("far", "repo", vec![], vec![point("2026-06-01T09:30:00Z")]);
+        let unscanned = session(
+            "unscanned",
+            "other-repo",
+            vec![],
+            vec![point("2026-01-01T09:30:00Z")],
+        );
+        let commits = vec![commit(
+            "a",
+            "repo",
+            "2026-01-01T10:00:00Z",
+            &[("src/lib.rs", 10, 0)],
+        )];
+        let report = build_report(
+            &[near, far, unscanned],
+            &commits,
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::hours(1),
+            Duration::minutes(30),
+        );
+        assert_eq!(3, report.summary.foreground_session_count);
+        assert_eq!(1, report.summary.foreground_sessions_with_commits);
+        // The session in the unscanned repo is left out of both sides.
+        assert_eq!(1, report.summary.foreground_sessions_without_commits);
     }
 
     #[test]

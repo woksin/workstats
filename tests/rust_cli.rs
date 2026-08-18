@@ -182,6 +182,97 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
 }
 
 #[test]
+fn git_output_is_reported_by_file_area_in_json_and_csv() {
+    let temporary = tempdir().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(project.join("tests")).unwrap();
+    assert!(git(&["init", project.to_str().unwrap()]).status.success());
+    fs::write(project.join("src/lib.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+    fs::write(project.join("tests/lib_test.rs"), "check\n").unwrap();
+    fs::write(project.join("README.md"), "docs\n").unwrap();
+    let path = project.to_str().unwrap();
+    assert!(git(&["-C", path, "add", "."]).status.success());
+    assert!(
+        git(&[
+            "-C",
+            path,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-m",
+            "areas",
+        ])
+        .status
+        .success()
+    );
+
+    let arguments = |format: &str| {
+        vec![
+            "--dir".to_string(),
+            path.to_string(),
+            "--author".to_string(),
+            "fixture@example.com".to_string(),
+            "--no-ai".to_string(),
+            "--no-cache".to_string(),
+            "--no-progress".to_string(),
+            "--format".to_string(),
+            format.to_string(),
+        ]
+    };
+    let json = run(&arguments("json")
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>());
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let report: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let composition = report["summary"]["composition"].as_array().unwrap();
+    let area = |name: &str| {
+        composition
+            .iter()
+            .find(|entry| entry["category"] == name)
+            .unwrap_or_else(|| panic!("missing {name} in {composition:?}"))
+    };
+    assert_eq!(4, area("source")["additions"]);
+    assert_eq!(1, area("test")["additions"]);
+    assert_eq!(1, area("docs")["additions"]);
+    assert_eq!(
+        "new code",
+        report["summary"]["change_shapes"][0]["shape"]
+            .as_str()
+            .unwrap()
+    );
+
+    let csv = run(&arguments("csv")
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>());
+    assert!(csv.status.success());
+    let csv = String::from_utf8_lossy(&csv.stdout);
+    let mut lines = csv.lines();
+    let header: Vec<_> = lines.next().unwrap().split(',').collect();
+    let row: Vec<_> = lines.next().unwrap().split(',').collect();
+    let cell = |name: &str| {
+        let index = header
+            .iter()
+            .position(|field| *field == name)
+            .unwrap_or_else(|| panic!("missing column {name} in {header:?}"));
+        row[index]
+    };
+    assert_eq!("4", cell("source_additions"));
+    assert_eq!("1", cell("test_files"));
+    assert_eq!("1", cell("docs_additions"));
+    // An area the row never touched still reports a numeric zero.
+    assert_eq!("0", cell("assets_additions"));
+}
+
+#[test]
 fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
     let temporary = tempdir().unwrap();
     let project = temporary.path().join("project");
