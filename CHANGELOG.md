@@ -262,14 +262,35 @@ tag are the generated list of pull requests.
   than that understated how much it was not showing.
 - A crafted repository name, path, or warning can no longer reorder the line it
   appears on. Direction-override characters are replaced along with control
-  characters everywhere text is drawn, and a grouping key is neutralised once,
-  before the table, JSON, and CSV are written, so all three name a row
-  identically. A warning clipped at 200 characters now ends in `…` instead of
-  stopping mid-sentence.
+  characters everywhere text is drawn: the table, `--raw`, the CSV, the
+  warnings, and every panel of `workstats ui`. A warning clipped at 200
+  characters now ends in `…` instead of stopping mid-sentence.
+- `--format json` carries the name a repository actually has. Replacement used
+  to happen once, in the grouping key, so all three formats named a row the same
+  way — but a key is an identifier that `jq`, a spreadsheet, and this tool's own
+  explorer join back to the checkout, and a substituted character silently
+  breaks that join. Worse, the key was also the bucket, so two repositories
+  differing only by a replaced character collapsed into one row and under-counted
+  both. Safety now belongs to the formats a terminal draws — the table, `--raw`
+  and the CSV, which is read with `cat` as often as by a spreadsheet — while
+  JSON is left faithful, where RFC 8259 escaping already makes a control
+  character inert.
 - A session with no recorded model is spelled `(no model)` throughout the table
   and `--raw`, rather than `unknown`, `<synthetic>`, or a bare dash depending on
   which adapter it came from — three spellings that split one figure across
   three rows. `--format json` and `--format csv` still carry the raw values.
+- A zero is written as `0.0` rather than `-0.0`. Rounding kept the sign of what
+  it was given, so a total that reached zero from below — a history with no
+  human time in it, most often — produced a `-0.0` in JSON and CSV that reads
+  like a bug and that some consumers stringify as one. Every derived seconds and
+  share field is normalised at the point it is rounded.
+- Counts agree with the nouns beside them: `1 commit`, not `1 commits`. This
+  covers the summary lines, the truncation notes under the table and the model
+  lists, the diagnostics footer, and the row counter in `workstats ui`.
+- A long model id in `--raw` no longer pushes the figure beside it out of line.
+  Bedrock-style ids run past the width of the name column, which was padded to a
+  minimum rather than clipped to a maximum; names are now shortened from the
+  left, keeping the version on the end that tells two builds of one model apart.
 
 ## 1.0.0 — 2026-08-18
 

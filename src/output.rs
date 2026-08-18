@@ -78,26 +78,36 @@ fn csv_fields(report: &Report) -> Vec<String> {
     fields
 }
 
+/// A CSV is written for a spreadsheet and read in a terminal — `head`, `cat`,
+/// `column -t` — so it is the one machine-readable format that has to be safe
+/// to look at. `csv::Writer` quotes a field for the delimiter, the quote
+/// character, and a record terminator, and passes every other byte through
+/// unchanged, so an escape sequence in a repository path would reach the
+/// terminal intact. The group-by columns are the only cells that carry text
+/// this tool did not write, but the rule costs nothing applied to all of them.
+///
+/// `--format json` is deliberately not treated this way: RFC 8259 escaping
+/// already makes a control character inert there, and a parsed key has to match
+/// the checkout it names.
 pub fn print_csv(report: &Report) -> Result<()> {
     let fields = csv_fields(report);
     let mut writer = csv::Writer::from_writer(io::stdout().lock());
     writer.write_record(&fields)?;
     for row in &report.rows {
-        let values: Vec<_> = fields
-            .iter()
-            .map(|field| {
-                let value = if let Some(value) = row.key.get(field) {
-                    value.clone()
-                } else {
-                    row_field(row, field)
-                };
-                neutralize_formula(value)
-            })
-            .collect();
+        let values: Vec<_> = fields.iter().map(|field| csv_cell(row, field)).collect();
         writer.write_record(values)?;
     }
     writer.flush()?;
     Ok(())
+}
+
+fn csv_cell(row: &ReportRow, field: &str) -> String {
+    let value = row
+        .key
+        .get(field)
+        .cloned()
+        .unwrap_or_else(|| row_field(row, field));
+    neutralize_formula(safe_text(&value))
 }
 
 /// Enough diagnostic messages to see what went wrong without burying the
@@ -107,6 +117,13 @@ const MAX_PRINTED_MESSAGES: usize = 5;
 /// Enough of the model list to see what did the work; the rest stay in
 /// `--format json`.
 const MAX_PRINTED_MODELS: usize = 12;
+
+/// The name columns of the `--raw` lists. A provider name is short by
+/// construction, but a model id is not — `us.anthropic.claude-3-5-sonnet-…-v2:0`
+/// is 44 characters — so the name is clipped to the column rather than allowed
+/// to push the figure beside it out of line.
+const PROVIDER_WIDTH: usize = 24;
+const MODEL_WIDTH: usize = 34;
 
 /// A quoted path is not this tool's own text, so it is clipped before it is
 /// printed.
@@ -135,11 +152,15 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         hours(summary.average_human_seconds_per_active_day)
     );
     println!(
-        "  Work blocks          {}  ({} foreground session edges + {} prompts + {} commits)",
+        "  Work blocks          {}  ({} + {} + {})",
         number(summary.work_block_count),
-        number(summary.foreground_session_edge_signal_count),
-        number(summary.prompt_signal_count),
-        number(summary.commit_signal_count)
+        counted(
+            summary.foreground_session_edge_signal_count as u64,
+            "foreground session edge",
+            "foreground session edges"
+        ),
+        counted(summary.prompt_signal_count as u64, "prompt", "prompts"),
+        counted(summary.commit_signal_count as u64, "commit", "commits")
     );
     println!("  Git commits             {}", number(summary.commit_count));
     println!(
@@ -160,8 +181,8 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     // shown, and shown as output, in the same breath.
     if summary.agent_commit_count != 0 {
         println!(
-            "  Agent-authored          {} commits  +{} / -{}  (output only — no human time)",
-            number(summary.agent_commit_count),
+            "  Agent-authored          {}  +{} / -{}  (output only — no human time)",
+            counted(summary.agent_commit_count as u64, "commit", "commits"),
             number(summary.agent_additions),
             number(summary.agent_deletions)
         );
@@ -179,9 +200,9 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             )
         };
         println!(
-            "  Co-authored by AI       {} of the {} commits above{autofix}",
+            "  Co-authored by AI       {} of the {} above{autofix}",
             number(summary.ai_assisted_commit_count),
-            number(summary.commit_count)
+            counted(summary.commit_count as u64, "commit", "commits")
         );
     }
     if let Some(first) = &report.observed.first_seen {
@@ -210,10 +231,14 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             hours(summary.parallel_agent_seconds)
         );
         println!(
-            "  Sessions              {}  ({} foreground, {} subagents)",
+            "  Sessions              {}  ({} foreground, {})",
             number(summary.session_count),
             number(summary.foreground_session_count),
-            number(summary.subagent_session_count)
+            counted(
+                summary.subagent_session_count as u64,
+                "subagent",
+                "subagents"
+            )
         );
         if summary.total_tokens != 0 {
             println!(
@@ -228,9 +253,13 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             summary.foreground_sessions_with_commits + summary.foreground_sessions_without_commits;
         if comparable_sessions != 0 {
             println!(
-                "  Committed output      {} of {} foreground sessions in repos with visible commits",
+                "  Committed output      {} of {} in repos with visible commits",
                 number(summary.foreground_sessions_with_commits),
-                number(comparable_sessions)
+                counted(
+                    comparable_sessions as u64,
+                    "foreground session",
+                    "foreground sessions"
+                )
             );
             if summary.foreground_sessions_without_commits != 0 {
                 println!(
@@ -247,7 +276,11 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             if !summary.provider_seconds.is_empty() {
                 println!("Parallel agent work by provider  (may overlap)");
                 for (provider, seconds) in &summary.provider_seconds {
-                    println!("  {provider:<24} {:>10}", hours(*seconds));
+                    println!(
+                        "  {:<PROVIDER_WIDTH$} {:>10}",
+                        cell(provider, PROVIDER_WIDTH),
+                        hours(*seconds)
+                    );
                 }
                 println!();
             }
@@ -255,7 +288,11 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                 println!("Parallel agent work by model  (all providers together)");
                 let (models, omitted) = ranked_models(&summary.model_seconds, f64::total_cmp);
                 for (model, seconds) in models {
-                    println!("  {model:<34} {:>10}", hours(seconds));
+                    println!(
+                        "  {:<MODEL_WIDTH$} {:>10}",
+                        cell(&model, MODEL_WIDTH),
+                        hours(seconds)
+                    );
                 }
                 print_omitted_models(omitted);
                 println!();
@@ -264,7 +301,11 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                 if !summary.provider_tokens.is_empty() {
                     println!("Tokens by provider");
                     for (provider, tokens) in &summary.provider_tokens {
-                        println!("  {provider:<24} {:>10}", compact_tokens(*tokens));
+                        println!(
+                            "  {:<PROVIDER_WIDTH$} {:>10}",
+                            cell(provider, PROVIDER_WIDTH),
+                            compact_tokens(*tokens)
+                        );
                     }
                     println!();
                 }
@@ -272,7 +313,11 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                     println!("Tokens by model  (all providers together)");
                     let (model_tokens, omitted) = ranked_models(&summary.model_tokens, u64::cmp);
                     for (model, tokens) in model_tokens {
-                        println!("  {model:<34} {:>10}", compact_tokens(tokens));
+                        println!(
+                            "  {:<MODEL_WIDTH$} {:>10}",
+                            cell(&model, MODEL_WIDTH),
+                            compact_tokens(tokens)
+                        );
                     }
                     print_omitted_models(omitted);
                     println!();
@@ -366,7 +411,10 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         }
     }
     if top != 0 && report.rows.len() > top {
-        println!("  … {} more rows; use --top 0", report.rows.len() - top);
+        println!(
+            "  … {}; use --top 0",
+            counted((report.rows.len() - top) as u64, "more row", "more rows")
+        );
     }
     if let Some(calendar) = ["day", "month"]
         .into_iter()
@@ -377,7 +425,10 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         // too gave `--top 1` a chart whose tallest bar belonged to a row the
         // reader could not see.
         let scope = if rows.len() < report.rows.len() {
-            format!("the {} rows above only, oldest → newest", rows.len())
+            format!(
+                "the {} above only, oldest → newest",
+                counted(rows.len() as u64, "row", "rows")
+            )
         } else {
             "oldest → newest".to_string()
         };
@@ -466,17 +517,36 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         || diagnostics.approximate_cwds != 0
     {
         println!(
-            "Diagnostics: {} malformed lines, {} unreadable files, {} Git errors, {} approximate working directories.",
-            diagnostics.malformed_lines,
-            diagnostics.unreadable_files,
-            diagnostics.git_errors,
-            diagnostics.approximate_cwds
+            "Diagnostics: {}, {}, {}, {}.",
+            counted(
+                diagnostics.malformed_lines,
+                "malformed line",
+                "malformed lines"
+            ),
+            counted(
+                diagnostics.unreadable_files,
+                "unreadable file",
+                "unreadable files"
+            ),
+            counted(diagnostics.git_errors, "Git error", "Git errors"),
+            counted(
+                diagnostics.approximate_cwds,
+                "approximate working directory",
+                "approximate working directories"
+            ),
         );
     }
     if diagnostics.content_rejections != 0 {
+        // "directories" above and "record" here are the same rule: the noun
+        // agrees with its number, and so does the verb that follows it.
+        let (records, verb) = if diagnostics.content_rejections == 1 {
+            ("record", "was")
+        } else {
+            ("records", "were")
+        };
         println!(
-            "Privacy: {} record(s) carrying prompt or response text were skipped, as designed.",
-            diagnostics.content_rejections
+            "Privacy: {} {records} carrying prompt or response text {verb} skipped, as designed.",
+            number(diagnostics.content_rejections)
         );
     }
     // Without these a mistyped --history or --events path produces a clean
@@ -541,25 +611,55 @@ where
 
 fn print_omitted_models(omitted: usize) {
     if omitted != 0 {
-        println!("  … {omitted} more models; use --format json for all of them.");
+        println!(
+            "  … {}; use --format json for all of them.",
+            counted(omitted as u64, "more model", "more models")
+        );
     }
+}
+
+/// What a control character or a direction override is drawn as instead of
+/// being drawn. The explorer uses the same one, so a path read in the table and
+/// the same path read in the explorer look alike.
+const REPLACEMENT: char = '·';
+
+/// Text on its way to a terminal, made safe to draw. A repository path, a
+/// working directory, or a quoted file name is not text this tool chose: a
+/// control character in one hands an escape sequence straight to the terminal,
+/// and a direction override reorders everything after it on the line, which is
+/// what lets a crafted name read as something it is not (CVE-2021-42574).
+///
+/// This is where that is dealt with, rather than in the grouping key itself —
+/// see `aggregate::bounded_value` for why the key stays faithful. Every
+/// terminal-facing path in this file goes through here: the table's row labels,
+/// the `--raw` provider and model lists, the CSV, and the diagnostic messages
+/// below.
+///
+/// Each replacement is one character wide, so a caller that has already counted
+/// a column's width still gets the number of cells it counted.
+fn safe_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() || is_direction_override(character) {
+                REPLACEMENT
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// A message quotes a path the tool did not choose, so it can carry control
 /// characters — and characters that reorder the line around them — into a
 /// terminal.
 fn safe_message(value: &str) -> String {
-    let mut safe: String = value
-        .chars()
-        .take(MAX_MESSAGE_CHARACTERS)
-        .map(|character| {
-            if character.is_control() || is_direction_override(character) {
-                '·'
-            } else {
-                character
-            }
-        })
-        .collect();
+    let mut safe = safe_text(
+        &value
+            .chars()
+            .take(MAX_MESSAGE_CHARACTERS)
+            .collect::<String>(),
+    );
     if value.chars().nth(MAX_MESSAGE_CHARACTERS).is_some() {
         safe.push('…');
     }
@@ -658,22 +758,29 @@ fn composition_field(row: &ReportRow, name: &str) -> Option<String> {
 /// The first column of every row table.
 const LABEL_WIDTH: usize = 38;
 
-/// A row's label, clipped to `LABEL_WIDTH` from the left. The tail is what is
-/// kept because the distinguishing part of a long path is its end.
-fn clipped_label(row: &ReportRow, dimensions: &[String]) -> String {
-    let label = label(row, dimensions);
-    if label.chars().count() <= LABEL_WIDTH {
-        return label;
+/// Text going into a fixed-width column: made safe to draw, then clipped from
+/// the left. The tail is what is kept because the distinguishing part of a long
+/// path is its end, and so is the version on the end of a long model id.
+/// Clipping matters as much as the substitution does — a name wider than its
+/// column pushes every number on the line out of alignment.
+fn cell(value: &str, width: usize) -> String {
+    let value = safe_text(value);
+    if value.chars().count() <= width {
+        return value;
     }
-    let suffix: String = label
+    let suffix: String = value
         .chars()
         .rev()
-        .take(LABEL_WIDTH - 1)
+        .take(width.saturating_sub(1))
         .collect::<String>()
         .chars()
         .rev()
         .collect();
     format!("…{suffix}")
+}
+
+fn clipped_label(row: &ReportRow, dimensions: &[String]) -> String {
+    cell(&label(row, dimensions), LABEL_WIDTH)
 }
 
 fn label(row: &ReportRow, dimensions: &[String]) -> String {
@@ -777,6 +884,16 @@ fn compact_tokens(value: u64) -> String {
     } else {
         format!("{:.1}B", value / 1_000_000_000.0)
     }
+}
+
+/// A count and the noun it counts, agreeing: `1 commit`, `12 commits`. Both
+/// spellings are given rather than derived — the report counts working
+/// *directories* as well as commits, and no rule short of a dictionary gets
+/// both right. Writing them out keeps this a formatter instead of the beginning
+/// of a pluralisation library.
+fn counted(value: u64, singular: &str, plural: &str) -> String {
+    let noun = if value == 1 { singular } else { plural };
+    format!("{} {noun}", number(value))
 }
 
 fn number(value: impl ToString) -> String {
@@ -1087,6 +1204,42 @@ mod tests {
         );
     }
 
+    /// The three edges of the cap, for the seconds list and the tokens list
+    /// alike — they share one implementation so that they cannot disagree about
+    /// what they left out. A list exactly as long as the cap is the one that
+    /// most easily grows a phantom "… 0 more".
+    #[test]
+    fn the_model_lists_report_what_they_left_out_at_every_edge() {
+        let seconds = |count: usize| -> BTreeMap<String, f64> {
+            (0..count)
+                .map(|index| (format!("model-{index:02}"), index as f64))
+                .collect()
+        };
+        let tokens = |count: usize| -> BTreeMap<String, u64> {
+            (0..count)
+                .map(|index| (format!("model-{index:02}"), index as u64))
+                .collect()
+        };
+        for count in [0, 1, MAX_PRINTED_MODELS - 1, MAX_PRINTED_MODELS] {
+            let (ranked, omitted) = ranked_models(&seconds(count), f64::total_cmp);
+            assert_eq!(count, ranked.len(), "{count} models by seconds");
+            assert_eq!(0, omitted, "{count} models by seconds");
+            let (ranked, omitted) = ranked_models(&tokens(count), u64::cmp);
+            assert_eq!(count, ranked.len(), "{count} models by tokens");
+            assert_eq!(0, omitted, "{count} models by tokens");
+        }
+        // One past the cap is the first list that hides anything, and both
+        // blocks say so in the same words.
+        let (ranked, omitted) = ranked_models(&seconds(MAX_PRINTED_MODELS + 1), f64::total_cmp);
+        assert_eq!(MAX_PRINTED_MODELS, ranked.len());
+        assert_eq!(1, omitted);
+        let (_, token_omitted) = ranked_models(&tokens(MAX_PRINTED_MODELS + 1), u64::cmp);
+        assert_eq!(omitted, token_omitted);
+        // And the note it prints agrees with that number.
+        assert_eq!("1 more model", counted(1, "more model", "more models"));
+        assert_eq!("4 more models", counted(4, "more model", "more models"));
+    }
+
     #[test]
     fn the_internal_no_model_spellings_render_as_one_entry() {
         let totals: BTreeMap<String, f64> = BTreeMap::from([
@@ -1128,6 +1281,95 @@ mod tests {
         let capped = hidden_messages_note(130).unwrap();
         assert!(capped.contains("… 125 more"), "{capped}");
         assert!(capped.contains("first 100 warnings were kept"), "{capped}");
+    }
+
+    /// The split this file now draws: the terminal is protected by the renderer
+    /// that draws it, and the identifier a consumer joins on is left alone.
+    /// `aggregate::bounded_value` no longer substitutes anything, so a table
+    /// cell that is not made safe here is not made safe anywhere.
+    #[test]
+    fn a_crafted_row_name_is_neutralised_on_its_way_to_a_terminal() {
+        let dimensions = vec!["repo".to_string()];
+        let mut row = row_with(Vec::new());
+        // U+202E would print the rest of the cell right-to-left, so a checkout
+        // called `gnp.exe` could name a row that reads `exe.png`; U+001B is the
+        // start of an escape sequence the terminal would obey.
+        row.key
+            .insert("repo".to_string(), "repo\u{202e}na\u{1b}[2Kme".to_string());
+        assert_eq!("repo·na·[2Kme", clipped_label(&row, &dimensions));
+        // The CSV is read in a terminal too, and `csv::Writer` would pass an
+        // escape sequence through as an ordinary byte.
+        assert_eq!("repo·na·[2Kme", csv_cell(&row, "repo"));
+        // Both replacements are one character wide, so the column is still the
+        // width the caller counted on.
+        assert_eq!(
+            "repo\u{202e}na\u{1b}[2Kme".chars().count(),
+            clipped_label(&row, &dimensions).chars().count()
+        );
+        // What the key itself says is untouched by any of this: it is the name
+        // the checkout has, and `--format json` carries it.
+        assert_eq!(
+            Some(&"repo\u{202e}na\u{1b}[2Kme".to_string()),
+            row.key.get("repo")
+        );
+        // A path that only looks dangerous is still left alone. U+200E opens no
+        // directional scope, and is ordinary content in an RTL path.
+        assert_eq!("~/src/prosjekt-æøå", safe_text("~/src/prosjekt-æøå"));
+        assert_eq!("report\u{200e}-2026", safe_text("report\u{200e}-2026"));
+    }
+
+    /// A key that a spreadsheet would read as a formula is still quoted, and the
+    /// order matters: neutralisation looks at the first character, so it has to
+    /// see the one the cell will actually carry.
+    #[test]
+    fn a_sanitised_cell_is_still_checked_for_a_formula() {
+        let mut row = row_with(Vec::new());
+        row.key
+            .insert("repo".to_string(), "=cmd|'/c calc'!A1".to_string());
+        assert_eq!("'=cmd|'/c calc'!A1", csv_cell(&row, "repo"));
+        // A numeric column is a number in both passes.
+        row.net_lines = -12;
+        assert_eq!("-12", csv_cell(&row, "net_lines"));
+    }
+
+    /// A name wider than its column pushes every figure on the line out of
+    /// alignment, and real model ids are wider than the `--raw` column.
+    #[test]
+    fn a_long_name_is_clipped_to_the_column_it_is_printed_in() {
+        let bedrock = "us.anthropic.claude-3-5-sonnet-20241022-v2:0";
+        assert!(bedrock.chars().count() > MODEL_WIDTH);
+        let clipped = cell(bedrock, MODEL_WIDTH);
+        assert_eq!(MODEL_WIDTH, clipped.chars().count());
+        assert!(clipped.starts_with('…'), "{clipped}");
+        // The tail is what tells two versions of one model apart.
+        assert!(clipped.ends_with("-20241022-v2:0"), "{clipped}");
+        assert_eq!("codex", cell("codex", PROVIDER_WIDTH));
+    }
+
+    #[test]
+    fn a_count_agrees_with_its_noun() {
+        assert_eq!("1 commit", counted(1, "commit", "commits"));
+        assert_eq!("0 commits", counted(0, "commit", "commits"));
+        assert_eq!("2 commits", counted(2, "commit", "commits"));
+        // The reason both spellings are passed in rather than derived.
+        assert_eq!(
+            "1 approximate working directory",
+            counted(
+                1,
+                "approximate working directory",
+                "approximate working directories"
+            )
+        );
+        assert_eq!(
+            "3 approximate working directories",
+            counted(
+                3,
+                "approximate working directory",
+                "approximate working directories"
+            )
+        );
+        // Large counts keep their separators.
+        assert_eq!("1,200 rows", counted(1200, "row", "rows"));
     }
 
     #[test]

@@ -575,12 +575,16 @@ fn count_segment(app: &App) -> Vec<Span<'static>> {
         let lines = app.diff().map_or(0, |view| view.lines.len());
         return vec![
             Span::styled(number(lines as u64), PLAIN),
-            Span::styled(" diff lines", DIM),
+            Span::styled(format!(" {}", noun(lines, "diff line", "diff lines")), DIM),
         ];
     }
+    let rows = app.rows().len();
     let mut spans = vec![
-        Span::styled(number(app.rows().len() as u64), PLAIN),
-        Span::styled(format!(" {}", app.level().label()), DIM),
+        Span::styled(number(rows as u64), PLAIN),
+        Span::styled(
+            format!(" {}", noun(rows, one_row(app.level()), app.level().label())),
+            DIM,
+        ),
     ];
     // Without this a filtered level looks like the whole truth.
     if !app.filter().is_empty() {
@@ -779,7 +783,11 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App) {
     ];
     if !app.input().is_empty() {
         typed.push(Span::styled(
-            format!("   {} matches", number(hits.len() as u64)),
+            format!(
+                "   {} {}",
+                number(hits.len() as u64),
+                noun(hits.len(), "match", "matches")
+            ),
             DIM,
         ));
     }
@@ -955,6 +963,29 @@ fn clip(text: &str, width: usize) -> String {
         shorten_path(text, width)
     } else {
         shorten(text, width)
+    }
+}
+
+/// The noun that agrees with `value`, the way `output::counted` picks one. Both
+/// spellings are given because these nouns are not all a plain `s` apart.
+fn noun<'a>(value: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if value == 1 { singular } else { plural }
+}
+
+/// What one row of a level is called. `LevelKind::label` is the plural the
+/// status bar and the empty state are written in, and a level holding a single
+/// row needs the singular of it. Spelled out rather than derived: `repositories`
+/// and `categories` do not lose a plain `s`, and `history` and `diff` are not
+/// plurals at all, so they stay as they are. The match is exhaustive, so a new
+/// level cannot be added without answering this.
+const fn one_row(level: LevelKind) -> &'static str {
+    match level {
+        LevelKind::Overview => "repository",
+        LevelKind::Repo => "period",
+        LevelKind::Period => "category",
+        LevelKind::Category => "commit",
+        LevelKind::Commit => "file",
+        LevelKind::File | LevelKind::Diff => level.label(),
     }
 }
 
@@ -1186,6 +1217,30 @@ mod tests {
         // characters of its own.
         let hebrew = "~/\u{5de}\u{5e1}\u{5de}\u{5db}\u{5d9}\u{5dd}\u{200f}/log";
         assert_eq!(hebrew, shorten(hebrew, 20));
+    }
+
+    /// The status bar counts the rows of whichever level is open, so every
+    /// level needs a name that works with a `1` in front of it.
+    #[test]
+    fn the_status_bar_counts_agree_with_the_nouns_beside_them() {
+        assert_eq!("repository", noun(1, one_row(LevelKind::Overview), "x"));
+        assert_eq!(
+            "repositories",
+            noun(4, one_row(LevelKind::Overview), LevelKind::Overview.label())
+        );
+        assert_eq!("commit", one_row(LevelKind::Category));
+        assert_eq!("file", one_row(LevelKind::Commit));
+        // Neither of these is a plural to begin with, so neither has a
+        // singular of its own to fall back to.
+        assert_eq!(LevelKind::File.label(), one_row(LevelKind::File));
+        assert_eq!(LevelKind::Diff.label(), one_row(LevelKind::Diff));
+        // Zero takes the plural, the way "no repositories match" reads.
+        assert_eq!(
+            "periods",
+            noun(0, one_row(LevelKind::Repo), LevelKind::Repo.label())
+        );
+        assert_eq!("diff line", noun(1, "diff line", "diff lines"));
+        assert_eq!("matches", noun(2, "match", "matches"));
     }
 
     #[test]
