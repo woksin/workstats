@@ -3963,15 +3963,39 @@ mod tests {
         path
     }
 
+    /// Renders a directory the way VS Code writes it into `workspace.json`: a URL, not a
+    /// path. Interpolating a `Path` into `file:///{}` yields
+    /// `file:///C:\Users\…\repos/my example` on Windows — backslashes, a bare drive
+    /// colon, an unescaped space — which is no file URL at all, so the parser declines it
+    /// and the test proves the fallback instead of what it claims to test.
+    fn vscode_folder_url(path: &Path) -> String {
+        let text = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace(' ', "%20");
+        let bytes = text.as_bytes();
+        // A drive letter is not the root of a URL path: VS Code writes `C:/…` as
+        // `/c%3A/…`, lowercased and with the colon escaped.
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return format!(
+                "file:///{}%3A{}",
+                text[..1].to_ascii_lowercase(),
+                &text[2..]
+            );
+        }
+        format!("file://{text}")
+    }
+
     #[test]
     fn copilot_chat_requests_become_prompts_and_an_exact_interval() {
         let root = tempdir().unwrap();
         let storage = root.path().join("workspaceStorage");
-        // A percent-escaped space in the folder URL: `workspace.json` stores a URL, not
-        // a path, and an undecoded one names no directory on this machine.
+        // A space in the project directory arrives percent-escaped, because
+        // `workspace.json` stores a URL, not a path, and an undecoded one names no
+        // directory on this machine.
         let project = root.path().join("repos/my example");
         fs::create_dir_all(&project).unwrap();
-        let folder = format!("file://{}/repos/my%20example", root.path().display());
+        let folder = vscode_folder_url(&project);
         let document = serde_json::json!({
             "version": 3,
             "sessionId": "chat-one",
@@ -4013,7 +4037,14 @@ mod tests {
         let session = &parsed.sessions[0];
         assert_eq!("copilot-vscode", session.provider);
         assert!(!session.is_subagent);
-        assert_eq!(project.to_string_lossy(), session.cwd);
+        // The cwd comes out of a URL, so it carries the URL's separators and drive-letter
+        // case rather than the platform's (`c:/Users/…` on Windows). Comparing the two
+        // spellings as the directory they resolve to keeps the assertion honest —
+        // and still fails on a fallback cwd, which resolves elsewhere.
+        assert_eq!(
+            canonical_string(&project),
+            canonical_string(Path::new(&session.cwd))
+        );
         assert!(!session.approximate_cwd);
         // Both submissions are human evidence; only the measured turn is agent time.
         assert_eq!(2, session.human_points.len());
@@ -4045,6 +4076,32 @@ mod tests {
             Some("C:/Users/test/project".to_string()),
             file_url_to_path("file:///C%3A/Users/test/project")
         );
+    }
+
+    /// A `workspace.json` written verbatim as VS Code writes it on Windows: an escaped
+    /// drive colon, forward slashes, a lowercase drive letter. Every developer on Windows
+    /// hits this shape, and the tempdir-driven test above can only exercise the shape of
+    /// whichever platform runs it.
+    #[test]
+    fn a_windows_workspace_url_resolves_to_a_drive_path() {
+        let root = tempdir().unwrap();
+        let document = serde_json::json!({
+            "version": 3,
+            "sessionId": "chat-windows",
+            "requests": [{"timestamp": 1_767_225_600_000_i64, "modelId": "copilot/gpt-test"}]
+        });
+        let path = vscode_chat_session(
+            root.path(),
+            "5e6f",
+            "session",
+            Some("file:///c%3A/Users/test/repos/my%20project"),
+            &document,
+        );
+        let parsed = parse_copilot_vscode_file(&path, MAX_VSCODE_CHAT_JSON_BYTES);
+        let session = &parsed.sessions[0];
+        // A fixed URL rather than a temp path, so one expectation holds everywhere.
+        assert_eq!("c:/Users/test/repos/my project", session.cwd);
+        assert!(!session.approximate_cwd);
     }
 
     #[test]
