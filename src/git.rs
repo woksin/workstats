@@ -396,13 +396,21 @@ fn parse_git_log(
         let (Some(added), Some(removed)) = (added, removed) else {
             continue;
         };
-        let resolved = renamed_target(fields.last().copied().unwrap_or_default());
+        let raw = fields.last().copied().unwrap_or_default();
+        let resolved = renamed_target(raw);
         let file_path: &str = &resolved;
         if includes.is_some_and(|patterns| !patterns.is_match(file_path)) {
             continue;
         }
         pending.matched_file = true;
-        if ignores.is_some_and(|patterns| patterns.is_match(file_path)) {
+        // Both spellings are tested against the ignores. Without `-z`, git's
+        // rename notation is ambiguous with a filename that genuinely contains
+        // " => ", and resolving such a path strips the directory that the
+        // vendor rule matches on — so `node_modules/a => b.js` would be read as
+        // `b.js` and counted as authored source. Ignoring on either spelling
+        // keeps generated files out; the residual is that a file moved *out* of
+        // an ignored directory stays ignored for that one commit.
+        if ignores.is_some_and(|patterns| patterns.is_match(file_path) || patterns.is_match(raw)) {
             pending.ignored_additions += added;
             pending.ignored_deletions += removed;
         } else {
@@ -589,6 +597,45 @@ mod tests {
             false,
         );
         assert!(filtered.is_empty());
+    }
+
+    /// A filename may legitimately contain " => ", and without `-z` git writes
+    /// it exactly like a rename. Resolving one of those strips the directory
+    /// the vendor rule matches on, so the file would be counted as authored
+    /// source; matching the ignores on the raw spelling too keeps it out.
+    #[test]
+    fn a_filename_that_looks_like_a_rename_still_matches_the_ignores() {
+        let base = tempdir().unwrap();
+        let repo = base.path().join("org/arrows");
+        fs::create_dir_all(repo.join("node_modules")).unwrap();
+        git(&["init", "-q", repo.to_str().unwrap()]);
+        let path = repo.to_str().unwrap();
+        git(&["-C", path, "config", "user.name", "Arrow Author"]);
+        git(&["-C", path, "config", "user.email", "arrow@example.com"]);
+        fs::write(repo.join("node_modules/a => b.js"), "one\ntwo\nthree\n").unwrap();
+        fs::write(repo.join("node_modules/plain.js"), "x\ny\n").unwrap();
+        fs::write(repo.join("src.rs"), "real\n").unwrap();
+        git(&["-C", path, "add", "."]);
+        git(&["-C", path, "commit", "-qm", "arrows"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Arrow Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(1, commits.len());
+        assert_eq!(1, commits[0].additions, "only src.rs is authored");
+        assert_eq!(5, commits[0].ignored_additions, "both vendored files");
     }
 
     #[test]
