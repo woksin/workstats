@@ -228,9 +228,7 @@ impl CategoryDef {
             let index = matched.first().copied().unwrap_or(0);
             return Some((RuleKind::Glob, self.globs[index].as_str()));
         }
-        if let Some(rule) = first(&self.directories, |rule| {
-            parts.directories.iter().any(|piece| *piece == rule)
-        }) {
+        if let Some(rule) = first(&self.directories, |rule| parts.directories.contains(&rule)) {
             return Some((RuleKind::Directory, rule));
         }
         if let Some(rule) = first(&self.directory_prefixes, |rule| {
@@ -276,7 +274,7 @@ impl CategoryDef {
     }
 }
 
-fn first<'a>(rules: &'a [String], mut predicate: impl FnMut(&str) -> bool) -> Option<&'a str> {
+fn first(rules: &[String], mut predicate: impl FnMut(&str) -> bool) -> Option<&str> {
     rules
         .iter()
         .find(|rule| predicate(rule.as_str()))

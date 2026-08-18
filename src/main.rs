@@ -904,10 +904,7 @@ fn classify_paths(arguments: &ClassifyArguments, fallback_config: Option<&Path>)
             writer.flush()?;
         }
         OutputFormat::Table => {
-            println!(
-                "{:<52} {:<10} {:<18} {}",
-                "PATH", "CATEGORY", "RULE", "MATCHED"
-            );
+            println!("{:<52} {:<10} {:<18} MATCHED", "PATH", "CATEGORY", "RULE");
             for item in &classified {
                 let pattern = if item.pattern.is_empty() {
                     "—"
