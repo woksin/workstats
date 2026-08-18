@@ -26,7 +26,8 @@ use serde::Serialize;
 use aggregate::{DIMENSIONS, build_report};
 use ai::{
     read_claude_sessions_indexed, read_codex_sessions_indexed, read_copilot_sessions_indexed,
-    read_event_sessions_indexed, read_gemini_sessions_indexed, read_opencode_sessions_indexed,
+    read_copilot_vscode_sessions_indexed, read_event_sessions_indexed,
+    read_gemini_sessions_indexed, read_opencode_sessions_indexed,
 };
 use cache::TranscriptCache;
 use git::{default_git_author, read_git_commits};
@@ -40,7 +41,7 @@ use sources::{
     default_codex_database, default_events_path, default_history_paths, normalize_provider,
     parse_history_overrides, resolve_opencode_database, source_inventory,
 };
-use timeutil::{parse_bound, parse_duration, parse_timestamp};
+use timeutil::{month_span, parse_bound, parse_duration, parse_timestamp, year_span};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -197,6 +198,24 @@ struct ReportArguments {
     since: Option<String>,
     #[arg(short = 'u', long, help = "Inclusive YYYY-MM or YYYY-MM-DD")]
     until: Option<String>,
+    // These pick the window the report covers; --group-by month and --period
+    // month split the rows inside whatever window is already picked. The words
+    // are otherwise identical, so all four help lines say which one they are.
+    // The conflicts are the AUDIT V shape again: --month with --since could
+    // only mean one of the two, and silently picking is what --by-repo used to
+    // do to --group-by.
+    #[arg(
+        long,
+        conflicts_with_all = ["year", "since", "until"],
+        help = "Filter to one calendar month: YYYY-MM, current (this), or last (previous)"
+    )]
+    month: Option<String>,
+    #[arg(
+        long,
+        conflicts_with_all = ["since", "until"],
+        help = "Filter to one calendar year: YYYY, current (this), or last (previous)"
+    )]
+    year: Option<String>,
     #[arg(
         long,
         default_value = "5m",
@@ -223,10 +242,14 @@ struct ReportArguments {
         long = "group-by",
         visible_alias = "by",
         conflicts_with_all = ["by_repo", "matrix", "by_dir"],
-        help = "Comma-separated: root,repo,cwd,provider,model,day,month (default: repo)"
+        help = "Comma-separated grouping dimensions: root,repo,cwd,provider,model,day,month (default: repo)"
     )]
     group_by: Option<String>,
-    #[arg(long, value_parser = ["day", "month"], help = "Append a calendar grouping")]
+    #[arg(
+        long,
+        value_parser = ["day", "month"],
+        help = "Append a calendar grouping to the rows; --month/--year choose the window"
+    )]
     period: Option<String>,
     #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append, help = "Include provider(s); repeatable/comma-separated (default: all)")]
     provider: Vec<String>,
@@ -374,6 +397,31 @@ fn bound_flag(flag: &str, value: Option<&str>, until: bool) -> Result<Option<Dat
         .with_context(|| format!("invalid {flag} {:?}", value.unwrap_or_default()))
 }
 
+/// The half-open `[since, until)` window one run reports on; `None` on either
+/// end means unbounded there.
+type ReportWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// `--month` and `--year` are shorthand for the whole window, and clap has
+/// already refused them alongside `--since`/`--until`, so whichever is present
+/// decides both ends. The reference instant is taken as an argument rather than
+/// read from the clock so `current` and `last` stay testable.
+fn report_window(arguments: &ReportArguments, reference: DateTime<Utc>) -> Result<ReportWindow> {
+    if let Some(value) = arguments.month.as_deref() {
+        let (since, until) =
+            month_span(value, reference).with_context(|| format!("invalid --month {value:?}"))?;
+        return Ok((Some(since), Some(until)));
+    }
+    if let Some(value) = arguments.year.as_deref() {
+        let (since, until) =
+            year_span(value, reference).with_context(|| format!("invalid --year {value:?}"))?;
+        return Ok((Some(since), Some(until)));
+    }
+    Ok((
+        bound_flag("--since", arguments.since.as_deref(), false)?,
+        bound_flag("--until", arguments.until.as_deref(), true)?,
+    ))
+}
+
 /// The directory Git history is scanned from. It takes its candidates instead
 /// of reading the environment itself so both the precedence and the error stay
 /// testable.
@@ -458,8 +506,7 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
     let gap_cap = duration_flag("--gap-cap", &arguments.gap_cap)?;
     let human_idle = duration_flag("--human-idle", &arguments.human_idle)?;
     let review_credit = duration_flag("--review-credit", &arguments.review_credit)?;
-    let since = bound_flag("--since", arguments.since.as_deref(), false)?;
-    let until = bound_flag("--until", arguments.until.as_deref(), true)?;
+    let (since, until) = report_window(&arguments, Utc::now())?;
     let dimensions = grouping_dimensions(&arguments)?;
 
     let progress = Progress::new(
@@ -601,6 +648,14 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
                         until,
                     ),
                     "copilot" => read_copilot_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        &mut diagnostics,
+                        transcript_cache.as_mut(),
+                        since,
+                        until,
+                    ),
+                    "copilot-vscode" => read_copilot_vscode_sessions_indexed(
                         path,
                         &mut resolver,
                         &mut diagnostics,
@@ -850,13 +905,16 @@ fn print_sources(arguments: &SourcesArguments) -> Result<()> {
         }
         OutputFormat::Table => {
             println!("AI HISTORY SOURCES\n");
+            // Widths hold the longest value each column can carry today —
+            // `copilot-vscode` and `GitHub Copilot Chat (VS Code)` are the ones
+            // setting them — so no row pushes the columns after it out of line.
             println!(
-                "{:<4} {:<12} {:<22} {:<24} {:<12} PATH",
+                "{:<4} {:<15} {:<30} {:<24} {:<12} PATH",
                 "", "ID", "SOURCE", "FORMAT", "SUPPORT"
             );
             for item in inventory {
                 println!(
-                    "{:<4} {:<12} {:<22} {:<24} {:<12} {}",
+                    "{:<4} {:<15} {:<30} {:<24} {:<12} {}",
                     if item.detected { "●" } else { "○" },
                     item.id,
                     item.name,
@@ -1074,6 +1132,42 @@ fn csv_globs(values: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Local, TimeZone};
+
+    /// Mid-January, so `last` has to cross a year boundary, and fixed, so no
+    /// assertion below depends on when the suite runs.
+    fn reference() -> DateTime<Utc> {
+        local_moment(2026, 1, 15, 12, 0)
+    }
+
+    fn local_moment(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        Local
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// The `--since X --until Y` pair a calendar shorthand has to be equal to;
+    /// anything else means the shorthand quietly reports a different window
+    /// than the longhand it stands for.
+    fn longhand(since: &str, until: &str) -> ReportWindow {
+        (
+            bound_flag("--since", Some(since), false).unwrap(),
+            bound_flag("--until", Some(until), true).unwrap(),
+        )
+    }
+
+    fn window(flags: &[&str]) -> ReportWindow {
+        report_window(&report_arguments(flags), reference()).unwrap()
+    }
+
+    /// The `>= since && < until` test `build_report` applies, run against the
+    /// window `flags` select.
+    fn covers(flags: &[&str], moment: DateTime<Utc>) -> bool {
+        let (since, until) = window(flags);
+        since.unwrap() <= moment && moment < until.unwrap()
+    }
 
     #[test]
     fn exact_repo_filter_does_not_match_similar_names() {
@@ -1250,6 +1344,121 @@ mod tests {
             Duration::minutes(5),
             duration_flag("--gap-cap", "5m").unwrap()
         );
+    }
+
+    /// The shorthand is only trustworthy if it lands on the very pair the user
+    /// would otherwise have typed, and it lives on the shared struct so the
+    /// explorer answers the same question the printed report does.
+    #[test]
+    fn the_month_shorthand_sets_both_bounds_and_reaches_the_explorer() {
+        assert_eq!(
+            longhand("2026-08", "2026-08"),
+            window(&["--month", "2026-08"])
+        );
+        assert_eq!(longhand("2026-01", "2026-12"), window(&["--year", "2026"]));
+
+        let parsed = Arguments::try_parse_from(["workstats", "ui", "--month", "last"]).unwrap();
+        let Some(Command::Ui(command)) = parsed.command else {
+            panic!("expected the ui subcommand");
+        };
+        assert_eq!(Some("last".to_string()), command.month);
+    }
+
+    /// Relative values are what earn the flag its keep — a recurring report is
+    /// one fixed command — so they resolve against a reference instant rather
+    /// than the clock, on the local calendar every other bound snaps to.
+    #[test]
+    fn relative_calendar_values_resolve_against_the_reference() {
+        for value in ["current", "this"] {
+            assert_eq!(longhand("2026-01", "2026-01"), window(&["--month", value]));
+        }
+        // January's previous month is the December before it, not month zero.
+        for value in ["last", "previous"] {
+            assert_eq!(longhand("2025-12", "2025-12"), window(&["--month", value]));
+        }
+        for value in ["current", "this"] {
+            assert_eq!(longhand("2026-01", "2026-12"), window(&["--year", value]));
+        }
+        for value in ["last", "previous"] {
+            assert_eq!(longhand("2025-01", "2025-12"), window(&["--year", value]));
+        }
+    }
+
+    /// `build_report` filters with `>= since && < until`, so the shorthand has
+    /// to end on the first instant *after* the span; ending on its last day
+    /// would silently drop that day's work.
+    #[test]
+    fn a_calendar_window_is_half_open_in_local_time() {
+        let january = ["--month", "2026-01"];
+        assert!(covers(&january, local_moment(2026, 1, 1, 0, 1)));
+        assert!(covers(&january, local_moment(2026, 1, 31, 23, 59)));
+        assert!(!covers(&january, local_moment(2026, 2, 1, 0, 0)));
+        assert!(!covers(&january, local_moment(2025, 12, 31, 23, 59)));
+
+        // December is the case a naive "month + 1" gets wrong, and it has to
+        // roll the year over for a month and for a year alike.
+        let december = ["--month", "2026-12"];
+        assert!(covers(&december, local_moment(2026, 12, 31, 23, 59)));
+        assert!(!covers(&december, local_moment(2027, 1, 1, 0, 0)));
+        let year = ["--year", "2026"];
+        assert!(covers(&year, local_moment(2026, 1, 1, 0, 1)));
+        assert!(covers(&year, local_moment(2026, 12, 31, 23, 59)));
+        assert!(!covers(&year, local_moment(2027, 1, 1, 0, 0)));
+        assert!(!covers(&year, local_moment(2025, 12, 31, 23, 59)));
+    }
+
+    /// Same shape as the grouping shortcuts: a combination that could only mean
+    /// one of the two has to say so rather than let one quietly win (AUDIT V).
+    #[test]
+    fn the_calendar_shorthands_conflict_with_each_other_and_with_the_bounds() {
+        for flags in [
+            ["--month", "2026-08", "--year", "2026"],
+            ["--month", "2026-08", "--since", "2026-01"],
+            ["--month", "2026-08", "--until", "2026-12"],
+            ["--year", "2026", "--since", "2026-01"],
+            ["--year", "2026", "--until", "2026-12"],
+        ] {
+            let mut command = vec!["workstats"];
+            command.extend_from_slice(&flags);
+            assert!(
+                Arguments::try_parse_from(command).is_err(),
+                "{flags:?} should conflict"
+            );
+        }
+        // The pieces each shorthand replaces stay legal on their own.
+        for flags in [
+            vec!["--month", "2026-08"],
+            vec!["--year", "2026"],
+            vec!["--since", "2026-01", "--until", "2026-12"],
+            // A filter and a grouping are orthogonal, so these must coexist.
+            vec!["--month", "current", "--group-by", "repo"],
+            vec!["--year", "last", "--period", "month"],
+        ] {
+            let mut command = vec!["workstats"];
+            command.extend_from_slice(&flags);
+            assert!(
+                Arguments::try_parse_from(command).is_ok(),
+                "{flags:?} should parse"
+            );
+        }
+    }
+
+    /// A month that does not exist used to be the kind of thing you only catch
+    /// by seeing it next to what you typed (AUDIT V).
+    #[test]
+    fn a_bad_month_or_year_names_the_flag_and_the_value() {
+        let error = format!(
+            "{:#}",
+            report_window(&report_arguments(&["--month", "2026-13"]), reference()).unwrap_err()
+        );
+        assert!(error.contains("--month"), "{error}");
+        assert!(error.contains("2026-13"), "{error}");
+        let error = format!(
+            "{:#}",
+            report_window(&report_arguments(&["--year", "26"]), reference()).unwrap_err()
+        );
+        assert!(error.contains("--year"), "{error}");
+        assert!(error.contains("\"26\""), "{error}");
     }
 
     /// A typo'd scan root used to look exactly like a quiet week (AUDIT V).

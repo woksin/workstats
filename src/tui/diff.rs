@@ -24,6 +24,7 @@ use anyhow::{Context, Result, bail};
 use tempfile::tempfile;
 
 use crate::git::git_executable;
+use crate::output::is_direction_override;
 
 /// The whole diff. A single commit that regenerates a lock file or a bundle is
 /// tens of megabytes, and there is no reading that anyway.
@@ -336,16 +337,6 @@ fn clip(raw: &[u8]) -> String {
         }
     }
     clipped
-}
-
-/// The bidirectional format characters. Unicode does not classify them as
-/// control characters, but they reorder what is drawn, which in a diff is the
-/// difference between reading a change and being shown a different one.
-fn is_direction_override(character: char) -> bool {
-    matches!(
-        character,
-        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
 }
 
 /// The revision is a positional argument to Git and is also spliced into

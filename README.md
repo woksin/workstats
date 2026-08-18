@@ -96,13 +96,18 @@ attendance system, or a universal productivity score.
 ## Bring your whole AI stack
 
 ```text
-  ● claude       Claude Code            built-in
-  ● codex        OpenAI Codex           built-in
-  ● gemini       Google Gemini CLI      built-in
-  ● copilot      GitHub Copilot CLI     best-effort
-  ● opencode     OpenCode               best-effort
-  ● events       any CLI / IDE / API    stable open JSONL
+  ● claude          Claude Code                    built-in
+  ● codex           OpenAI Codex                   built-in
+  ● gemini          Google Gemini CLI              built-in
+  ● copilot         GitHub Copilot CLI             best-effort
+  ● copilot-vscode  GitHub Copilot Chat (VS Code)  best-effort
+  ● opencode        OpenCode                       best-effort
+  ● events          any CLI / IDE / API            stable open JSONL
 ```
+
+GitHub Copilot is covered on two surfaces, the CLI and Copilot Chat in VS Code,
+because those are the two that leave a timestamped local record. Inline
+completions leave none, so nothing counts them.
 
 Run `workstats sources` to see what is detected on the current machine. Native
 adapters read structural fields from documented or inspectable local histories.
@@ -121,7 +126,20 @@ optional.
 No Rust toolchain is required. Every release includes a `SHA256SUMS` file.
 
 <table>
-<tr><td width="145"><b>macOS</b></td><td>
+<tr><td width="145"><b>Homebrew</b><br><sub>macOS · Linux</sub></td><td>
+
+```bash
+brew install woksin/workstats/workstats
+```
+
+The fully-qualified name taps `woksin/workstats` and trusts that one formula as
+it installs it. Homebrew 5.1.15 and newer refuse to load a formula from a
+non-official tap until it is trusted, so installing by the short name instead
+takes `brew tap woksin/workstats && brew trust woksin/workstats` first, which
+trusts the whole tap rather than a single formula.
+
+</td></tr>
+<tr><td><b>macOS</b></td><td>
 
 ```bash
 # Apple silicon
@@ -224,6 +242,8 @@ workstats --dir ~/projects                 # discover repositories below a direc
 workstats --group-by month,repo            # recent work by month and repo
 workstats --period day --group-by root     # daily trend by source root
 workstats --since 2026-07 --until 2026-08  # inclusive local calendar bounds
+workstats --month 2026-07                  # filter to one calendar month
+workstats --year last                      # filter to the previous calendar year
 workstats --provider codex,gemini --group-by model
 workstats --exclude-provider copilot
 workstats --repo-exact my-project          # infer its checkout from matching AI sessions
@@ -236,9 +256,9 @@ history under the current directory — `--dir PATH` or `WORKSTATS_DIR` moves th
 root, `--depth N` (default 4) bounds how far below it repositories are
 discovered. Retained AI history is always machine-wide, because that is how the
 tools store it: a run in one checkout still sees sessions from everywhere unless
-you narrow it with `--repo`, `--repo-exact`, `--since`/`--until`, or
-`--provider`. That asymmetry is deliberate and it is why *committed output*
-counts only sessions in repositories Git actually scanned.
+you narrow it with `--repo`, `--repo-exact`, `--since`/`--until`,
+`--month`/`--year`, or `--provider`. That asymmetry is deliberate and it is why
+*committed output* counts only sessions in repositories Git actually scanned.
 
 `--dir` and `WORKSTATS_DIR` must name a directory that exists. A path that does
 not is an error naming which of the two was wrong, not an all-zero report.
@@ -602,9 +622,16 @@ and supports `--format json` and `--format csv`.
 - no file contents in reports or the cache either — the explorer's diff viewer
   is the single place a tracked file is ever read, and what it reads is
   display-only ([details below](#the-diff-viewer-is-the-one-place-file-contents-are-read));
-- Codex and OpenCode SQLite databases are opened read-only;
-- known credential files such as `auth.json`, `secrets.json`, `.env`, and key
-  stores are never discovery targets;
+- a VS Code chat session is read for timestamps, model ids, and how long each
+  turn took; the parser names no message field, so prompt and response bodies
+  are never deserialized;
+- Copilot's `~/.copilot/session-store.db` is read for `sessions(id, cwd,
+  repository, branch, host_type)` and nothing else — that database also holds a
+  `turns` table of full prompt and response bodies and a `search_index` FTS5
+  index over them, and `workstats` queries neither;
+- Codex, Copilot, and OpenCode SQLite databases are opened read-only;
+- known credential locations such as `auth.json`, `secrets.json`, `.env`,
+  `~/.config/github-copilot/`, and key stores are never discovery targets;
 - malformed and oversized transcript records degrade safely;
 - CSV cells are neutralized against spreadsheet formula injection.
 
@@ -658,9 +685,16 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 | Claude Code projects | `~/.claude/projects` |
 | Gemini CLI sessions | `~/.gemini/tmp/*/chats` |
 | GitHub Copilot CLI sessions | `~/.copilot/session-state/*/events.jsonl` |
+| GitHub Copilot CLI metadata | `~/.copilot/session-store.db` |
+| GitHub Copilot Chat sessions | `~/Library/Application Support/Code/User/workspaceStorage` (macOS) |
 | OpenCode sessions | `~/.local/share/opencode/opencode.db` |
 | Workstats Events | platform data directory (shown by `workstats sources`) |
 | Git repositories | current directory, `--dir PATH`, or `WORKSTATS_DIR` |
+
+VS Code keeps that chat directory under `%APPDATA%\Code\User\workspaceStorage`
+on Windows and `~/.config/Code/User/workspaceStorage` on Linux. `Code -
+Insiders` and `VSCodium` are read alongside `Code` when they exist; any other
+install is reachable with `--history copilot-vscode=PATH`.
 
 All inputs are optional (`--no-git`, `--no-ai`, `--provider`, and
 `--exclude-provider`). Missing default histories are silently skipped; a
@@ -693,9 +727,18 @@ The config file holds `source_roots`, `categories`, `category_mode`, and
 to the index as `update-check.json` (`WORKSTATS_UPDATE_CACHE` overrides its
 path); it contains only a version string and a timestamp.
 
-Copilot CLI and OpenCode are marked best-effort because their vendors may evolve
-the internal event/database schema. The readers check tables and fields before
-querying, stay read-only, and degrade to diagnostics instead of guessing.
+Copilot and OpenCode are marked best-effort because their vendors may evolve the
+internal event/database/document schema. The readers check tables and fields
+before querying, stay read-only, and degrade to diagnostics instead of guessing:
+a chat session in a format newer than the parser knows is reported and skipped
+rather than guessed at.
+
+A Copilot CLI session whose event log never recorded a working directory takes
+one from `session-store.db`, so it is attributed to the repository it actually
+ran in instead of to the transcript directory. A directory the event log did
+record always wins, and a `repository` in the store that disagrees with the
+directory is reported as a diagnostic naming both rather than silently
+preferred.
 
 Token usage (input, output, cache-read, cache-creation) is read from Claude
 Code and Codex transcripts directly and from Copilot's end-of-session summary.
@@ -720,6 +763,21 @@ Three shortcuts exist for the groupings people ask for most: `--by-repo`
 (`--group-by cwd`). They are mutually exclusive with each other and with an
 explicit `--group-by`, and combining them is an error rather than one of them
 silently winning.
+
+`--month` and `--year` narrow the window a report covers, exactly as `--since`
+and `--until` do. `--month 2026-07` and `--year 2026` name one outright; both
+also accept `current` (or `this`) and `last` (or `previous`), resolved against
+the local calendar. They cannot be combined with each other or with
+`--since`/`--until`.
+
+They are filters, not groupings. `--group-by` and `--period` decide how the rows
+*inside* that window are split, so the two compose rather than compete.
+
+```bash
+workstats --month last                     # the previous calendar month
+workstats --month 2026-07 --group-by repo  # July, one row per repository
+workstats --year 2026 --period month       # 2026, with a month column per row
+```
 
 `--depth N` (default 4) bounds Git repository discovery below the scan root.
 `--no-ignore` includes the generated and vendor paths — `node_modules/`,
@@ -777,10 +835,12 @@ releases nothing. [`cratis/release-action`](https://github.com/Cratis/release-ac
 works out the version and cuts the GitHub release, then the release workflow
 builds six native artifacts from it, executes every runnable binary, generates
 SHA-256 checksums, and attaches them—no repository secrets required for the
-binaries. A configured `HOMEBREW_TAP_DEPLOY_KEY` additionally publishes the
-release to a Homebrew tap; when it is absent the step is skipped with a warning
-annotation, and it fails the release outright if this README advertises a tap
-that is not configured.
+binaries. The `HOMEBREW_TAP_DEPLOY_KEY` secret then publishes the formula to
+[`woksin/homebrew-workstats`](https://github.com/woksin/homebrew-workstats) —
+the tap the Homebrew instructions above install from — and the job reads the
+formula back afterwards to confirm it names the version just released. Without
+that secret the step is skipped with a warning annotation, or fails the release
+outright if this README advertises a tap that is not configured.
 
 ## License
 

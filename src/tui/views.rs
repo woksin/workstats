@@ -30,6 +30,7 @@ use ratatui::widgets::{
 use super::app::App;
 use super::diff::{DiffKind, DiffView};
 use super::state::{Column, Entry, KEYBINDINGS, LevelKind, Mode, SavedView, Sort};
+use crate::output::is_direction_override;
 
 /// The selection marker and the width `Table` reserves for it. Reserving it
 /// always keeps the columns from jumping sideways when a selection appears.
@@ -892,13 +893,18 @@ fn draw_save_view(frame: &mut Frame, area: Rect, app: &App) {
 
 // ---- text ------------------------------------------------------------------
 
-/// Control characters are replaced before anything is drawn: a Git path or a
-/// diff line is text this tool did not choose, and an escape sequence in one
-/// would otherwise be handed straight to the terminal.
+/// Control characters and direction overrides are replaced before anything is
+/// drawn: a Git path or a diff line is text this tool did not choose, an escape
+/// sequence in one would otherwise be handed straight to the terminal, and an
+/// override would reorder the cells around it so a row reads as a repository or
+/// a file it is not. The diff pane's `clip` refuses the same two classes.
+///
+/// Each replacement is one character wide, so the widths the caller counts
+/// still match the cells the terminal draws.
 fn safe_chars(text: &str) -> Vec<char> {
     text.chars()
         .map(|character| {
-            if character.is_control() {
+            if character.is_control() || is_direction_override(character) {
                 '·'
             } else {
                 character
@@ -1161,6 +1167,25 @@ mod tests {
             safe_chars("s\u{7}e"),
             "a bell is not a glyph"
         );
+    }
+
+    #[test]
+    fn a_row_cannot_reorder_itself() {
+        // U+202E would draw the rest of the row right-to-left, so a file named
+        // `gnp.exe` could sit in the explorer looking like `exe.png`.
+        assert_eq!(vec!['a', '·', 'b'], safe_chars("a\u{202e}b"));
+        assert_eq!(
+            "path·to·file·",
+            shorten("path\u{202e}to\u{2066}file\u{202c}", 20)
+        );
+        // One character in, one cell out: the override does not buy extra room.
+        assert_eq!("…c/d·e", shorten_path("a/b/c/d\u{202e}e", 6));
+        // U+200F opens no directional scope, so it cannot reorder the row, and
+        // it is ordinary content in a Hebrew directory name. Escaped rather
+        // than written literally so that this file carries no invisible
+        // characters of its own.
+        let hebrew = "~/\u{5de}\u{5e1}\u{5de}\u{5db}\u{5d9}\u{5dd}\u{200f}/log";
+        assert_eq!(hebrew, shorten(hebrew, 20));
     }
 
     #[test]

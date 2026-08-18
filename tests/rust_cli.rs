@@ -135,6 +135,7 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
         .collect();
     assert!(ids.contains(&"gemini"));
     assert!(ids.contains(&"copilot"));
+    assert!(ids.contains(&"copilot-vscode"));
     assert!(ids.contains(&"opencode"));
     assert!(ids.contains(&"events"));
 
@@ -166,6 +167,10 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
         "cursor",
         "--events",
         events.to_str().unwrap(),
+        // --events adds to the log `workstats record` writes rather than
+        // replacing it, so without this the developer's own recorded sessions
+        // reach these counts on a machine that has ever run `workstats record`.
+        "--no-default-events",
         "--no-cache",
         "--no-progress",
         "--format",
@@ -336,6 +341,7 @@ fn a_filter_matching_only_a_nested_session_directory_still_finds_the_commits() {
         "fixture",
         "--events",
         events.to_str().unwrap(),
+        "--no-default-events",
         "--no-cache",
         "--no-progress",
         "--format",
@@ -411,6 +417,7 @@ fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
         "fixture",
         "--events",
         events.to_str().unwrap(),
+        "--no-default-events",
         "--no-cache",
         "--no-progress",
         "--format",
