@@ -12,6 +12,18 @@ tag are the generated list of pull requests.
 
 ## [Unreleased]
 
+### Fixed
+
+- Generated and vendor directories at the repository root — `node_modules/`,
+  `dist/`, `build/`, `bin/`, `vendor/`, and the rest — are ignored again. Git
+  reports repository-relative paths, so a top-level directory had nothing
+  before the first slash and escaped every `*/directory/*` rule, inflating
+  additions, deletions, file counts, and work composition. Only nested copies
+  were being ignored. The same root anchoring now applies to
+  `--path-exclude` patterns written in that shape.
+
+## 1.0.0 — 2026-08-18
+
 ### Removed
 
 - **Breaking:** the `gitstats` alias and every remnant of it — the installed
@@ -19,6 +31,8 @@ tag are the generated list of pull requests.
   `WORKSTATS_LEGACY_ENTRYPOINT`, and the `GITSTATS_DIR` / `GITSTATS_AUTHOR`
   environment fallbacks. Use `workstats`, `WORKSTATS_DIR`, and
   `WORKSTATS_AUTHOR` instead.
+
+## 0.8.0 — 2026-08-18
 
 ### Added
 
@@ -35,6 +49,11 @@ tag are the generated list of pull requests.
   commits in the same repository within one `--human-idle` window. Sessions in
   repositories Git did not scan are excluded from both sides, so the remainder
   genuinely reflects reading, review, and uncommitted work.
+
+## 0.7.0 — 2026-08-17
+
+### Added
+
 - Token usage tracking (input, output, cache-read, cache-creation) for Claude
   Code, Codex, GitHub Copilot CLI, and Gemini CLI, grouped by the existing
   `root`, `repo`, `cwd`, `provider`, `model`, `day`, and `month` dimensions. A

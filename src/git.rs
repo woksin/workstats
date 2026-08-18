@@ -420,15 +420,19 @@ fn compile_globs(patterns: &[String]) -> Result<Option<GlobSet>, globset::Error>
     }
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(
-            GlobBuilder::new(pattern)
-                .literal_separator(false)
-                .backslash_escape(true)
-                .build()?,
-        );
+        let mut variants = vec![pattern.clone()];
         if !pattern.starts_with('/') {
+            variants.push(format!("/{pattern}"));
+        }
+        // `*/node_modules/*` needs something before the slash, but Git reports
+        // repository-relative paths — so a top-level `node_modules/` has
+        // nothing there and would escape the rule. Anchor it at the root too.
+        if let Some(rooted) = pattern.strip_prefix("*/") {
+            variants.push(rooted.to_string());
+        }
+        for variant in variants {
             builder.add(
-                GlobBuilder::new(&format!("/{pattern}"))
+                GlobBuilder::new(&variant)
                     .literal_separator(false)
                     .backslash_escape(true)
                     .build()?,
@@ -524,6 +528,31 @@ mod tests {
             false,
         );
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn generated_directories_are_ignored_at_the_repository_root_too() {
+        let patterns: Vec<String> = DEFAULT_IGNORES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        let globs = compile_globs(&patterns).unwrap().unwrap();
+
+        // Git reports repository-relative paths, so these have nothing before
+        // the first slash and used to escape every `*/directory/*` rule.
+        assert!(globs.is_match("node_modules/react/index.js"));
+        assert!(globs.is_match("dist/bundle.js"));
+        assert!(globs.is_match("bin/workstats"));
+        assert!(globs.is_match("vendor/library.go"));
+
+        // Nested matches keep working.
+        assert!(globs.is_match("packages/web/node_modules/react/index.js"));
+        assert!(globs.is_match("services/api/dist/bundle.js"));
+
+        // Real source is still counted, including lookalike directory names.
+        assert!(!globs.is_match("src/app.js"));
+        assert!(!globs.is_match("src/bindings/mod.rs"));
+        assert!(!globs.is_match("distribution/notes.md"));
     }
 
     #[test]
