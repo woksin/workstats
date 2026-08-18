@@ -147,6 +147,28 @@ tag are the generated list of pull requests.
 
 ### Fixed
 
+- **The explorer's column headings read as headings again.** Every one of them
+  carried its sort key as a bare leading digit — `1 Repository`, `2 Source
+  root` — which reads as part of the title rather than as a key, and the column
+  the rows were sorted by showed an arrow *instead of* its number, so the row of
+  headings looked like `1 2 _ 4 5` and appeared to have lost one. The digits are
+  gone from the table. `1`–`9` still sort by column; the `?` overlay now lists
+  them beside the columns of the level actually on screen, which is something a
+  fixed line of help text cannot do, because every level has a different table.
+- Figures in `workstats ui` separate thousands the way the printed report does:
+  `12,205`, not `12 205`. The explorer grouped with a space, so one count was
+  spelled two ways depending on where it was read, and inside a table whose
+  columns are themselves separated by spaces, a narrow column of `1 048` reads
+  as two values rather than one.
+- Explorer columns are as wide as what is in them. Widths were declared per
+  column, with one column left to take whatever space remained, so `Repository`
+  stretched across a wide terminal and pushed the `Source root` beside it half a
+  screen from the name it belongs to, while a long path elsewhere was clipped on
+  a terminal with room to spare. Each column is now measured from the rows it is
+  given, and room that nothing needs is left empty instead of being spent on one
+  column. A column that still does not fit is dropped rather than squeezed, as
+  before, and the status bar names the sorted column when it has gone off
+  screen.
 - **A whole Copilot Chat session was being dropped for exceeding a stale size
   ceiling.** The VS Code chat parser refused any session over 16 MiB, a limit
   set when the largest session anyone had seen was 6.4 MB. Sessions grow with

@@ -315,17 +315,19 @@ breadcrumb, because "when else did this change?" is the next question. Pressing
 
 | Key | Does |
 |---|---|
-| `↑` `↓` / `k` `j`, `PgUp` `PgDn`, `Home` `End` | move the selection |
+| `↑` `↓` / `k` `j` | move the selection |
+| `PgUp` `PgDn` / `Ctrl-b` `Ctrl-f` / `Space` | move by a screen |
+| `Home` `End` / `g` `G` | first / last row |
 | `Enter` / `→` / `l` | descend into the selected row |
 | `Esc` | close an overlay, then clear the filter, then go up one level |
 | `Backspace` / `←` / `h` | go up one level |
 | `/` | filter the current level as you type |
 | `s` | fuzzy search repositories, files, and commits |
-| `1`–`9` | sort by that column; press again to reverse |
+| `1`–`9` | sort by that column, numbered in `?` for the level on screen; press again to reverse |
 | `[` `]` / `o` | previous / next sort column; reverse the order |
 | `p` | switch the period between month and day |
-| `w` / `v` / `d` | save the current view / open saved views / delete the highlighted one |
-| `?` | show or hide the key map |
+| `w` / `v` / `d` | save the current view / open saved views / delete the highlighted one in that list |
+| `?` | show or hide the key map and this level's sort keys |
 | `q` / `Ctrl-C` | quit |
 
 Search is fuzzy and ranked, over repository names, every changed file path, and

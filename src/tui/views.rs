@@ -30,17 +30,18 @@ use ratatui::widgets::{
 use super::app::App;
 use super::diff::{DiffKind, DiffView};
 use super::state::{Column, Entry, KEYBINDINGS, LevelKind, Mode, SavedView, Sort};
-use crate::output::is_direction_override;
+use crate::output::{is_direction_override, number};
 
 /// The selection marker and the width `Table` reserves for it. Reserving it
 /// always keeps the columns from jumping sideways when a selection appears.
 const MARKER: &str = "› ";
 const MARKER_WIDTH: u16 = 2;
-/// `Table`'s own default, repeated here so `column_widths` resolves the same
-/// layout the widget will.
+/// `Table`'s own default, repeated here because `column_widths` has to leave
+/// room for the gap the widget draws between two columns.
 const COLUMN_SPACING: u16 = 1;
-/// A fill column has no natural width. Below this it stops carrying a readable
-/// path, so the column is dropped rather than shown as a stub.
+/// The narrowest a text column is allowed to become. Below this it stops
+/// carrying a readable path, so the column is dropped rather than shown as a
+/// stub.
 const FILL_FLOOR: u16 = 12;
 /// A header and two rows. The body is served before any chrome is.
 const BODY_FLOOR: u16 = 3;
@@ -271,19 +272,19 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &mut App) {
 /// Built apart from `draw_table` so the widget can be exercised at every
 /// terminal width without standing up an `App`.
 fn table(columns: &[Column], rows: &[Entry], sort: Sort, width: u16) -> Table<'static> {
-    let columns = &columns[..visible_columns(columns, width)];
-    let widths = column_widths(width, columns);
+    // Every width is resolved here, so `Table` is handed lengths that already
+    // fit and a cell can be shortened to the room it will actually get instead
+    // of being cut mid-word by the widget.
+    let widths = column_widths(columns, rows, width);
+    let columns = &columns[..widths.len()];
     let titles: Vec<Cell<'static>> = columns
         .iter()
         .enumerate()
         .map(|(index, column)| {
             let sorted = (index == sort.column).then_some(sort.descending);
             let room = widths.get(index).copied().unwrap_or(0) as usize;
-            Cell::from(aligned(
-                header_text(column, index, sorted, room),
-                column.numeric,
-            ))
-            .style(if sorted.is_some() { SORTED } else { HEAD })
+            Cell::from(aligned(header_text(column, sorted, room), column.numeric))
+                .style(if sorted.is_some() { SORTED } else { HEAD })
         })
         .collect();
     let header = Row::new(titles);
@@ -291,7 +292,7 @@ fn table(columns: &[Column], rows: &[Entry], sort: Sort, width: u16) -> Table<'s
         .iter()
         .map(|entry| body_row(entry, columns, &widths))
         .collect();
-    Table::new(body, columns.iter().map(constraint).collect::<Vec<_>>())
+    Table::new(body, widths.iter().map(|width| Constraint::Length(*width)))
         .header(header)
         .column_spacing(COLUMN_SPACING)
         .row_highlight_style(SELECTED)
@@ -320,86 +321,117 @@ fn aligned(text: String, numeric: bool) -> Line<'static> {
     if numeric { line.right_aligned() } else { line }
 }
 
-/// The column header: its number, because `1`–`9` are what select it, and an
-/// arrow on the one the rows are sorted by. The number is the first thing
-/// dropped when the column is too narrow for all three.
-fn header_text(column: &Column, index: usize, sorted: Option<bool>, width: usize) -> String {
+/// The column header: its title, and an arrow on the one the rows are sorted
+/// by. It carries no sort key: `1`–`9` still select a column, but a bare digit
+/// in front of every title reads as part of the title — and the sorted column,
+/// which shows an arrow instead, made the row look like `1 2 _ 4 5`. The key
+/// map is spelled out in the `?` overlay, beside the column each key sorts.
+fn header_text(column: &Column, sorted: Option<bool>, width: usize) -> String {
     let arrow = match sorted {
         Some(true) => " ▼",
         Some(false) => " ▲",
         None => "",
     };
-    let number = if index < 9 {
-        format!("{} ", index + 1)
-    } else {
-        String::new()
-    };
     let title = column.title;
-    if number.chars().count() + title.chars().count() + arrow.chars().count() <= width {
-        format!("{number}{title}{arrow}")
-    } else if title.chars().count() + arrow.chars().count() <= width {
+    if title.chars().count() + arrow.chars().count() <= width {
         format!("{title}{arrow}")
     } else {
         shorten(title, width)
     }
 }
 
-/// How many columns fit. Trailing columns are dropped rather than squeezed —
-/// half a number is worse than no number — and the status bar still names the
-/// column the rows are sorted by when it has gone off screen.
-fn visible_columns(columns: &[Column], width: u16) -> usize {
-    if columns.is_empty() {
-        return 0;
-    }
-    let mut used = MARKER_WIDTH;
-    let mut visible = 0;
-    for column in columns {
-        let needed = if column.width == 0 {
-            FILL_FLOOR
-        } else {
-            column.width
-        };
-        let next = used.saturating_add(needed).saturating_add(if visible == 0 {
-            0
-        } else {
-            COLUMN_SPACING
-        });
-        if visible > 0 && next > width {
-            break;
-        }
-        used = next;
-        visible += 1;
-    }
-    // The first column carries the row's identity, so it is shown even on a
-    // terminal too narrow for it and left to the widget to clip.
-    visible.max(1)
-}
+/// Room for the ` ▼` a sorted column carries. Reserved on every column, not
+/// only the sorted one, so that changing the sort does not shuffle the whole
+/// table sideways.
+const ARROW_WIDTH: u16 = 2;
 
-/// Resolves the widths `Table` will use internally, so a cell can be shortened
-/// to the room it will actually get instead of being cut mid-word by the
-/// widget. It mirrors `Table::get_column_widths`: the selection column first,
-/// then the constraints with the same spacing.
-fn column_widths(width: u16, columns: &[Column]) -> Vec<u16> {
-    if columns.is_empty() {
-        return Vec::new();
-    }
-    let [_marker, rest] =
-        Layout::horizontal([Constraint::Length(MARKER_WIDTH), Constraint::Fill(0)])
-            .areas(Rect::new(0, 0, width, 1));
-    Layout::horizontal(columns.iter().map(constraint).collect::<Vec<_>>())
-        .spacing(COLUMN_SPACING)
-        .split(rest)
+/// The widths every column would like: enough for its title plus the sort
+/// arrow, and enough for the widest value actually under it.
+///
+/// Measured from the rows rather than declared in the schema, because a
+/// declared width is wrong in both directions — it clips the longest path on a
+/// wide terminal, and it left `Repository` stretched across half the screen
+/// beside three short names. Measuring every row rather than the visible ones
+/// keeps the width steady while the reader scrolls; it does move when a filter
+/// changes which rows exist, which is the one moment a reader expects the table
+/// to redraw anyway.
+fn wanted_widths(columns: &[Column], rows: &[Entry]) -> Vec<u16> {
+    columns
         .iter()
-        .map(|rect| rect.width)
+        .enumerate()
+        .map(|(index, column)| {
+            let title = cells(column.title.chars().count()).saturating_add(ARROW_WIDTH);
+            rows.iter()
+                .filter_map(|row| row.fields.get(index))
+                .map(|field| cells(field.text.chars().count()))
+                .fold(title, u16::max)
+        })
         .collect()
 }
 
-const fn constraint(column: &Column) -> Constraint {
-    if column.width == 0 {
-        Constraint::Fill(1)
-    } else {
-        Constraint::Length(column.width)
+/// What a column shrinks to before it is dropped instead. A number keeps its
+/// full width — half a number is worse than no number — so only text gives
+/// ground, and only down to the point where a path still identifies something.
+fn floor_widths(columns: &[Column], wanted: &[u16]) -> Vec<u16> {
+    columns
+        .iter()
+        .zip(wanted)
+        .map(|(column, wanted)| {
+            if column.numeric {
+                *wanted
+            } else {
+                (*wanted).min(FILL_FLOOR)
+            }
+        })
+        .collect()
+}
+
+/// The resolved width of every column that fits, in order; its length is how
+/// many columns are shown. Trailing columns are dropped rather than squeezed,
+/// and the status bar still names the column the rows are sorted by when it has
+/// gone off screen.
+///
+/// Whatever room is left over after every column has what its content needs is
+/// simply not spent. Handing it to one column is what pushed `Source root` half
+/// a screen away from the repository it belongs to; a table that ends before
+/// the right edge keeps figures that are read together next to each other.
+fn column_widths(columns: &[Column], rows: &[Entry], width: u16) -> Vec<u16> {
+    if columns.is_empty() {
+        return Vec::new();
     }
+    let wanted = wanted_widths(columns, rows);
+    let floors = floor_widths(columns, &wanted);
+    let room = width.saturating_sub(MARKER_WIDTH);
+
+    // How many columns fit at the width below which they stop being worth
+    // showing.
+    let mut widths: Vec<u16> = Vec::with_capacity(columns.len());
+    let mut used: u16 = 0;
+    for floor in &floors {
+        let gap = if widths.is_empty() { 0 } else { COLUMN_SPACING };
+        let next = used.saturating_add(gap).saturating_add(*floor);
+        if !widths.is_empty() && next > room {
+            break;
+        }
+        used = next;
+        widths.push(*floor);
+    }
+    // The first column carries the row's identity, so it is shown even on a
+    // terminal too narrow for it — clipped to whatever room there is.
+    if widths[0] > room {
+        widths[0] = room;
+        used = room;
+    }
+
+    // Then spend what is left widening the text columns towards their content,
+    // left to right: the leftmost is the one that names the row.
+    let mut spare = room.saturating_sub(used);
+    for (index, width) in widths.iter_mut().enumerate() {
+        let grow = wanted[index].saturating_sub(*width).min(spare);
+        *width += grow;
+        spare -= grow;
+    }
+    widths
 }
 
 /// A level with nothing in it says why. A blank panel reads as a bug, and the
@@ -626,7 +658,7 @@ fn draw_overlays(frame: &mut Frame, area: Rect, app: &App) {
     }
     // Help sits on top of everything else: it is what a lost reader reaches for.
     if app.help_visible() {
-        draw_help(frame, area);
+        draw_help(frame, area, app.columns());
     }
 }
 
@@ -645,26 +677,17 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, footer: &str) -> Rect {
     inner
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+/// The gap between the key list and the sort keys beside it.
+const HELP_GAP: u16 = 3;
+
+fn draw_help(frame: &mut Frame, area: Rect, columns: &[Column]) {
     let keys = KEYBINDINGS
         .iter()
         .map(|(key, _)| key.chars().count())
         .max()
         .unwrap_or(0);
-    let widest = KEYBINDINGS
-        .iter()
-        .map(|(key, description)| key.chars().count() + description.chars().count())
-        .max()
-        .unwrap_or(0);
-    let outer = overlay(area, cells(widest + 6), cells(KEYBINDINGS.len() + 2));
-    let inner = panel(frame, outer, "Keys", "? or Esc closes");
-    if inner.is_empty() {
-        return;
-    }
-    let rows = inner.height as usize;
     let mut lines: Vec<Line<'static>> = KEYBINDINGS
         .iter()
-        .take(rows)
         .map(|(key, description)| {
             Line::from(vec![
                 Span::styled(format!("{key:<keys$}"), ACCENT),
@@ -673,14 +696,84 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             ])
         })
         .collect();
+    // Measured from the lines themselves rather than estimated: the widest key
+    // and the longest description are on different rows, and a panel sized for
+    // their sum clipped the end of the longest sentence in it.
+    let sorts = sort_key_lines(columns);
+    let left_width = widest_line(&lines);
+    let right_width = widest_line(&sorts);
+    let beside = if right_width == 0 {
+        0
+    } else {
+        HELP_GAP + right_width
+    };
+    // 2 borders and the block's own horizontal padding.
+    let outer = overlay(
+        area,
+        left_width.saturating_add(beside).saturating_add(4),
+        cells(KEYBINDINGS.len() + 2),
+    );
+    let inner = panel(frame, outer, "Keys", "? or Esc closes");
+    if inner.is_empty() {
+        return;
+    }
+    // On a terminal too narrow for both, the sort keys go rather than the
+    // sentences: they are a reminder of what the key list already says, and half
+    // a sentence beside a full list of columns helps nobody.
+    let beside = (inner.width >= left_width.saturating_add(beside)).then_some(right_width);
+    let [left, right] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(beside.unwrap_or(0))])
+            .spacing(if beside.is_some() { HELP_GAP } else { 0 })
+            .areas(inner);
     // Spend the last visible row on saying that there is more rather than
     // letting the list end without a word.
+    let rows = left.height as usize;
+    lines.truncate(rows);
     if KEYBINDINGS.len() > rows
         && let Some(last) = lines.last_mut()
     {
         *last = Line::styled(format!("… {} more", KEYBINDINGS.len() - rows + 1), DIM);
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines), left);
+    if beside.is_some() {
+        frame.render_widget(Paragraph::new(sorts), right);
+    }
+}
+
+/// The `1`–`9` keys written against the columns they sort at this level.
+///
+/// This is where the digits live now. In the header they read as part of the
+/// column title and told a reader who had never pressed `?` nothing at all;
+/// here they sit under the sentence that explains them, and they can name the
+/// columns of the level actually on screen — which a fixed `1 – 9` line cannot,
+/// because every level has a different table.
+fn sort_key_lines(columns: &[Column]) -> Vec<Line<'static>> {
+    if columns.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::styled("Sort keys", HEAD)];
+    // Past nine there is no key to press, so there is nothing to list.
+    lines.extend(columns.iter().take(9).enumerate().map(|(index, column)| {
+        Line::from(vec![
+            Span::styled(format!("{}  ", index + 1), ACCENT),
+            Span::styled(column.title, PLAIN),
+        ])
+    }));
+    lines
+}
+
+fn widest_line(lines: &[Line<'static>]) -> u16 {
+    lines
+        .iter()
+        .map(|line| {
+            cells(
+                line.iter()
+                    .map(|span| span.content.chars().count())
+                    .sum::<usize>(),
+            )
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn draw_views(frame: &mut Frame, area: Rect, app: &App) {
@@ -989,20 +1082,6 @@ const fn one_row(level: LevelKind) -> &'static str {
     }
 }
 
-/// Thousands separated the way `src/output.rs` separates them, so a count read
-/// in the explorer and the same count read in the printed table look alike.
-fn number(value: u64) -> String {
-    let digits = value.to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
-    for (position, digit) in digits.chars().enumerate() {
-        if position > 0 && (digits.len() - position).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
-}
-
 /// A `u16` is the unit of a terminal; anything that does not fit in one is
 /// already wider than any screen.
 fn cells(value: usize) -> u16 {
@@ -1015,7 +1094,50 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::tui::state::{Field, columns};
+    use crate::tui::app::app_for_test;
+    use crate::tui::event::Action;
+    use crate::tui::state::{Dataset, Field, columns, sample_commit};
+
+    /// Three short repository names and figures worth grouping: the shape of
+    /// the report the explorer looked broken on. Rendering it is the only way
+    /// to see what a reader sees, because `workstats ui` needs a real terminal.
+    fn wide_app() -> (App, tempfile::TempDir) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut data = Dataset::from_commits(vec![
+            sample_commit(
+                "aaaaaaaaaaaa",
+                "/repos/workstats",
+                &[("src/main.rs", 12_205, 3_477), ("README.md", 1_048, 96)],
+            ),
+            sample_commit("bbbbbbbbbbbb", "/repos/widget", &[("src/lib.rs", 640, 210)]),
+            sample_commit("cccccccccccc", "/repos/gadget", &[("tests/api.rs", 88, 4)]),
+        ]);
+        data.summary = vec![
+            (
+                "Observed".to_string(),
+                "2026-01-04 → 2026-08-18".to_string(),
+            ),
+            ("Commits".to_string(), number(1_048_u64)),
+            ("Tokens".to_string(), number(60_471_298_552_u64)),
+        ];
+        let app = app_for_test(data, directory.path().join("views.json"));
+        (app, directory)
+    }
+
+    /// The whole screen as text, row by row, with the trailing blanks trimmed.
+    fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| draw(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                let row: String = (0..width)
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol().to_string()))
+                    .collect();
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
 
     fn entries(width: usize, count: usize) -> Vec<Entry> {
         (0..count)
@@ -1095,13 +1217,15 @@ mod tests {
     #[test]
     fn the_help_overlay_is_clipped_rather_than_overflowing() {
         for (width, height) in [(1_u16, 1_u16), (6, 3), (20, 6), (40, 12), (120, 40)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal
-                .draw(|frame| {
-                    let area = frame.area();
-                    draw_help(frame, area);
-                })
-                .unwrap();
+            for schema in [columns(LevelKind::Overview), columns(LevelKind::Diff)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        draw_help(frame, area, schema);
+                    })
+                    .unwrap();
+            }
         }
     }
 
@@ -1129,13 +1253,14 @@ mod tests {
     #[test]
     fn columns_are_dropped_from_the_right_and_the_first_one_always_stays() {
         let schema = columns(LevelKind::Overview);
-        assert_eq!(schema.len(), visible_columns(schema, 200));
-        assert_eq!(1, visible_columns(schema, 1));
-        assert_eq!(0, visible_columns(&[], 80));
+        let rows = entries(schema.len(), 4);
+        assert_eq!(schema.len(), column_widths(schema, &rows, 400).len());
+        assert_eq!(1, column_widths(schema, &rows, 1).len());
+        assert!(column_widths(&[], &rows, 80).is_empty());
         // Narrowing never adds a column back.
         let mut previous = schema.len();
-        for width in (1..200_u16).rev() {
-            let visible = visible_columns(schema, width);
+        for width in (1..400_u16).rev() {
+            let visible = column_widths(schema, &rows, width).len();
             assert!(visible <= previous, "width {width}");
             previous = visible;
         }
@@ -1143,34 +1268,75 @@ mod tests {
 
     #[test]
     fn resolved_column_widths_never_exceed_the_area() {
-        let schema = columns(LevelKind::Overview);
-        for width in 1..200_u16 {
-            let visible = visible_columns(schema, width);
-            let widths = column_widths(width, &schema[..visible]);
-            assert_eq!(visible, widths.len(), "width {width}");
-            // Everything the columns claim has to fit in what is left after the
-            // selection marker, or a cell would be shortened to a width the
-            // widget never gives it.
-            let claimed: u32 = widths.iter().map(|value| u32::from(*value)).sum::<u32>()
-                + u32::from(COLUMN_SPACING) * visible.saturating_sub(1) as u32;
-            let room = u32::from(width.saturating_sub(MARKER_WIDTH));
-            assert!(claimed <= room, "width {width}: {widths:?}");
+        for kind in [LevelKind::Overview, LevelKind::Category, LevelKind::Commit] {
+            let schema = columns(kind);
+            let rows = entries(schema.len(), 4);
+            for width in 1..400_u16 {
+                let widths = column_widths(schema, &rows, width);
+                // Everything the columns claim has to fit in what is left after
+                // the selection marker, or a cell would be shortened to a width
+                // the widget never gives it.
+                let claimed: u32 = widths.iter().map(|value| u32::from(*value)).sum::<u32>()
+                    + u32::from(COLUMN_SPACING) * widths.len().saturating_sub(1) as u32;
+                let room = u32::from(width.saturating_sub(MARKER_WIDTH));
+                assert!(claimed <= room, "{kind:?} at width {width}: {widths:?}");
+            }
         }
     }
 
+    /// A column is as wide as the widest thing it has to show and no wider.
+    /// `Repository` stretched to half a wide terminal beside three short names
+    /// is the defect this measures against.
     #[test]
-    fn a_header_gives_up_its_number_before_its_arrow() {
+    fn a_column_is_as_wide_as_its_content_and_leftover_room_is_left_alone() {
+        let schema = columns(LevelKind::Overview);
+        let rows = vec![Entry {
+            id: "workstats".to_string(),
+            fields: vec![
+                Field::text("workstats"),
+                Field::text("studio"),
+                Field::count(3),
+                Field::count(12),
+                Field::count(12_205),
+                Field::count(3_477),
+                Field::lines(8_728),
+                Field::hours(0.0),
+                Field::hours(0.0),
+            ],
+        }];
+        let widths = column_widths(schema, &rows, 200);
+        assert_eq!(schema.len(), widths.len());
+        // Title plus room for the sort arrow, because every value under these
+        // is shorter than the title above it.
+        assert_eq!(vec![12, 13, 9, 7, 7, 9, 6, 6, 9], widths);
+        // The table therefore ends well before the right edge instead of
+        // pushing `Source root` half a screen away from the repository.
+        let used: u16 =
+            widths.iter().sum::<u16>() + COLUMN_SPACING * (widths.len() as u16 - 1) + MARKER_WIDTH;
+        assert!(used < 100, "{used} of 200 cells");
+
+        // A longer value widens its own column, and only its own.
+        let mut wider = rows.clone();
+        wider[0].fields[0] = Field::text("a-considerably-longer-repository");
+        let widths = column_widths(schema, &wider, 200);
+        assert_eq!(32, widths[0]);
+        assert_eq!(13, widths[1]);
+    }
+
+    #[test]
+    fn a_header_shows_its_title_and_the_sort_arrow() {
         let column = Column {
             title: "Commits",
-            width: 9,
             numeric: true,
         };
-        assert_eq!("3 Commits", header_text(&column, 2, None, 9));
-        assert_eq!("Commits ▼", header_text(&column, 2, Some(true), 9));
-        assert_eq!("3 Commits ▲", header_text(&column, 2, Some(false), 11));
-        assert_eq!("Commi…", header_text(&column, 2, Some(true), 6));
-        // Past nine there is no key to press, so there is no number to show.
-        assert_eq!("Commits", header_text(&column, 9, None, 20));
+        // No sort key in front of it: a bare digit reads as part of the title,
+        // and the sorted column could not show one at all.
+        assert_eq!("Commits", header_text(&column, None, 9));
+        assert_eq!("Commits ▼", header_text(&column, Some(true), 9));
+        assert_eq!("Commits ▲", header_text(&column, Some(false), 11));
+        // Too narrow for the arrow, so the title keeps the room.
+        assert_eq!("Commits", header_text(&column, Some(true), 8));
+        assert_eq!("Commi…", header_text(&column, Some(true), 6));
     }
 
     #[test]
@@ -1308,6 +1474,9 @@ mod tests {
         assert!(highlight("anything", &[0], 0).is_empty());
     }
 
+    /// The status bar, the diff position and the search hit count all go
+    /// through `output::number`, which is the printed report's own formatter —
+    /// so there is no second spelling of a count left to drift.
     #[test]
     fn counts_are_grouped_the_way_the_printed_table_groups_them() {
         assert_eq!("1,234,567", number(1_234_567));
@@ -1347,5 +1516,126 @@ mod tests {
         assert_ne!(diff_style(DiffKind::Added), diff_style(DiffKind::Removed));
         assert_ne!(diff_style(DiffKind::Hunk), diff_style(DiffKind::Context));
         assert_eq!(PLAIN, diff_style(DiffKind::Context));
+    }
+
+    /// What a reader on a wide terminal actually sees. Written against the
+    /// rendered cells rather than the pieces that build them, because every one
+    /// of the defects this guards against — sort digits reading as part of a
+    /// title, a space inside a number reading as a column gap, one column
+    /// stretched across half the screen — was invisible until the whole frame
+    /// was on screen at once.
+    #[test]
+    fn the_overview_reads_as_a_table_on_a_wide_terminal() {
+        let (mut app, _directory) = wide_app();
+        let screen = screen(&mut app, 200, 50);
+
+        // No sort key in front of a title, and so no apparent gap where the
+        // sorted column's key used to be replaced by an arrow.
+        let header = &screen[2];
+        assert_eq!(
+            "  Repository   Source root   Commits ▼   Files   Added   Removed    Net   AI h   Human h",
+            header
+        );
+        assert!(
+            !header.chars().any(|character| character.is_ascii_digit()),
+            "{header}"
+        );
+
+        // Thousands separated with a comma, the way the printed report
+        // separates them. A space here would be indistinguishable from the
+        // space between two columns.
+        assert!(screen[3].contains("13,253"), "{}", screen[3]);
+        assert!(screen[1].contains("Tokens 60,471,298,552"), "{}", screen[1]);
+
+        // Every column is as wide as its content needs, so the table ends long
+        // before the right edge instead of pushing `Source root` away from the
+        // repository it belongs to.
+        assert!(header.chars().count() < 100, "{header}");
+        let gap = header.find("Source root").expect("a second column")
+            - header.find("Repository").expect("a first column")
+            - "Repository".len();
+        assert!(gap <= 4, "{gap} cells between the first two columns");
+
+        // The row count in the footer is a count, and now that no header
+        // carries a digit it can no longer be read as another key hint.
+        assert!(
+            screen[49].starts_with("3 repositories · sort Commits ▼"),
+            "{}",
+            screen[49]
+        );
+    }
+
+    /// The sort keys moved out of the header and into the one place a reader
+    /// goes when they want to know what a key does.
+    #[test]
+    fn the_help_overlay_names_the_column_each_sort_key_selects() {
+        let (mut app, _directory) = wide_app();
+        app.apply(Action::ToggleHelp);
+        let panel = screen(&mut app, 200, 50).join("\n");
+        assert!(panel.contains("Sort keys"), "{panel}");
+        assert!(panel.contains("1  Repository"), "{panel}");
+        assert!(panel.contains("3  Commits"), "{panel}");
+        assert!(panel.contains("9  Human h"), "{panel}");
+        // The panel is sized from the lines it draws, so the longest sentence
+        // in it survives to its full stop.
+        assert!(
+            panel.contains("sort by the numbered column; press again to reverse"),
+            "{panel}"
+        );
+
+        // A level with a different table gets a different list.
+        app.apply(Action::Descend);
+        app.apply(Action::Descend);
+        let panel = screen(&mut app, 200, 50).join("\n");
+        assert!(panel.contains("1  Category"), "{panel}");
+        assert!(panel.contains("6  Share"), "{panel}");
+        assert!(!panel.contains("Repository"), "{panel}");
+    }
+
+    /// The sort keys are the first thing the help panel gives up, because a
+    /// clipped sentence is worse than a missing reminder.
+    #[test]
+    fn a_narrow_help_overlay_keeps_the_sentences_and_drops_the_sort_keys() {
+        let (mut app, _directory) = wide_app();
+        app.apply(Action::ToggleHelp);
+        let panel = screen(&mut app, 60, 30).join("\n");
+        assert!(!panel.contains("Sort keys"), "{panel}");
+        assert!(panel.contains("descend into the selected row"), "{panel}");
+    }
+
+    /// `clip` shortens a cell to the width this module resolved, so a width the
+    /// widget then disagrees with would cut a value in half without an ellipsis
+    /// to say so.
+    #[test]
+    fn the_widths_this_module_resolves_are_the_widths_the_widget_draws() {
+        let schema = columns(LevelKind::Overview);
+        let rows = entries(schema.len(), 3);
+        for width in [40_u16, 80, 120, 200] {
+            let widths = column_widths(schema, &rows, width);
+            let mut terminal = Terminal::new(TestBackend::new(width, 6)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    let widget = table(schema, &rows, Sort::default(), area.width);
+                    let mut state = TableState::new().with_selected(Some(0));
+                    frame.render_stateful_widget(widget, area, &mut state);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            // Cell by cell, not byte by byte: an arrow is three bytes wide and
+            // one column wide, and it is the columns that have to line up.
+            let header: Vec<String> = (0..width)
+                .filter_map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol().to_string()))
+                .collect();
+            // Each title lands inside the cells this module set aside for it.
+            let mut x = MARKER_WIDTH as usize;
+            for (index, resolved) in widths.iter().enumerate() {
+                let sorted = (index == Sort::default().column).then_some(false);
+                let expected = header_text(&schema[index], sorted, *resolved as usize);
+                let drawn: String = header[x..x + *resolved as usize].concat();
+                assert_eq!(expected, drawn.trim(), "width {width}, column {index}");
+                x += *resolved as usize + COLUMN_SPACING as usize;
+            }
+        }
     }
 }

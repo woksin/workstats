@@ -941,7 +941,19 @@ fn counted(value: u64, singular: &str, plural: &str) -> String {
     format!("{} {noun}", number(value))
 }
 
-fn number(value: impl ToString) -> String {
+/// Thousands separated with a comma, for every figure this tool prints or
+/// draws. Shared with `workstats ui` rather than reimplemented there, so the
+/// same count cannot read as `12,205` in the report and `12 205` in the
+/// explorer.
+///
+/// A comma and not a space: the explorer draws its figures in columns that are
+/// themselves separated by spaces, so a space *inside* a number competes with
+/// the column gap and `1 048` in a narrow column reads as two values. A narrow
+/// no-break space is the typographically correct separator, but it is missing
+/// from enough terminal fonts to render as a box or as nothing at all, and a
+/// separator that sometimes disappears is worse than one that is merely
+/// conventional.
+pub fn number(value: impl ToString) -> String {
     let value = value.to_string();
     let mut output = String::new();
     for (index, character) in value.chars().rev().enumerate() {
