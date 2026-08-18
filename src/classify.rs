@@ -174,9 +174,19 @@ const TEST_DIRECTORIES: &[&str] = &[
     "e2e",
     "benches",
     "benchmarks",
+    "given",
 ];
 
-const TEST_STEMS: &[&str] = &["test", "tests", "spec", "specs", "conftest"];
+/// Test-project directory suffixes. .NET splits tests into a sibling project
+/// such as `Arc.Core.Specs/`, so an exact directory name is not enough.
+const TEST_DIRECTORY_SUFFIXES: &[&str] = &[".specs", ".tests", ".test", "-tests", "-specs"];
+
+/// BDD directory prefixes. Cratis-style suites nest subjects and behaviours as
+/// `for_TheSubject/when_something_happens/and_a_detail.cs`, where no path
+/// component is literally named "test".
+const TEST_DIRECTORY_PREFIXES: &[&str] = &["for_", "when_", "given_"];
+
+const TEST_STEMS: &[&str] = &["test", "tests", "spec", "specs", "conftest", "given"];
 
 const TEST_STEM_SUFFIXES: &[&str] = &[
     "_test", "_tests", "-test", "-tests", "_spec", "_specs", "-spec", "-specs",
@@ -313,9 +323,7 @@ pub fn classify(path: &str) -> Category {
     let original_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let original_stem = split_name(original_name).0;
 
-    if directories
-        .iter()
-        .any(|piece| TEST_DIRECTORIES.contains(piece))
+    if directories.iter().any(|piece| is_test_directory(piece))
         || is_test_name(name, stem, original_stem)
     {
         return Category::Test;
@@ -349,10 +357,23 @@ pub fn classify(path: &str) -> Category {
     Category::Other
 }
 
+fn is_test_directory(directory: &str) -> bool {
+    TEST_DIRECTORIES.contains(&directory)
+        || TEST_DIRECTORY_SUFFIXES
+            .iter()
+            .any(|suffix| directory.ends_with(suffix))
+        || TEST_DIRECTORY_PREFIXES
+            .iter()
+            .any(|prefix| directory.starts_with(prefix))
+}
+
 fn is_test_name(name: &str, stem: &str, original_stem: &str) -> bool {
     TEST_STEMS.contains(&stem)
         || name.starts_with("test_")
         || name.starts_with("test-")
+        // A BDD suite names the file after the behaviour under test.
+        || name.starts_with("when_")
+        || name.starts_with("given_")
         || name.contains(".test.")
         || name.contains(".spec.")
         || TEST_STEM_SUFFIXES
@@ -393,6 +414,43 @@ mod tests {
         assert_eq!("config", category("schema/events-v1.schema.json"));
         assert_eq!("assets", category("assets/banner.svg"));
         assert_eq!("other", category("Makefile.custom"));
+    }
+
+    #[test]
+    fn dotnet_spec_projects_and_bdd_folders_count_as_tests() {
+        // Tests living in a sibling project rather than a `tests/` directory.
+        assert_eq!(
+            "test",
+            category("Source/Arc.Core.Specs/for_Thing/when_x.cs")
+        );
+        assert_eq!("test", category("Source/DotNET.Specs/Helpers/Builder.cs"));
+        assert_eq!("test", category("Source/Fundamentals.Tests/Runner.cs"));
+
+        // Behaviour folders that contain no component literally named "test".
+        assert_eq!(
+            "test",
+            category("Integration/Api/for_EventTypes/TestEvent.cs")
+        );
+        assert_eq!(
+            "test",
+            category("Specs/for_Rule/when_analyzing/and_void_is_used.cs")
+        );
+        assert_eq!("test", category("Specs/for_Rule/given/a_rule.cs"));
+        assert_eq!("test", category("Source/Api/when_handling_a_command.cs"));
+
+        // Production code beside them stays source.
+        assert_eq!("source", category("Source/Api/Controller.cs"));
+        assert_eq!("source", category("Source/Arc.Core/Engine.cs"));
+    }
+
+    #[test]
+    fn specification_lookalikes_stay_out_of_the_test_bucket() {
+        // A directory merely containing the word, or a product named for it.
+        assert_eq!("source", category("Source/Forecast/Model.cs"));
+        assert_eq!("source", category("Source/Formatting/Engine.cs"));
+        assert_eq!("source", category("Source/Whenever/Scheduler.cs"));
+        assert_eq!("source", category("src/specular/render.rs"));
+        assert_eq!("source", category("Source/OpenApi.Specification/Doc.cs"));
     }
 
     #[test]

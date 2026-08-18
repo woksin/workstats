@@ -14,6 +14,13 @@ tag are the generated list of pull requests.
 
 ### Fixed
 
+- Tests kept in a sibling project (`Arc.Core.Specs/`, `Fundamentals.Tests/`) or
+  in BDD behaviour folders (`for_Subject/when_something/given/`) are counted as
+  tests instead of source. Directory matching was exact, so `Core.Specs` did
+  not match `specs` and whole .NET suites were reported as production code. On
+  one real month this moved 1,752 files and ~66k changed lines out of `source`,
+  taking the test-to-source ratio from 0.20 to 1.36.
+
 - Generated and vendor directories at the repository root — `node_modules/`,
   `dist/`, `build/`, `bin/`, `vendor/`, and the rest — are ignored again. Git
   reports repository-relative paths, so a top-level directory had nothing
