@@ -667,11 +667,15 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         progress.set("Scanning Git repositories");
         for root in &git_scan_roots {
             let scan_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-            let depth = if scan_root == configured_root {
-                arguments.depth
-            } else {
-                0
-            };
+            // Everything but the configured directory got here by being the
+            // checkout of a session the filter already matched.
+            let from_session = scan_root != configured_root;
+            let depth = if from_session { 0 } else { arguments.depth };
+            // Re-applying the filter to such a root would reject it: the filter
+            // matched the session's own working directory, which may be deep
+            // inside the repository, while the repository is described by its
+            // root. That defeated the inference this loop exists to perform.
+            let scoped_filter = if from_session { None } else { repo_filter };
             commits.extend(read_git_commits(
                 root,
                 &author,
@@ -680,7 +684,7 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
                 depth,
                 since,
                 until,
-                repo_filter,
+                scoped_filter,
                 &csv_globs(&arguments.path),
                 &csv_globs(&arguments.path_exclude),
                 arguments.no_ignore,

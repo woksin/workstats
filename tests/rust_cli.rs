@@ -273,6 +273,86 @@ fn git_output_is_reported_by_file_area_in_json_and_csv() {
 }
 
 #[test]
+fn a_filter_matching_only_a_nested_session_directory_still_finds_the_commits() {
+    // `--repo api` matches the session's own working directory, which is deep
+    // inside the checkout. The repository is described by its root, which does
+    // not contain "api" — so re-applying the filter to the inferred root used
+    // to return the session with none of its commits.
+    let temporary = tempdir().unwrap();
+    let project = temporary.path().join("widget");
+    let nested = project.join("packages/api");
+    let unrelated = temporary.path().join("elsewhere");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    assert!(git(&["init", project.to_str().unwrap()]).status.success());
+    fs::write(nested.join("service.rs"), "one\ntwo\n").unwrap();
+    let path = project.to_str().unwrap();
+    assert!(git(&["-C", path, "add", "."]).status.success());
+    assert!(
+        git(&[
+            "-C",
+            path,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-m",
+            "service",
+        ])
+        .status
+        .success()
+    );
+
+    let events = temporary.path().join("events.jsonl");
+    assert!(
+        run(&[
+            "record",
+            "--provider",
+            "fixture",
+            "--session",
+            "nested",
+            "--cwd",
+            nested.to_str().unwrap(),
+            "--kind",
+            "prompt",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+            "--output",
+            events.to_str().unwrap(),
+        ])
+        .status
+        .success()
+    );
+
+    let output = run(&[
+        "--dir",
+        unrelated.to_str().unwrap(),
+        "--author",
+        "fixture@example.com",
+        "--repo",
+        "api",
+        "--provider",
+        "fixture",
+        "--events",
+        events.to_str().unwrap(),
+        "--no-cache",
+        "--no-progress",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(1, report["summary"]["session_count"]);
+    assert_eq!(1, report["summary"]["commit_count"], "commits were dropped");
+    assert_eq!(2, report["summary"]["additions"]);
+}
+
+#[test]
 fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
     let temporary = tempdir().unwrap();
     let project = temporary.path().join("project");
