@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -9,7 +10,7 @@ use chrono::{DateTime, Utc};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use tempfile::tempfile;
 
-use crate::classify::{CategoryTally, classify, tally_add};
+use crate::classify::{CategoryTally, classify};
 use crate::model::{Diagnostics, GitCommit};
 use crate::paths::PathResolver;
 
@@ -214,9 +215,13 @@ pub fn read_git_commits(
     let mut seen = HashSet::new();
     for repo_path in discover_repositories(base, depth, diagnostics) {
         let (cwd, repo, root) = resolver.describe(&repo_path.to_string_lossy());
+        // The same three fields the session filter in `main.rs` matches, so a
+        // filter naming a source root selects commits as well as sessions.
         if repo_filter.is_some_and(|filter| {
             let filter = filter.to_lowercase();
-            !repo.to_lowercase().contains(&filter) && !cwd.to_lowercase().contains(&filter)
+            !repo.to_lowercase().contains(&filter)
+                && !cwd.to_lowercase().contains(&filter)
+                && !root.to_lowercase().contains(&filter)
         }) {
             continue;
         }
@@ -225,6 +230,10 @@ pub fn read_git_commits(
             .arg("--no-pager")
             .arg("-C")
             .arg(&repo_path)
+            // Without this Git octal-escapes and quotes every non-ASCII path,
+            // which breaks extension detection and the ignore globs.
+            .arg("-c")
+            .arg("core.quotePath=false")
             .arg("log")
             .arg("--regexp-ignore-case")
             .arg(format!("--author={author}"))
@@ -387,7 +396,8 @@ fn parse_git_log(
         let (Some(added), Some(removed)) = (added, removed) else {
             continue;
         };
-        let file_path = fields.last().copied().unwrap_or_default();
+        let resolved = renamed_target(fields.last().copied().unwrap_or_default());
+        let file_path: &str = &resolved;
         if includes.is_some_and(|patterns| !patterns.is_match(file_path)) {
             continue;
         }
@@ -398,12 +408,44 @@ fn parse_git_log(
         } else {
             pending.additions += added;
             pending.deletions += removed;
-            tally_add(&mut pending.categories, classify(file_path), added, removed);
+            pending.categories.add(classify(file_path), added, removed);
             pending.files.push(file_path.to_string());
         }
     }
     emit(&mut commits, &mut repo_seen, pending);
     commits
+}
+
+/// `--numstat` reports a rename as one field in three shapes: `old => new`,
+/// `dir/{old => new}`, and `{old => new}/file`. Categories, ignore globs,
+/// `--path`, and the reported file list all expect a real path, so the entry is
+/// resolved to where the file ended up before any of them sees it. Renames are
+/// left on (`--no-renames` would turn every large move into thousands of
+/// phantom added and deleted lines).
+fn renamed_target(field: &str) -> Cow<'_, str> {
+    let Some(arrow) = field.find(" => ") else {
+        return Cow::Borrowed(field);
+    };
+    let (left, right) = (&field[..arrow], &field[arrow + 4..]);
+    if let Some(open) = left.rfind('{')
+        && let Some(close) = right.find('}')
+    {
+        return Cow::Owned(join_components(&format!(
+            "{}{}{}",
+            &left[..open],
+            &right[..close],
+            &right[close + 1..]
+        )));
+    }
+    Cow::Owned(join_components(right))
+}
+
+/// `dir/{old => }/file` leaves an empty component behind.
+fn join_components(path: &str) -> String {
+    path.split('/')
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn parse_numstat(value: &str) -> Option<u64> {
@@ -449,7 +491,8 @@ fn iso(value: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::Category;
+    use crate::classify::active_registry;
+    use crate::paths::SourceRule;
     use tempfile::tempdir;
 
     fn git(arguments: &[&str]) {
@@ -458,6 +501,24 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git command failed: {arguments:?}");
+    }
+
+    /// A repository with an author configured, ready to commit into.
+    fn repository(base: &Path, relative: &str) -> PathBuf {
+        let repo = base.join(relative);
+        fs::create_dir_all(&repo).unwrap();
+        let path = repo.to_str().unwrap().to_string();
+        git(&["init", "-q", &path]);
+        git(&["-C", &path, "config", "user.name", "Test Author"]);
+        git(&["-C", &path, "config", "user.email", "test@example.com"]);
+        repo
+    }
+
+    fn lines(commit: &GitCommit, category: &str) -> (u64, u64) {
+        let registry = active_registry();
+        let index = registry.index_of(category).expect("known category");
+        let lines = commit.categories.get(index);
+        (lines.additions, lines.deletions)
     }
 
     #[test]
@@ -587,11 +648,138 @@ mod tests {
             false,
         );
         assert_eq!(1, commits.len());
-        let categories = &commits[0].categories;
-        assert_eq!(3, categories[Category::Source.index()].additions);
-        assert_eq!(1, categories[Category::Test.index()].additions);
-        assert_eq!(2, categories[Category::Docs.index()].additions);
-        assert_eq!(0, categories[Category::Config.index()].additions);
+        assert_eq!((3, 0), lines(&commits[0], "source"));
+        assert_eq!((1, 0), lines(&commits[0], "test"));
+        assert_eq!((2, 0), lines(&commits[0], "docs"));
+        assert_eq!((0, 0), lines(&commits[0], "config"));
         assert_eq!(6, commits[0].additions);
+    }
+
+    #[test]
+    fn rename_entries_resolve_to_the_path_the_file_landed_on() {
+        assert_eq!("tests/b.rs", renamed_target("src/a.rs => tests/b.rs"));
+        assert_eq!("tests/b.rs", renamed_target("tests/{a.rs => b.rs}"));
+        assert_eq!(
+            "tests/helper.rs",
+            renamed_target("{src => tests}/helper.rs")
+        );
+        assert_eq!(
+            "src/nested/file.rs",
+            renamed_target("src/{ => nested}/file.rs")
+        );
+        assert_eq!("src/file.rs", renamed_target("src/{nested => }/file.rs"));
+        // An ordinary path is untouched.
+        assert_eq!("src/main.rs", renamed_target("src/main.rs"));
+    }
+
+    #[test]
+    fn a_moved_file_is_counted_where_it_landed() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/moved");
+        let path = repo.to_str().unwrap().to_string();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        // Rename detection is Git's default, but the test must not depend on
+        // whoever runs it having left it that way.
+        git(&["-C", &path, "config", "diff.renames", "true"]);
+        let body: String = (0..20).map(|line| format!("line {line}\n")).collect();
+        fs::write(repo.join("src/helper.rs"), &body).unwrap();
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "before"]);
+        fs::remove_file(repo.join("src/helper.rs")).unwrap();
+        fs::write(repo.join("tests/helper.rs"), format!("{body}extra\n")).unwrap();
+        git(&["-C", &path, "add", "-A"]);
+        git(&["-C", &path, "commit", "-qm", "move"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+        );
+        let moved = commits
+            .iter()
+            .find(|commit| {
+                commit.additions == 1 && commit.files.iter().any(|file| file.ends_with("helper.rs"))
+            })
+            .expect("the move commit");
+        assert_eq!("tests/helper.rs", moved.files[0]);
+        assert_eq!((1, 0), lines(moved, "test"));
+        assert_eq!((0, 0), lines(moved, "source"));
+    }
+
+    #[test]
+    fn non_ascii_paths_arrive_as_real_paths() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "org/unicode");
+        let path = repo.to_str().unwrap().to_string();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("node_modules")).unwrap();
+        fs::write(repo.join("src/spørsmål.rs"), "one\n").unwrap();
+        fs::write(repo.join("node_modules/pakke_æøå.js"), "generated\n").unwrap();
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "unicode"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(1, commits.len());
+        // Quoted, octal-escaped paths lose their extension and escape the
+        // ignore globs; neither may happen here.
+        assert_eq!((1, 0), lines(&commits[0], "source"));
+        assert_eq!(1, commits[0].ignored_additions);
+        assert!(!commits[0].files.iter().any(|file| file.contains('"')));
+    }
+
+    #[test]
+    fn the_repository_filter_also_matches_the_source_root() {
+        let base = tempdir().unwrap();
+        let repo = repository(base.path(), "studio/widget");
+        let path = repo.to_str().unwrap().to_string();
+        fs::write(repo.join("main.rs"), "one\n").unwrap();
+        git(&["-C", &path, "add", "."]);
+        git(&["-C", &path, "commit", "-qm", "widget"]);
+
+        let mut diagnostics = Diagnostics::default();
+        // A source-root label that appears in neither the repo name nor the
+        // path, so only the root can satisfy the filter.
+        let rule = SourceRule::new(r"^.+/widget$", "acme-portfolio").unwrap();
+        let mut resolver = PathResolver::with_home(vec![rule], base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            Some("acme"),
+            &[],
+            &[],
+            false,
+        );
+        assert_eq!(1, commits.len());
+        assert_eq!("acme-portfolio", commits[0].root);
     }
 }

@@ -19,6 +19,11 @@ use crate::timeutil::{nearest_models, parse_epoch_milliseconds, parse_timestamp}
 
 pub const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
 
+/// A legacy Gemini session is a single JSON document rather than a line per record, so
+/// it needs a whole-file bound of its own. Real sessions reach tens of megabytes, hence
+/// the far larger limit.
+pub const MAX_GEMINI_JSON_BYTES: u64 = 128 * 1024 * 1024;
+
 #[derive(Debug, Default, Deserialize, serde::Serialize)]
 pub struct ParsedFile {
     pub sessions: Vec<RawSession>,
@@ -193,6 +198,8 @@ struct ClaudeRecord {
     cwd: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
     version: Option<String>,
     #[serde(default, deserialize_with = "deserialize_message")]
     message: Option<ClaudeMessage>,
@@ -210,6 +217,7 @@ struct ClaudeRecord {
 
 #[derive(Default)]
 struct ClaudeMessage {
+    id: Option<String>,
     model: Option<String>,
     human_content: bool,
     usage: Option<ClaudeUsage>,
@@ -246,6 +254,7 @@ where
             let mut message = ClaudeMessage::default();
             while let Some(key) = map.next_key::<String>()? {
                 match key.as_str() {
+                    "id" => message.id = map.next_value::<Option<String>>()?,
                     "model" => message.model = map.next_value::<Option<String>>()?,
                     "content" => message.human_content = map.next_value::<HumanContent>()?.0,
                     "usage" => message.usage = map.next_value::<Option<ClaudeUsage>>()?,
@@ -413,10 +422,11 @@ struct ExactCandidate {
 
 #[derive(Deserialize)]
 struct CodexTokenInfo {
+    total_token_usage: Option<CodexTokenUsage>,
     last_token_usage: Option<CodexTokenUsage>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 struct CodexTokenUsage {
     #[serde(default)]
     input_tokens: u64,
@@ -621,20 +631,7 @@ pub fn read_codex_sessions_indexed(
         diagnostics,
         cache,
         "codex",
-        |path| {
-            metadata
-                .by_path
-                .get(&canonical_string(path))
-                .map(|item| {
-                    format!(
-                        "codex-v2:{}:{}:{}",
-                        item.id.as_deref().unwrap_or_default(),
-                        item.cwd.as_deref().unwrap_or_default(),
-                        item.model.as_deref().unwrap_or_default()
-                    )
-                })
-                .unwrap_or_else(|| "codex-v2:none".to_string())
-        },
+        |path| codex_context_fingerprint(&metadata, path),
         since,
         until,
         |path| parse_codex_file(path, &metadata, MAX_JSONL_LINE_BYTES),
@@ -687,7 +684,7 @@ pub fn read_gemini_sessions_indexed(
         diagnostics,
         cache,
         "gemini",
-        |_| "gemini-v1".to_string(),
+        gemini_context_fingerprint,
         since,
         until,
         |path| parse_gemini_file(path, root, MAX_JSONL_LINE_BYTES),
@@ -810,9 +807,23 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
             },
         );
     } else {
+        // A legacy session is one JSON document, so `max_line_bytes` cannot bound it and
+        // the whole file would otherwise be read into memory unbounded. The BufReader is
+        // not cosmetic: serde_json's `IoRead` issues one syscall per byte, which measured
+        // ~90x slower on a 19 MB session.
         let parsed = File::open(path)
             .map_err(anyhow::Error::from)
-            .and_then(|file| serde_json::from_reader::<_, GeminiRecord>(file).map_err(Into::into));
+            .and_then(|file| {
+                let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+                if size > MAX_GEMINI_JSON_BYTES {
+                    anyhow::bail!("session larger than {MAX_GEMINI_JSON_BYTES} bytes");
+                }
+                serde_json::from_reader::<_, GeminiRecord>(BufReader::with_capacity(
+                    128 * 1024,
+                    file,
+                ))
+                .map_err(Into::into)
+            });
         match parsed {
             Ok(record) => {
                 session_id = record.session_id;
@@ -960,9 +971,6 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             {
                 current_model = safe_model(&model);
             }
-            if let Some(model) = record.data.model.as_deref() {
-                current_model = safe_model(model);
-            }
             let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) else {
                 return;
             };
@@ -1026,6 +1034,12 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             if is_agent_event {
                 return;
             }
+            // Deliberately below the subagent guard: a subagent record names its own
+            // model, and applying it here used to redirect every following foreground
+            // point to a model the human never selected.
+            if let Some(model) = record.data.model.as_deref() {
+                current_model = safe_model(model);
+            }
             if matches!(
                 record_type,
                 "user.message"
@@ -1055,14 +1069,22 @@ pub fn parse_copilot_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| file_stem(path))
     });
-    let multiple = points_by_cwd.len() > 1;
-    for (cwd_key, points) in points_by_cwd {
-        if points.is_empty() {
+    // A `session.context_changed` after the last activity event leaves the shutdown
+    // usage under a cwd that has no points, so the sessions come from the union of the
+    // maps rather than from the activity map alone — as `parse_codex_file` already does.
+    let mut cwd_keys = BTreeSet::new();
+    cwd_keys.extend(points_by_cwd.keys().cloned());
+    cwd_keys.extend(human_by_cwd.keys().cloned());
+    cwd_keys.extend(token_events_by_cwd.keys().cloned());
+    let multiple = cwd_keys.len() > 1;
+    for cwd_key in cwd_keys {
+        let points = points_by_cwd.remove(&cwd_key).unwrap_or_default();
+        let human_points = human_by_cwd.remove(&cwd_key).unwrap_or_default();
+        let token_events = token_events_by_cwd.remove(&cwd_key).unwrap_or_default();
+        if points.is_empty() && token_events.is_empty() {
             continue;
         }
         let approximate_cwd = cwd_key.is_none();
-        let human_points = human_by_cwd.remove(&cwd_key).unwrap_or_default();
-        let token_events = token_events_by_cwd.remove(&cwd_key).unwrap_or_default();
         let resolved_cwd =
             cwd_key.unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned());
         result.sessions.push(RawSession {
@@ -1174,13 +1196,35 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
         },
     );
     if sensitive_records > 0 {
-        result.diagnostics.malformed_lines += sensitive_records;
+        result.diagnostics.content_rejections += sensitive_records;
         result.diagnostics.warn(format!(
             "{sensitive_records} content-bearing event record(s) skipped: {}",
             path.display()
         ));
     }
-    result.sessions = sessions.into_values().collect();
+    // The aggregator keys a session by (provider, session_id) alone, so one id reused
+    // across working directories or roles would collapse to whichever record came last
+    // — reporting foreground work as a subagent. Codex and Copilot suffix the cwd for
+    // the same reason.
+    let mut variants: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (provider, session_id, _, _) in sessions.keys() {
+        *variants
+            .entry((provider.clone(), session_id.clone()))
+            .or_default() += 1;
+    }
+    result.sessions = sessions
+        .into_iter()
+        .map(|((provider, session_id, cwd, is_subagent), mut session)| {
+            if variants[&(provider, session_id)] > 1 {
+                session.session_id = if is_subagent {
+                    format!("{}:{cwd}:subagent", session.session_id)
+                } else {
+                    format!("{}:{cwd}", session.session_id)
+                };
+            }
+            session
+        })
+        .collect();
     if result.sessions.is_empty() {
         result.diagnostics.skipped_sessions += 1;
     }
@@ -1200,10 +1244,10 @@ struct OpenCodeSession {
 
 pub fn parse_opencode_database(path: &Path) -> ParsedFile {
     let mut result = ParsedFile::default();
-    let parsed = (|| -> rusqlite::Result<Vec<RawSession>> {
+    let parsed = (|| -> rusqlite::Result<(Vec<RawSession>, u64)> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         if !sqlite_table_exists(&connection, "session")? {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let columns = sqlite_columns(&connection, "session")?;
         let expression = |name: &str, fallback: &str| {
@@ -1224,9 +1268,15 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
         let mut statement = connection.prepare(&query)?;
         let mut rows = statement.query([])?;
         let mut sessions: BTreeMap<String, OpenCodeSession> = BTreeMap::new();
+        let mut skipped_rows = 0_u64;
         while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let cwd: String = row.get(1)?;
+            // A NULL or unexpectedly typed cell costs one row, never the whole database:
+            // `parent_id` below already read tolerantly, and a strict read here threw
+            // away every OpenCode session over a single bad cell.
+            let (Some(id), Some(cwd)) = (sqlite_text(row, 0), sqlite_text(row, 1)) else {
+                skipped_rows += 1;
+                continue;
+            };
             if id.is_empty() || cwd.is_empty() {
                 continue;
             }
@@ -1267,14 +1317,19 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                 let mut statement = connection.prepare(&query)?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
-                    let session_id: String = row.get(0)?;
-                    let message_type: String = row.get(1)?;
-                    let milliseconds: i64 = row.get(2)?;
+                    let (Some(session_id), Some(message_type), Some(milliseconds)) = (
+                        sqlite_text(row, 0),
+                        sqlite_text(row, 1),
+                        sqlite_number(row, 2),
+                    ) else {
+                        skipped_rows += 1;
+                        continue;
+                    };
                     let data: Option<String> = row.get(3).unwrap_or(None);
                     let Some(session) = sessions.get_mut(&session_id) else {
                         continue;
                     };
-                    let Some(timestamp) = parse_epoch_milliseconds(milliseconds as f64) else {
+                    let Some(timestamp) = parse_epoch_milliseconds(milliseconds) else {
                         continue;
                     };
                     current_session_ids.insert(session_id);
@@ -1303,16 +1358,21 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                 )?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
-                    let session_id: String = row.get(0)?;
+                    let (Some(session_id), Some(milliseconds), Some(data)) = (
+                        sqlite_text(row, 0),
+                        sqlite_number(row, 1),
+                        sqlite_text(row, 2),
+                    ) else {
+                        skipped_rows += 1;
+                        continue;
+                    };
                     if current_session_ids.contains(&session_id) {
                         continue;
                     }
-                    let milliseconds: i64 = row.get(1)?;
-                    let data: String = row.get(2)?;
                     let Some(session) = sessions.get_mut(&session_id) else {
                         continue;
                     };
-                    let Some(timestamp) = parse_epoch_milliseconds(milliseconds as f64) else {
+                    let Some(timestamp) = parse_epoch_milliseconds(milliseconds) else {
                         continue;
                     };
                     let value: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
@@ -1336,27 +1396,37 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
             }
         }
 
-        Ok(sessions
-            .into_values()
-            .filter(|session| !session.points.is_empty())
-            .map(|session| RawSession {
-                provider: "opencode".to_string(),
-                session_id: session.id,
-                source_file: path.to_path_buf(),
-                cwd: session.cwd,
-                points: session.points,
-                exact_intervals: Vec::new(),
-                human_points: session.human_points,
-                token_events: Vec::new(),
-                is_subagent: session.is_subagent,
-                approximate_cwd: false,
-                version: session.version,
-            })
-            .collect())
+        Ok((
+            sessions
+                .into_values()
+                .filter(|session| !session.points.is_empty())
+                .map(|session| RawSession {
+                    provider: "opencode".to_string(),
+                    session_id: session.id,
+                    source_file: path.to_path_buf(),
+                    cwd: session.cwd,
+                    points: session.points,
+                    exact_intervals: Vec::new(),
+                    human_points: session.human_points,
+                    token_events: Vec::new(),
+                    is_subagent: session.is_subagent,
+                    approximate_cwd: false,
+                    version: session.version,
+                })
+                .collect(),
+            skipped_rows,
+        ))
     })();
     match parsed {
-        Ok(sessions) => {
+        Ok((sessions, skipped_rows)) => {
             result.sessions = sessions;
+            if skipped_rows > 0 {
+                result.diagnostics.malformed_lines += skipped_rows;
+                result.diagnostics.warn(format!(
+                    "{skipped_rows} unreadable OpenCode row(s) skipped: {}",
+                    path.display()
+                ));
+            }
             if result.sessions.is_empty() {
                 result.diagnostics.skipped_sessions += 1;
             }
@@ -1378,6 +1448,27 @@ fn sqlite_table_exists(connection: &Connection, table: &str) -> rusqlite::Result
         [table],
         |row| row.get(0),
     )
+}
+
+/// Reads a cell through its stored value instead of a fixed Rust type. SQLite columns
+/// are typed per value, and OpenCode declares `time_created` NUMERIC, which it is free
+/// to store as REAL, so a strict `i64` read fails on rows a previous version wrote.
+fn sqlite_number(row: &rusqlite::Row<'_>, index: usize) -> Option<f64> {
+    match row.get_ref(index).ok()? {
+        rusqlite::types::ValueRef::Integer(value) => Some(value as f64),
+        rusqlite::types::ValueRef::Real(value) => Some(value),
+        rusqlite::types::ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok()?.parse().ok(),
+        _ => None,
+    }
+}
+
+fn sqlite_text(row: &rusqlite::Row<'_>, index: usize) -> Option<String> {
+    match row.get_ref(index).ok()? {
+        rusqlite::types::ValueRef::Text(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        rusqlite::types::ValueRef::Integer(value) => Some(value.to_string()),
+        rusqlite::types::ValueRef::Real(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn sqlite_columns(connection: &Connection, table: &str) -> rusqlite::Result<BTreeSet<String>> {
@@ -1411,22 +1502,38 @@ fn json_model(encoded: &str) -> String {
 }
 
 fn gemini_project_root(path: &Path) -> Option<String> {
+    gemini_project_marker(path).map(|(_, root)| root)
+}
+
+fn gemini_project_marker(path: &Path) -> Option<(PathBuf, String)> {
     for ancestor in path.ancestors() {
         let marker = ancestor.join(".project_root");
         if !marker.is_file() {
             continue;
         }
-        let bytes = fs::read(marker).ok()?;
+        let bytes = fs::read(&marker).ok()?;
         if bytes.len() > 32 * 1024 {
             return None;
         }
         let value = String::from_utf8(bytes).ok()?;
         let value = value.trim();
         if !value.is_empty() {
-            return Some(value.to_string());
+            return Some((marker, value.to_string()));
         }
     }
     None
+}
+
+/// A Gemini session takes its cwd from an out-of-band `.project_root` marker, so the
+/// marker belongs in the fingerprint: a constant one kept a moved project pinned to its
+/// stale directory for as long as the transcript itself was untouched.
+fn gemini_context_fingerprint(path: &Path) -> String {
+    match gemini_project_marker(path) {
+        Some((marker, root)) => {
+            format!("gemini-v2:{}:{root}", crate::cache::file_context(&marker))
+        }
+        None => "gemini-v2:none".to_string(),
+    }
 }
 
 fn safe_provider(value: &str) -> String {
@@ -1538,7 +1645,8 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
     let mut result = ParsedFile::default();
     let mut points = Vec::new();
     let mut human_points = Vec::new();
-    let mut token_events = Vec::new();
+    let mut token_events: Vec<TokenEvent> = Vec::new();
+    let mut counted_responses: HashMap<(String, String), usize> = HashMap::new();
     let mut cwd = None;
     let mut session_id = None;
     let mut version = None;
@@ -1592,11 +1700,43 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
                     cache_creation_tokens: usage.cache_creation_input_tokens,
                 };
                 if !usage.is_zero() {
-                    token_events.push(TokenEvent {
+                    let event = TokenEvent {
                         timestamp,
                         model: current_model.clone(),
                         usage,
-                    });
+                    };
+                    // Claude Code writes one record per content block of a single API
+                    // response — a text block, then one per tool call — and every one of
+                    // them repeats the same ids and a byte-identical usage. The response,
+                    // not the record, is what may be counted.
+                    let response_key = match (
+                        record
+                            .message
+                            .as_ref()
+                            .and_then(|message| message.id.clone()),
+                        record.request_id.clone(),
+                    ) {
+                        (None, None) => None,
+                        (id, request) => {
+                            Some((id.unwrap_or_default(), request.unwrap_or_default()))
+                        }
+                    };
+                    let counted = response_key
+                        .as_ref()
+                        .and_then(|key| counted_responses.get(key).copied());
+                    match (response_key, counted) {
+                        // Last occurrence wins. The repeats are identical apart from the
+                        // timestamp, so this only moves the response to the moment its
+                        // final block was written.
+                        (_, Some(index)) => token_events[index] = event,
+                        (Some(key), None) => {
+                            counted_responses.insert(key, token_events.len());
+                            token_events.push(event);
+                        }
+                        // A record carrying neither id cannot be matched to a sibling, so
+                        // it is counted rather than dropped.
+                        (None, None) => token_events.push(event),
+                    }
                 }
             }
             let human = record_type == "user"
@@ -1666,6 +1806,7 @@ pub fn parse_codex_file(
     let mut session_id = None;
     let mut current_model = "unknown".to_string();
     let mut is_subagent = false;
+    let mut previous_token_total = None;
     for_json_lines(
         path,
         max_line_bytes,
@@ -1725,7 +1866,12 @@ pub fn parse_codex_file(
                     if record.record_type.as_deref() == Some("event_msg")
                         && let Some(timestamp) =
                             record.timestamp.as_deref().and_then(parse_timestamp)
-                        && let Some(event) = codex_token_event(&payload, timestamp, &current_model)
+                        && let Some(event) = codex_token_event(
+                            &payload,
+                            timestamp,
+                            &current_model,
+                            &mut previous_token_total,
+                        )
                     {
                         token_events_by_cwd
                             .entry(cwd.clone())
@@ -1814,6 +1960,43 @@ pub fn parse_codex_file(
     result
 }
 
+/// `parse_codex_file` falls back from the path index to the id index, so the fingerprint
+/// has to follow it — a rollout matched only by id used to carry a constant fingerprint
+/// and never invalidate when its metadata changed. The file is not read here, so the id
+/// comes from the `rollout-<timestamp>-<thread id>.jsonl` name.
+fn codex_context_fingerprint(metadata: &CodexMetadataIndex, path: &Path) -> String {
+    metadata
+        .by_path
+        .get(&canonical_string(path))
+        .or_else(|| codex_rollout_id(path).and_then(|id| metadata.by_id.get(&id)))
+        .map(|item| {
+            format!(
+                "codex-v2:{}:{}:{}",
+                item.id.as_deref().unwrap_or_default(),
+                item.cwd.as_deref().unwrap_or_default(),
+                item.model.as_deref().unwrap_or_default()
+            )
+        })
+        .unwrap_or_else(|| "codex-v2:none".to_string())
+}
+
+fn codex_rollout_id(path: &Path) -> Option<String> {
+    let stem = file_stem(path);
+    let candidate = stem.get(stem.len().checked_sub(36)?..)?;
+    let uuid_shaped = candidate
+        .as_bytes()
+        .iter()
+        .enumerate()
+        .all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    uuid_shaped.then(|| candidate.to_string())
+}
+
 fn exact_codex_interval(payload: &CodexPayload, model: &str) -> Option<ExactInterval> {
     let direct = (payload.started_at_ms, payload.completed_at_ms);
     let nested = [
@@ -1841,11 +2024,22 @@ fn codex_token_event(
     payload: &CodexPayload,
     timestamp: DateTime<Utc>,
     model: &str,
+    previous_total: &mut Option<CodexTokenUsage>,
 ) -> Option<TokenEvent> {
     if payload.payload_type.as_deref() != Some("token_count") {
         return None;
     }
-    let last = payload.info.as_ref()?.last_token_usage.as_ref()?;
+    let info = payload.info.as_ref()?;
+    // Codex re-emits a `token_count` event that still carries the previous turn's
+    // `last_token_usage` while the cumulative total has not moved. Only the total tells
+    // the two apart, so an unmoved total means the turn was already counted.
+    if let Some(total) = info.total_token_usage.as_ref() {
+        if previous_total.as_ref() == Some(total) {
+            return None;
+        }
+        *previous_total = Some(total.clone());
+    }
+    let last = info.last_token_usage.as_ref()?;
     // `cached_input_tokens` is a subset of `input_tokens` (OpenAI-style accounting), not
     // additional to it, so it is split out here rather than summed on top.
     let usage = TokenUsage {
@@ -2009,8 +2203,10 @@ fn read_bounded_line<R: BufRead>(
     if read == 0 {
         return Ok(None);
     }
-    let oversized = line.len() > maximum;
     let complete = line.ends_with(b"\n");
+    // The terminator is not part of the record, so counting it made the effective limit
+    // one byte short of `maximum`.
+    let oversized = line.len() - usize::from(complete) > maximum;
     let truncated = !complete && remaining == 0;
     if truncated {
         discard_to_newline(reader)?;
@@ -2077,6 +2273,11 @@ pub fn file_time_range(sessions: &[RawSession]) -> (Option<DateTime<Utc>>, Optio
                     .iter()
                     .flat_map(|item| [item.start, item.end]),
             )
+            // Copilot reports a whole session's usage from `session.shutdown`, which can
+            // land more than an hour after the last activity point. Leaving those out of
+            // the cached range lets a range-pruned hit answer with zero tokens for a day
+            // the cold read counts.
+            .chain(session.token_events.iter().map(|event| event.timestamp))
         {
             minimum = Some(minimum.map_or(timestamp, |value: DateTime<Utc>| value.min(timestamp)));
             maximum = Some(maximum.map_or(timestamp, |value: DateTime<Utc>| value.max(timestamp)));
@@ -2404,9 +2605,10 @@ mod tests {
         let parsed = parse_event_file(&path, MAX_JSONL_LINE_BYTES);
         assert_eq!("cursor", parsed.sessions[0].provider);
         assert_eq!(1, parsed.sessions.len());
+        assert_eq!("task-one", parsed.sessions[0].session_id);
         assert_eq!(1, parsed.sessions[0].human_points.len());
         assert_eq!(1, parsed.sessions[0].exact_intervals.len());
-        assert_eq!(1, parsed.diagnostics.malformed_lines);
+        assert_eq!(1, parsed.diagnostics.content_rejections);
     }
 
     #[test]
@@ -2675,5 +2877,379 @@ mod tests {
         assert_eq!(20, event.usage.output_tokens);
         assert_eq!(5, event.usage.cache_read_tokens);
         assert_eq!(1, event.usage.cache_creation_tokens);
+    }
+
+    #[test]
+    fn claude_repeated_content_block_records_count_one_response() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let path = project.join("session.jsonl");
+        let usage = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let records = [
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:05Z",
+                "cwd": project,
+                "requestId": "req-one",
+                "message": {"id": "msg-one", "model": "claude-test", "usage": usage.clone()}
+            }),
+            // The same API response written again for its tool_use block.
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:06Z",
+                "cwd": project,
+                "requestId": "req-one",
+                "message": {"id": "msg-one", "model": "claude-test", "usage": usage.clone()}
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:09Z",
+                "cwd": project,
+                "requestId": "req-two",
+                "message": {"id": "msg-two", "model": "claude-test", "usage": usage.clone()}
+            }),
+            // Neither id present: nothing can pair it with a sibling, so it is counted.
+            serde_json::json!({
+                "type": "assistant",
+                "timestamp": "2026-01-01T00:00:12Z",
+                "cwd": project,
+                "message": {"model": "claude-test", "usage": usage.clone()}
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        let events = &parsed.sessions[0].token_events;
+        assert_eq!(4, parsed.sessions[0].points.len());
+        assert_eq!(3, events.len());
+        assert_eq!(
+            90,
+            events.iter().map(|event| event.usage.total()).sum::<u64>()
+        );
+        assert_eq!(
+            parse_timestamp("2026-01-01T00:00:06Z").unwrap(),
+            events[0].timestamp
+        );
+    }
+
+    #[test]
+    fn file_time_range_covers_token_events_after_the_last_activity_point() {
+        let session = RawSession {
+            provider: "copilot".to_string(),
+            session_id: "session".to_string(),
+            source_file: PathBuf::from("events.jsonl"),
+            cwd: "/tmp/repo".to_string(),
+            points: vec![ActivityPoint {
+                timestamp: parse_timestamp("2026-01-01T23:00:00Z").unwrap(),
+                model: "gpt-test".to_string(),
+            }],
+            exact_intervals: Vec::new(),
+            human_points: Vec::new(),
+            token_events: vec![TokenEvent {
+                timestamp: parse_timestamp("2026-01-02T00:30:00Z").unwrap(),
+                model: "gpt-test".to_string(),
+                usage: TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+            }],
+            is_subagent: false,
+            approximate_cwd: false,
+            version: None,
+        };
+        let (minimum, maximum) = file_time_range(std::slice::from_ref(&session));
+        assert_eq!(parse_timestamp("2026-01-01T23:00:00Z"), minimum);
+        assert_eq!(parse_timestamp("2026-01-02T00:30:00Z"), maximum);
+    }
+
+    #[test]
+    fn copilot_usage_survives_a_context_change_after_the_last_activity() {
+        let root = tempdir().unwrap();
+        let other = root.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let path = root.path().join("events.jsonl");
+        let records = [
+            serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {"sessionId": "copilot-session", "selectedModel": "gpt-test", "context": {"cwd": root.path()}}
+            }),
+            serde_json::json!({
+                "type": "user.message",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {}
+            }),
+            serde_json::json!({
+                "type": "session.context_changed",
+                "timestamp": "2026-01-01T00:04:00Z",
+                "data": {"cwd": other}
+            }),
+            serde_json::json!({
+                "type": "session.shutdown",
+                "timestamp": "2026-01-01T00:05:00Z",
+                "data": {
+                    "modelMetrics": {
+                        "gpt-test": {"usage": {"inputTokens": 100, "outputTokens": 20}}
+                    }
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        assert_eq!(2, parsed.sessions.len());
+        let usage_session = parsed
+            .sessions
+            .iter()
+            .find(|session| !session.token_events.is_empty())
+            .unwrap();
+        assert!(usage_session.points.is_empty());
+        assert_eq!(other.to_string_lossy(), usage_session.cwd);
+        assert_eq!(120, usage_session.token_events[0].usage.total());
+    }
+
+    #[test]
+    fn copilot_subagent_model_does_not_replace_the_foreground_model() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let records = [
+            serde_json::json!({
+                "type": "session.start",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {"sessionId": "copilot-session", "selectedModel": "gpt-foreground", "context": {"cwd": root.path()}}
+            }),
+            serde_json::json!({
+                "type": "user.message",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "data": {}
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-01-01T00:00:30Z",
+                "agentId": "agent-one",
+                "data": {"model": "gpt-subagent"}
+            }),
+            serde_json::json!({
+                "type": "assistant.message",
+                "timestamp": "2026-01-01T00:01:00Z",
+                "data": {}
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_copilot_file(&path, MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.sessions.len());
+        assert_eq!(2, parsed.sessions[0].points.len());
+        assert!(
+            parsed.sessions[0]
+                .points
+                .iter()
+                .all(|point| point.model == "gpt-foreground")
+        );
+    }
+
+    #[test]
+    fn event_sessions_keep_one_id_apart_across_directories_and_roles() {
+        let root = tempdir().unwrap();
+        let other = root.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let path = root.path().join("events.jsonl");
+        let records = [
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "provider": "cursor",
+                "session_id": "task-one",
+                "cwd": root.path(),
+                "model": "model-a",
+                "event": "prompt",
+                "role": "foreground"
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:01:00Z",
+                "provider": "cursor",
+                "session_id": "task-one",
+                "cwd": other,
+                "model": "model-a",
+                "role": "subagent"
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_event_file(&path, MAX_JSONL_LINE_BYTES);
+        assert_eq!(2, parsed.sessions.len());
+        let foreground = parsed
+            .sessions
+            .iter()
+            .find(|session| !session.is_subagent)
+            .unwrap();
+        let subagent = parsed
+            .sessions
+            .iter()
+            .find(|session| session.is_subagent)
+            .unwrap();
+        assert_ne!(foreground.session_id, subagent.session_id);
+        assert!(foreground.session_id.starts_with("task-one:"));
+        assert!(subagent.session_id.ends_with(":subagent"));
+    }
+
+    #[test]
+    fn opencode_skips_only_the_rows_it_cannot_read() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("opencode.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT,
+                    parent_id TEXT,
+                    version TEXT,
+                    model TEXT
+                );
+                CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    type TEXT,
+                    time_created REAL,
+                    data TEXT
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session(id, directory, version, model) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    "session-one",
+                    root.path().to_string_lossy(),
+                    "test",
+                    r#"{"providerID":"openai","id":"gpt-test"}"#
+                ],
+            )
+            .unwrap();
+        // A NULL directory used to abort the read of every other session as well.
+        connection
+            .execute(
+                "INSERT INTO session(id, directory) VALUES (?1, NULL)",
+                rusqlite::params!["session-two"],
+            )
+            .unwrap();
+        // OpenCode declares `time_created` NUMERIC, and SQLite may hand it back as REAL.
+        connection
+            .execute(
+                "INSERT INTO session_message(id, session_id, type, time_created, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "message-one",
+                    "session-one",
+                    "user",
+                    1_767_225_600_000.0_f64,
+                    "{}"
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_message(id, session_id, type, time_created, data) VALUES (?1, ?2, NULL, ?3, ?4)",
+                rusqlite::params!["message-two", "session-one", 1_767_225_660_000.0_f64, "{}"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let parsed = parse_opencode_database(&path);
+        assert_eq!(1, parsed.sessions.len());
+        assert_eq!(1, parsed.sessions[0].points.len());
+        assert_eq!(1, parsed.sessions[0].human_points.len());
+        assert_eq!(2, parsed.diagnostics.malformed_lines);
+    }
+
+    #[test]
+    fn codex_token_count_repeated_at_an_unchanged_total_is_counted_once() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("rollout-test.jsonl");
+        let total = serde_json::json!({
+            "input_tokens": 100, "cached_input_tokens": 10,
+            "cache_write_input_tokens": 0, "output_tokens": 20,
+            "reasoning_output_tokens": 5, "total_tokens": 120
+        });
+        let last = serde_json::json!({
+            "input_tokens": 100, "cached_input_tokens": 10,
+            "cache_write_input_tokens": 0, "output_tokens": 20,
+            "reasoning_output_tokens": 5, "total_tokens": 120
+        });
+        let records = [
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "s", "cwd": root.path(), "model": "gpt-a"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:10Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": total.clone(), "last_token_usage": last.clone()}
+                }
+            }),
+            // Re-emitted with the previous turn's last usage and an unmoved total.
+            serde_json::json!({
+                "timestamp": "2026-01-01T00:00:15Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": total.clone(), "last_token_usage": last.clone()}
+                }
+            }),
+        ];
+        fs::write(
+            &path,
+            records
+                .into_iter()
+                .map(|record| record.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_codex_file(&path, &CodexMetadataIndex::default(), MAX_JSONL_LINE_BYTES);
+        let events = &parsed.sessions[0].token_events;
+        assert_eq!(1, events.len());
+        assert_eq!(120, events[0].usage.total());
     }
 }

@@ -19,9 +19,14 @@ path = "src/main.rs"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+# Pinned together on purpose: ratatui 0.30 pulls crossterm 0.29 through
+# ratatui-crossterm, and the explorer passes crossterm key events straight into
+# ratatui, so the two must resolve to one crossterm.
+crossterm = "0.29"
 csv = "1.3"
 flate2 = "1.1.9"
 globset = "0.4"
+ratatui = "0.30"
 rayon = "1.10"
 regex = "1.11"
 rusqlite = { version = "0.32", features = ["bundled"] }

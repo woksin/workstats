@@ -8,7 +8,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::ai::{ParsedFile, file_time_range};
 
-const PARSER_VERSION: i64 = 2;
+/// Bumped whenever a parser changes what it stores or how a range is derived, so that
+/// entries written by an older build are recomputed instead of answered from. Version 3
+/// deduplicates Claude token events and folds token timestamps into the cached range.
+const PARSER_VERSION: i64 = 3;
 
 type CacheRow = (
     i64,
@@ -252,7 +255,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use crate::model::{ActivityPoint, Diagnostics, RawSession};
+    use crate::model::{ActivityPoint, Diagnostics, RawSession, TokenEvent, TokenUsage};
     use crate::timeutil::parse_timestamp;
     use tempfile::tempdir;
 
@@ -329,6 +332,41 @@ mod tests {
                 .unwrap(),
             CacheLookup::Miss
         ));
+    }
+
+    #[test]
+    fn a_token_event_after_the_last_point_keeps_the_entry_in_range() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("events.jsonl");
+        fs::write(&source, "{}\n").unwrap();
+        let cache_path = directory.path().join("index.sqlite3");
+        let mut cache = TranscriptCache::open(&cache_path, false).unwrap();
+        let stamp = file_stamp(&source).unwrap();
+        let mut entry = parsed(&source);
+        // Copilot reports a session's usage at shutdown, after the last activity point
+        // and often on the other side of a day boundary.
+        entry.sessions[0].token_events.push(TokenEvent {
+            timestamp: parse_timestamp("2026-01-02T00:30:00Z").unwrap(),
+            model: "gpt".into(),
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+        });
+        cache
+            .put(&source, "copilot", "context", stamp, &entry)
+            .unwrap();
+
+        let since = parse_timestamp("2026-01-02T00:00:00Z").unwrap();
+        let CacheLookup::Hit(hit) = cache
+            .lookup(&source, "copilot", "context", stamp, Some(since), None)
+            .unwrap()
+        else {
+            panic!("expected a cache hit covering the token event");
+        };
+        assert_eq!(1, hit.sessions[0].token_events.len());
     }
 
     #[test]

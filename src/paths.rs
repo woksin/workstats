@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::classify::{CategoryMode, CategoryRegistry, CategoryRules};
 use crate::model::{Diagnostics, RawSession, Session};
 
 #[derive(Debug)]
@@ -59,6 +60,21 @@ pub struct Config {
     pub source_roots: Vec<ConfigRule>,
     #[serde(default)]
     pub check_updates: Option<bool>,
+    /// File-area rules, keyed by category name. A name the built-ins do not
+    /// know creates a new category.
+    #[serde(default)]
+    pub categories: BTreeMap<String, CategoryRules>,
+    /// `"extend"` (default) or `"replace"`.
+    #[serde(default)]
+    pub category_mode: Option<String>,
+}
+
+impl Config {
+    pub fn category_registry(&self) -> Result<CategoryRegistry> {
+        let mode = CategoryMode::parse(self.category_mode.as_deref())?;
+        CategoryRegistry::from_config(&self.categories, mode)
+            .context("invalid \"categories\" configuration")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -360,6 +376,53 @@ mod tests {
             "tmp/scratch",
             resolver.source_root(&env::temp_dir().join("workstats-scratch").to_string_lossy())
         );
+    }
+
+    #[test]
+    fn categories_and_source_roots_load_from_the_same_config_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        fs::write(
+            &path,
+            r#"{"source_roots": [{"pattern": "^/work/([^/]+)/.*", "replacement": "work/\\1"}],
+                "categories": {"ai": {"directories": [".claude"]}},
+                "category_mode": "extend"}"#,
+        )
+        .unwrap();
+        let mut diagnostics = Diagnostics::default();
+        let config = load_config(Some(&path), &mut diagnostics);
+        assert!(
+            diagnostics.messages.is_empty(),
+            "{:?}",
+            diagnostics.messages
+        );
+        let registry = config.category_registry().unwrap();
+        let ai = registry.index_of("ai").expect("configured category");
+        assert_eq!(ai, registry.classify(".claude/settings.json"));
+        assert_eq!(1, configured_rules(config, &[]).unwrap().len());
+    }
+
+    #[test]
+    fn an_unusable_config_is_reported_rather_than_guessed_at() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        // A misspelled rule set must not silently do nothing.
+        fs::write(
+            &path,
+            r#"{"categories": {"ai": {"directory": [".claude"]}}}"#,
+        )
+        .unwrap();
+        let mut diagnostics = Diagnostics::default();
+        let config = load_config(Some(&path), &mut diagnostics);
+        assert_eq!(1, diagnostics.messages.len());
+        assert!(config.categories.is_empty());
+
+        // A bad mode is a hard error rather than a silently ignored setting.
+        let config = Config {
+            category_mode: Some("merge".to_string()),
+            ..Config::default()
+        };
+        assert!(config.category_registry().is_err());
     }
 
     #[test]

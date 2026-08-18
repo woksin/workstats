@@ -9,6 +9,7 @@ mod paths;
 mod progress;
 mod sources;
 mod timeutil;
+mod tui;
 mod update;
 
 use std::collections::{BTreeSet, HashSet};
@@ -18,7 +19,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -64,8 +65,13 @@ enum EventRole {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Explore the same report interactively; takes the report flags itself,
+    /// as in `workstats ui --dir . --since 2026-01`
+    Ui(Box<ReportArguments>),
     /// Show supported and automatically detected local histories
     Sources(SourcesArguments),
+    /// Show the category and the rule a path matches
+    Classify(ClassifyArguments),
     /// Append one content-free event for a CLI, IDE, script, or API wrapper
     #[command(visible_alias = "event")]
     Record(Box<RecordArguments>),
@@ -77,6 +83,29 @@ enum Command {
 struct SourcesArguments {
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
     output_format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ClassifyArguments {
+    #[arg(
+        value_name = "PATH",
+        required = true,
+        help = "Repository-relative path to classify; repeatable"
+    )]
+    paths: Vec<String>,
+    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
+    output_format: OutputFormat,
+    #[arg(long, help = "JSON config (default: platform config directory)")]
+    config: Option<PathBuf>,
+}
+
+/// One path, the category it lands in, and why.
+#[derive(Serialize)]
+struct ClassifiedPath {
+    path: String,
+    category: String,
+    rule: &'static str,
+    pattern: String,
 }
 
 #[derive(Debug, Args)]
@@ -139,16 +168,14 @@ struct RecordedEvent {
     completed_at: Option<String>,
 }
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "workstats",
-    version,
-    about = "Measures local Git output and active AI-assisted work across supported CLIs, IDEs, and API event logs. Transcript text is never emitted and no network calls are made unless you run `workstats update` or opt into --check-updates.",
-    after_help = "Human work is a supervision-inclusive estimate from prompts, foreground session boundaries, and authored commits, not a stopwatch. Autonomous agent output does not imply continuous human presence."
-)]
-struct Arguments {
-    #[command(subcommand)]
-    command: Option<Command>,
+/// Used when neither `--group-by` nor one of its shortcut flags is given.
+const DEFAULT_GROUP_BY: &str = "repo";
+
+/// Everything that shapes the report itself, flattened into both the default
+/// command and `workstats ui`. Sharing one struct is what makes the explorer
+/// answer the same question the printed report does, rather than a similar one.
+#[derive(Debug, Args)]
+struct ReportArguments {
     #[arg(
         short = 'd',
         long = "dir",
@@ -189,13 +216,16 @@ struct Arguments {
         help = "Setup and review time credited around each work block"
     )]
     review_credit: String,
+    // Optional rather than defaulted so clap can tell "the user asked for this
+    // grouping" from "nobody said"; the shortcut flags below conflict with the
+    // former only.
     #[arg(
         long = "group-by",
         visible_alias = "by",
-        default_value = "repo",
-        help = "Comma-separated: root,repo,cwd,provider,model,day,month"
+        conflicts_with_all = ["by_repo", "matrix", "by_dir"],
+        help = "Comma-separated: root,repo,cwd,provider,model,day,month (default: repo)"
     )]
-    group_by: String,
+    group_by: Option<String>,
     #[arg(long, value_parser = ["day", "month"], help = "Append a calendar grouping")]
     period: Option<String>,
     #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append, help = "Include provider(s); repeatable/comma-separated (default: all)")]
@@ -206,6 +236,8 @@ struct Arguments {
     history: Vec<String>,
     #[arg(long, value_name = "FILE", action = clap::ArgAction::Append, help = "Add a Workstats Events JSONL file or directory; repeatable")]
     events: Vec<PathBuf>,
+    #[arg(long, help = "Skip the event log written by `workstats record`")]
+    no_default_events: bool,
     #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
     output_format: OutputFormat,
     #[arg(long, default_value_t = 30, help = "Maximum table rows (0 means all)")]
@@ -254,11 +286,23 @@ struct Arguments {
     no_color: bool,
     #[arg(long, help = "Disable the interactive progress animation")]
     no_progress: bool,
-    #[arg(short = 'r', long, help = "Group by month and repo")]
+    // Each of these rewrites the grouping wholesale, so two of them together —
+    // or either with --group-by — used to mean one silently won (AUDIT V).
+    #[arg(
+        short = 'r',
+        long,
+        conflicts_with_all = ["matrix", "by_dir"],
+        help = "Alias for --group-by month,repo"
+    )]
     by_repo: bool,
-    #[arg(short = 'm', long, help = "Alias for --group-by repo --period month")]
+    #[arg(
+        short = 'm',
+        long,
+        conflicts_with = "by_dir",
+        help = "Alias for --group-by repo,month"
+    )]
     matrix: bool,
-    #[arg(short = 'D', long, help = "Group by exact working area")]
+    #[arg(short = 'D', long, help = "Alias for --group-by cwd")]
     by_dir: bool,
     #[arg(
         long = "raw",
@@ -278,13 +322,37 @@ struct Arguments {
     no_update_check: bool,
 }
 
+#[derive(Debug, Parser)]
+#[command(
+    name = "workstats",
+    version,
+    about = "Measures local Git output and active AI-assisted work across supported CLIs, IDEs, and API event logs. Transcript text is never emitted and no network calls are made unless you run `workstats update` or opt into --check-updates.",
+    after_help = "Human work is a supervision-inclusive estimate from prompts, foreground session boundaries, and authored commits, not a stopwatch. Autonomous agent output does not imply continuous human presence."
+)]
+struct Arguments {
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    report: ReportArguments,
+}
+
+/// What happens to the report once it is built. It is built identically either
+/// way; only the last step differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Presentation {
+    Print,
+    Explore,
+}
+
 fn main() {
-    let arguments = Arguments::parse();
-    let result = match arguments.command.as_ref() {
-        Some(Command::Sources(command)) => print_sources(command),
-        Some(Command::Record(command)) => record_event(command),
-        Some(Command::Update(command)) => run_update_command(command),
-        None => run(arguments),
+    let Arguments { command, report } = Arguments::parse();
+    let result = match command {
+        Some(Command::Ui(command)) => run(*command, Presentation::Explore),
+        Some(Command::Sources(command)) => print_sources(&command),
+        Some(Command::Classify(command)) => classify_paths(&command),
+        Some(Command::Record(command)) => record_event(&command),
+        Some(Command::Update(command)) => run_update_command(&command),
+        None => run(report, Presentation::Print),
     };
     if let Err(error) = result {
         eprintln!("workstats: {error:#}");
@@ -292,32 +360,70 @@ fn main() {
     }
 }
 
-fn run(arguments: Arguments) -> Result<()> {
-    let gap_cap = parse_duration(&arguments.gap_cap)?;
-    let human_idle = parse_duration(&arguments.human_idle)?;
-    let review_credit = parse_duration(&arguments.review_credit)?;
-    let since = parse_bound(arguments.since.as_deref(), false)?;
-    let until = parse_bound(arguments.until.as_deref(), true)?;
-    let mut dimensions: Vec<String> = arguments
-        .group_by
-        .split(',')
-        .map(str::trim)
-        .filter(|piece| !piece.is_empty())
-        .map(str::to_string)
-        .collect();
-    if arguments.by_repo {
-        dimensions = vec!["month".into(), "repo".into()];
-    } else if arguments.matrix {
-        dimensions = vec!["repo".into(), "month".into()];
-    } else if arguments.by_dir {
-        dimensions = vec!["cwd".into()];
+/// Names the flag and the value it was given. A parse failure used to say only
+/// what a duration should look like, never which flag was wrong (AUDIT V).
+fn duration_flag(flag: &str, value: &str) -> Result<Duration> {
+    parse_duration(value).with_context(|| format!("invalid {flag} {value:?}"))
+}
+
+fn bound_flag(flag: &str, value: Option<&str>, until: bool) -> Result<Option<DateTime<Utc>>> {
+    parse_bound(value, until)
+        .with_context(|| format!("invalid {flag} {:?}", value.unwrap_or_default()))
+}
+
+/// The directory Git history is scanned from. It takes its candidates instead
+/// of reading the environment itself so both the precedence and the error stay
+/// testable.
+fn scan_directory(
+    explicit: Option<&Path>,
+    from_environment: Option<PathBuf>,
+    current: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let (directory, origin) = match (explicit, from_environment) {
+        (Some(path), _) => (path.to_path_buf(), "--dir"),
+        (None, Some(path)) => (path, "WORKSTATS_DIR"),
+        (None, None) => (
+            current.unwrap_or_else(|| PathBuf::from(".")),
+            "the current working directory",
+        ),
+    };
+    // A scan root that does not exist used to produce an all-zero report and
+    // exit 0 (AUDIT V), which reads as "no work found", not "wrong path".
+    if !directory.is_dir() {
+        bail!(
+            "{origin} does not name an existing directory: {}",
+            directory.display()
+        );
     }
+    Ok(directory)
+}
+
+/// The grouping dimensions for one run, validated. Split out of `run` so the
+/// shortcut flags can be exercised without building a report.
+fn grouping_dimensions(arguments: &ReportArguments) -> Result<Vec<String>> {
+    let mut dimensions: Vec<String> = if arguments.by_repo {
+        vec!["month".to_string(), "repo".to_string()]
+    } else if arguments.matrix {
+        vec!["repo".to_string(), "month".to_string()]
+    } else if arguments.by_dir {
+        vec!["cwd".to_string()]
+    } else {
+        arguments
+            .group_by
+            .as_deref()
+            .unwrap_or(DEFAULT_GROUP_BY)
+            .split(',')
+            .map(str::trim)
+            .filter(|piece| !piece.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
     if let Some(period) = &arguments.period
         && !dimensions.contains(period)
     {
         dimensions.push(period.clone());
     }
-    let unique: std::collections::HashSet<_> = dimensions.iter().collect();
+    let unique: HashSet<_> = dimensions.iter().collect();
     if dimensions.is_empty()
         || unique.len() != dimensions.len()
         || dimensions
@@ -334,18 +440,35 @@ fn run(arguments: Arguments) -> Result<()> {
     {
         bail!("day and month are alternative calendar groupings; choose one");
     }
+    Ok(dimensions)
+}
+
+fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
+    // Refused before any scanning: `workstats ui --format json` can only mean
+    // the user wanted one of the two, and picking silently is how --by-repo
+    // used to lose an explicit --group-by.
+    if presentation == Presentation::Explore && arguments.output_format != OutputFormat::Table {
+        bail!(
+            "`workstats ui` is interactive and writes no machine-readable output; drop --format, or run workstats without `ui` for json or csv"
+        );
+    }
+    let gap_cap = duration_flag("--gap-cap", &arguments.gap_cap)?;
+    let human_idle = duration_flag("--human-idle", &arguments.human_idle)?;
+    let review_credit = duration_flag("--review-credit", &arguments.review_credit)?;
+    let since = bound_flag("--since", arguments.since.as_deref(), false)?;
+    let until = bound_flag("--until", arguments.until.as_deref(), true)?;
+    let dimensions = grouping_dimensions(&arguments)?;
 
     let progress = Progress::new(
         arguments.no_progress,
         !arguments.no_color && env::var_os("NO_COLOR").is_none(),
     );
     progress.set("Loading configuration");
-    let directory = arguments.directory.clone().unwrap_or_else(|| {
-        env::var_os("WORKSTATS_DIR")
-            .map(PathBuf::from)
-            .or_else(|| env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
+    let directory = scan_directory(
+        arguments.directory.as_deref(),
+        env::var_os("WORKSTATS_DIR").map(PathBuf::from),
+        env::current_dir().ok(),
+    )?;
     let author = arguments.author.clone().unwrap_or_else(|| {
         env::var("WORKSTATS_AUTHOR")
             .ok()
@@ -380,10 +503,16 @@ fn run(arguments: Arguments) -> Result<()> {
         .unwrap_or_else(default_codex_database);
     let mut event_paths = arguments.events.clone();
     event_paths.extend(history_paths.remove("events").unwrap_or_default());
+    // Everything `workstats record` wrote is part of the picture unless the
+    // run says otherwise; adding one --events file must not silently drop it.
     let default_events = default_events_path();
-    if event_paths.is_empty() && default_events.is_file() {
+    if !arguments.no_default_events && default_events.is_file() {
         event_paths.push(default_events);
     }
+    let mut seen_event_paths = BTreeSet::new();
+    event_paths.retain(|path| {
+        seen_event_paths.insert(path.canonicalize().unwrap_or_else(|_| path.clone()))
+    });
     let mut included: BTreeSet<String> = arguments
         .provider
         .iter()
@@ -419,6 +548,9 @@ fn run(arguments: Arguments) -> Result<()> {
         && (arguments.check_updates
             || env::var_os("WORKSTATS_CHECK_UPDATES").is_some()
             || check_updates_configured);
+    // Before anything classifies a path, so every commit in this run is read
+    // through the same registry.
+    classify::install(config.category_registry()?)?;
     let rules = configured_rules(config, &arguments.source_rule)?;
     let mut resolver = PathResolver::new(rules);
     let cache_path = arguments.cache.clone().unwrap_or_else(default_cache_path);
@@ -626,6 +758,12 @@ fn run(arguments: Arguments) -> Result<()> {
         "Analyzed {} commits and {} AI sessions{cache_summary}",
         report.summary.commit_count, report.summary.session_count
     ));
+    if presentation == Presentation::Explore {
+        // Nothing above this line knows about the explorer: it browses the
+        // report the default command would have printed, and `commits` carries
+        // the per-commit detail the report itself aggregates away.
+        return tui::run(&report, commits);
+    }
     match arguments.output_format {
         OutputFormat::Json => print_json(&report)?,
         OutputFormat::Csv => print_csv(&report)?,
@@ -728,6 +866,62 @@ fn print_sources(arguments: &SourcesArguments) -> Result<()> {
     Ok(())
 }
 
+/// Answers "why did this file land there?" against the configured registry,
+/// which is the only way to debug a category rule without running a report.
+fn classify_paths(arguments: &ClassifyArguments) -> Result<()> {
+    let mut diagnostics = Diagnostics::default();
+    let config = load_config(arguments.config.as_deref(), &mut diagnostics);
+    let registry = config.category_registry()?;
+    for message in &diagnostics.messages {
+        eprintln!("workstats: {message}");
+    }
+    let classified: Vec<ClassifiedPath> = arguments
+        .paths
+        .iter()
+        .map(|path| {
+            let matched = registry.explain(path);
+            ClassifiedPath {
+                path: path.clone(),
+                category: registry.name(matched.category).to_string(),
+                rule: matched.rule.as_str(),
+                pattern: matched.pattern,
+            }
+        })
+        .collect();
+    match arguments.output_format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&classified)?),
+        OutputFormat::Csv => {
+            let mut writer = csv::Writer::from_writer(io::stdout());
+            for item in &classified {
+                writer.serialize(item)?;
+            }
+            writer.flush()?;
+        }
+        OutputFormat::Table => {
+            println!(
+                "{:<52} {:<10} {:<18} {}",
+                "PATH", "CATEGORY", "RULE", "MATCHED"
+            );
+            for item in &classified {
+                let pattern = if item.pattern.is_empty() {
+                    "—"
+                } else {
+                    item.pattern.as_str()
+                };
+                println!(
+                    "{:<52} {:<10} {:<18} {pattern}",
+                    item.path, item.category, item.rule
+                );
+            }
+            println!(
+                "\nCategories in match order: {}",
+                registry.names().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 fn record_event(arguments: &RecordArguments) -> Result<()> {
     let provider = normalize_provider(&arguments.provider);
     if !valid_provider_identifier(&provider, false) {
@@ -751,21 +945,28 @@ fn record_event(arguments: &RecordArguments) -> Result<()> {
     {
         bail!("--model must be a short model identifier, not message content");
     }
+    // The value is echoed back because an RFC 3339 timestamp is usually wrong
+    // in a way you can only see next to what you typed (AUDIT V).
     let timestamp = arguments
         .timestamp
         .as_deref()
-        .map(|value| parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --timestamp")))
+        .map(|value| {
+            parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --timestamp {value:?}"))
+        })
         .transpose()?;
     let started_at = arguments
         .started_at
         .as_deref()
-        .map(|value| parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --started-at")))
+        .map(|value| {
+            parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --started-at {value:?}"))
+        })
         .transpose()?;
     let completed_at = arguments
         .completed_at
         .as_deref()
         .map(|value| {
-            parse_timestamp(value).ok_or_else(|| anyhow::anyhow!("invalid --completed-at"))
+            parse_timestamp(value)
+                .ok_or_else(|| anyhow::anyhow!("invalid --completed-at {value:?}"))
         })
         .transpose()?;
     if started_at
@@ -879,6 +1080,163 @@ mod tests {
             "/repos/misc/widget-tools",
             "widget"
         ));
+    }
+
+    #[test]
+    fn the_classify_subcommand_takes_paths_and_a_format() {
+        let arguments = Arguments::try_parse_from([
+            "workstats",
+            "classify",
+            "src/main.rs",
+            "tests/lib.rs",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        let Some(Command::Classify(command)) = arguments.command else {
+            panic!("expected the classify subcommand");
+        };
+        assert_eq!(2, command.paths.len());
+        assert_eq!(OutputFormat::Json, command.output_format);
+        assert!(Arguments::try_parse_from(["workstats", "classify"]).is_err());
+    }
+
+    /// The explorer is only worth having if it answers the same question the
+    /// printed report does, which means taking the same filters.
+    #[test]
+    fn the_ui_subcommand_takes_the_report_flags() {
+        let arguments = Arguments::try_parse_from([
+            "workstats",
+            "ui",
+            "--dir",
+            "/repos/widget",
+            "--since",
+            "2026-01",
+            "--provider",
+            "claude,codex",
+            "--group-by",
+            "repo,month",
+        ])
+        .unwrap();
+        let Some(Command::Ui(command)) = arguments.command else {
+            panic!("expected the ui subcommand");
+        };
+        assert_eq!(Some(PathBuf::from("/repos/widget")), command.directory);
+        assert_eq!(Some("2026-01".to_string()), command.since);
+        assert_eq!(vec!["claude", "codex"], command.provider);
+        assert_eq!(
+            vec!["repo".to_string(), "month".to_string()],
+            grouping_dimensions(&command).unwrap()
+        );
+        assert!(Arguments::try_parse_from(["workstats", "ui"]).is_ok());
+    }
+
+    fn report_arguments(flags: &[&str]) -> ReportArguments {
+        let mut command = vec!["workstats"];
+        command.extend_from_slice(flags);
+        Arguments::try_parse_from(command).unwrap().report
+    }
+
+    #[test]
+    fn the_grouping_shortcuts_expand_and_default_to_repo() {
+        assert_eq!(
+            vec!["repo"],
+            grouping_dimensions(&report_arguments(&[])).unwrap()
+        );
+        assert_eq!(
+            vec!["month", "repo"],
+            grouping_dimensions(&report_arguments(&["--by-repo"])).unwrap()
+        );
+        assert_eq!(
+            vec!["repo", "month"],
+            grouping_dimensions(&report_arguments(&["--matrix"])).unwrap()
+        );
+        assert_eq!(
+            vec!["cwd"],
+            grouping_dimensions(&report_arguments(&["--by-dir"])).unwrap()
+        );
+        assert_eq!(
+            vec!["cwd", "day"],
+            grouping_dimensions(&report_arguments(&["--by-dir", "--period", "day"])).unwrap()
+        );
+        assert!(grouping_dimensions(&report_arguments(&["--group-by", "repo,repo"])).is_err());
+        assert!(grouping_dimensions(&report_arguments(&["--group-by", "nonsense"])).is_err());
+        assert!(grouping_dimensions(&report_arguments(&["--group-by", "day,month"])).is_err());
+    }
+
+    /// Each shortcut used to overwrite the grouping wholesale, so two together
+    /// meant one silently won (AUDIT V).
+    #[test]
+    fn the_grouping_shortcuts_conflict_instead_of_overriding_each_other() {
+        for flags in [
+            ["--by-repo", "--matrix"],
+            ["--by-repo", "--by-dir"],
+            ["--matrix", "--by-dir"],
+        ] {
+            assert!(
+                Arguments::try_parse_from(["workstats", flags[0], flags[1]]).is_err(),
+                "{flags:?} should conflict"
+            );
+        }
+        for shortcut in ["--by-repo", "--matrix", "--by-dir"] {
+            assert!(
+                Arguments::try_parse_from(["workstats", shortcut, "--group-by", "cwd"]).is_err(),
+                "{shortcut} should conflict with --group-by"
+            );
+            assert!(Arguments::try_parse_from(["workstats", shortcut]).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_bad_duration_or_date_names_the_flag_and_the_value() {
+        let error = format!("{:#}", duration_flag("--gap-cap", "5x").unwrap_err());
+        assert!(error.contains("--gap-cap"), "{error}");
+        assert!(error.contains("\"5x\""), "{error}");
+        let error = format!(
+            "{:#}",
+            bound_flag("--since", Some("2026-13"), false).unwrap_err()
+        );
+        assert!(error.contains("--since"), "{error}");
+        assert!(error.contains("2026-13"), "{error}");
+        assert!(bound_flag("--until", None, true).unwrap().is_none());
+        assert_eq!(
+            Duration::minutes(5),
+            duration_flag("--gap-cap", "5m").unwrap()
+        );
+    }
+
+    /// A typo'd scan root used to look exactly like a quiet week (AUDIT V).
+    #[test]
+    fn a_missing_scan_directory_is_an_error_that_names_where_it_came_from() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("nope");
+        assert_eq!(
+            temporary.path().to_path_buf(),
+            scan_directory(Some(temporary.path()), None, None).unwrap()
+        );
+        // An explicit --dir wins over both fallbacks, so its own absence is
+        // what gets reported.
+        let error = format!(
+            "{:#}",
+            scan_directory(
+                Some(&missing),
+                Some(temporary.path().to_path_buf()),
+                Some(temporary.path().to_path_buf())
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("--dir"), "{error}");
+        assert!(error.contains("nope"), "{error}");
+        let error = format!(
+            "{:#}",
+            scan_directory(None, Some(missing.clone()), None).unwrap_err()
+        );
+        assert!(error.contains("WORKSTATS_DIR"), "{error}");
+        let error = format!(
+            "{:#}",
+            scan_directory(None, None, Some(missing)).unwrap_err()
+        );
+        assert!(error.contains("current working directory"), "{error}");
     }
 
     #[test]

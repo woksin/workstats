@@ -21,6 +21,11 @@ pub fn parse_epoch_milliseconds(value: f64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp_micros(micros)
 }
 
+/// A gap cap, idle threshold, or review credit beyond a leap year is never a real
+/// request, and unbounded values used to saturate at `i64::MAX` microseconds and
+/// panic the first time one was added to a timestamp.
+const MAX_DURATION_SECONDS: f64 = 366.0 * 24.0 * 3600.0;
+
 pub fn parse_duration(value: &str) -> Result<Duration> {
     let expression = Regex::new(r"(?i)^(\d+(?:\.\d+)?)(s|m|h)$").expect("static regex");
     let Some(captures) = expression.captures(value.trim()) else {
@@ -36,9 +41,33 @@ pub fn parse_duration(value: &str) -> Result<Duration> {
         "h" => 3600.0,
         _ => unreachable!(),
     };
-    Ok(Duration::microseconds(
-        (amount * factor * 1_000_000.0).round() as i64,
-    ))
+    let seconds = amount * factor;
+    // A digit string too large for f64 parses to infinity, which this rejects too.
+    if seconds > MAX_DURATION_SECONDS {
+        bail!("duration must be at most 8784h (366 days)");
+    }
+    Ok(Duration::microseconds((seconds * 1_000_000.0).round() as i64))
+}
+
+/// chrono panics when a timestamp plus a delta leaves the representable range.
+/// Timestamps come from transcripts we do not control and deltas from flags, so
+/// every offset in this module clamps instead of trusting both to stay in range.
+fn saturating_add(value: DateTime<Utc>, delta: Duration) -> DateTime<Utc> {
+    let bound = if delta < Duration::zero() {
+        DateTime::<Utc>::MIN_UTC
+    } else {
+        DateTime::<Utc>::MAX_UTC
+    };
+    value.checked_add_signed(delta).unwrap_or(bound)
+}
+
+fn saturating_sub(value: DateTime<Utc>, delta: Duration) -> DateTime<Utc> {
+    let bound = if delta < Duration::zero() {
+        DateTime::<Utc>::MAX_UTC
+    } else {
+        DateTime::<Utc>::MIN_UTC
+    };
+    value.checked_sub_signed(delta).unwrap_or(bound)
 }
 
 pub fn parse_bound(value: Option<&str>, until: bool) -> Result<Option<DateTime<Utc>>> {
@@ -138,7 +167,9 @@ pub fn build_session_intervals(session: &Session, gap_cap: Duration) -> Vec<Inte
         }
         ranges.push((
             current.timestamp,
-            following.timestamp.min(current.timestamp + gap_cap),
+            following
+                .timestamp
+                .min(saturating_add(current.timestamp, gap_cap)),
             current.model.clone(),
         ));
     }
@@ -276,12 +307,12 @@ pub fn build_human_intervals(
                 .succ_opt()
                 .unwrap(),
         );
-        let mut left = (block[0].timestamp - edge).max(first_day);
+        let mut left = saturating_sub(block[0].timestamp, edge).max(first_day);
         for (index, signal) in block.iter().enumerate() {
             let right = if let Some(next) = block.get(index + 1) {
-                signal.timestamp + (next.timestamp - signal.timestamp) / 2
+                saturating_add(signal.timestamp, (next.timestamp - signal.timestamp) / 2)
             } else {
-                (signal.timestamp + edge).min(next_day)
+                saturating_add(signal.timestamp, edge).min(next_day)
             };
             if right > left {
                 intervals.push(Interval {
@@ -416,6 +447,7 @@ fn local_midnight(date: NaiveDate) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ExactInterval;
 
     fn session(points: Vec<ActivityPoint>) -> Session {
         Session {
@@ -430,6 +462,49 @@ mod tests {
             token_events: vec![],
             is_subagent: false,
         }
+    }
+
+    fn point(timestamp: &str, model: &str) -> ActivityPoint {
+        ActivityPoint {
+            timestamp: parse_timestamp(timestamp).unwrap(),
+            model: model.into(),
+        }
+    }
+
+    fn exact(start: &str, end: &str, model: &str) -> ExactInterval {
+        ExactInterval {
+            start: parse_timestamp(start).unwrap(),
+            end: parse_timestamp(end).unwrap(),
+            model: model.into(),
+        }
+    }
+
+    fn interval(start: &str, end: &str, model: &str) -> Interval {
+        Interval {
+            start: parse_timestamp(start).unwrap(),
+            end: parse_timestamp(end).unwrap(),
+            provider: "codex".into(),
+            model: model.into(),
+            session_id: "s".into(),
+            cwd: "/x".into(),
+            repo: "x".into(),
+            root: "root".into(),
+        }
+    }
+
+    fn shape(intervals: &[Interval]) -> Vec<(&str, f64)> {
+        intervals
+            .iter()
+            .map(|item| (item.model.as_str(), item.seconds()))
+            .collect()
+    }
+
+    fn seconds_by_model(intervals: &[Interval]) -> BTreeMap<&str, f64> {
+        let mut totals: BTreeMap<&str, f64> = BTreeMap::new();
+        for item in intervals {
+            *totals.entry(item.model.as_str()).or_default() += item.seconds();
+        }
+        totals
     }
 
     #[test]
@@ -447,6 +522,115 @@ mod tests {
         let intervals = build_session_intervals(&value, Duration::minutes(5));
         assert_eq!(420.0, intervals.iter().map(Interval::seconds).sum::<f64>());
         assert_eq!(420.0, union_seconds(&intervals));
+    }
+
+    #[test]
+    fn a_known_model_outranks_an_unknown_one_while_they_overlap() {
+        let value = Session {
+            exact_intervals: vec![exact("2026-01-01T10:02:00Z", "2026-01-01T10:06:00Z", "gpt")],
+            ..session(vec![
+                point("2026-01-01T10:00:00Z", "unknown"),
+                point("2026-01-01T10:10:00Z", "unknown"),
+            ])
+        };
+        let intervals = build_session_intervals(&value, Duration::minutes(30));
+        let expected = vec![("unknown", 120.0), ("gpt", 240.0), ("unknown", 240.0)];
+        assert_eq!(expected, shape(&intervals));
+        assert_eq!(600.0, union_seconds(&intervals));
+    }
+
+    #[test]
+    fn touching_ranges_with_one_model_become_a_single_interval() {
+        let value = Session {
+            exact_intervals: vec![
+                exact("2026-01-01T10:00:00Z", "2026-01-01T10:10:00Z", "m"),
+                exact("2026-01-01T10:10:00Z", "2026-01-01T10:20:00Z", "m"),
+            ],
+            ..session(vec![])
+        };
+        let intervals = build_session_intervals(&value, Duration::minutes(30));
+        assert_eq!(vec![("m", 600.0)], shape(&intervals));
+        assert_eq!(parse_timestamp("2026-01-01T10:00:00Z").unwrap(), intervals[0].start);
+        assert_eq!(parse_timestamp("2026-01-01T10:20:00Z").unwrap(), intervals[0].end);
+    }
+
+    #[test]
+    fn an_exact_interval_wins_inside_a_point_derived_range() {
+        let value = Session {
+            exact_intervals: vec![exact("2026-01-01T10:05:00Z", "2026-01-01T10:10:00Z", "n")],
+            ..session(vec![
+                point("2026-01-01T10:00:00Z", "m"),
+                point("2026-01-01T10:20:00Z", "m"),
+            ])
+        };
+        let intervals = build_session_intervals(&value, Duration::minutes(30));
+        // The wall clock is unchanged; only the attribution inside the overlap moves.
+        assert_eq!(1200.0, union_seconds(&intervals));
+        assert_eq!(BTreeMap::from([("m", 900.0), ("n", 300.0)]), seconds_by_model(&intervals));
+    }
+
+    #[test]
+    fn an_absurd_gap_cap_clamps_instead_of_panicking() {
+        let value = session(vec![
+            point("2026-01-01T10:00:00Z", "m"),
+            point("2026-01-01T10:05:00Z", "m"),
+        ]);
+        let intervals = build_session_intervals(&value, Duration::MAX);
+        assert_eq!(300.0, union_seconds(&intervals));
+    }
+
+    #[test]
+    fn an_absurd_review_credit_clamps_to_the_local_day() {
+        let timestamp = parse_timestamp("2026-01-01T12:00:00Z").unwrap();
+        let signal = HumanSignal {
+            timestamp,
+            provider: "git".into(),
+            session_id: "commit".into(),
+            cwd: "/repo".into(),
+            repo: "repo".into(),
+            root: "root".into(),
+            kind: "commit".into(),
+            model: "—".into(),
+        };
+        let intervals = build_human_intervals(&[signal], Duration::minutes(30), Duration::MAX);
+        let date = timestamp.with_timezone(&Local).date_naive();
+        assert_eq!(local_midnight(date), intervals[0].start);
+        assert_eq!(local_midnight(date.succ_opt().unwrap()), intervals[0].end);
+    }
+
+    #[test]
+    fn union_counts_a_nested_interval_once() {
+        let intervals = [
+            interval("2026-01-01T10:00:00Z", "2026-01-01T11:00:00Z", "m"),
+            interval("2026-01-01T10:10:00Z", "2026-01-01T10:20:00Z", "n"),
+            interval("2026-01-01T10:30:00Z", "2026-01-01T10:30:00Z", "n"),
+        ];
+        // Without the max() the enclosing range would be truncated to the nested end.
+        assert_eq!(3600.0, union_seconds(&intervals));
+    }
+
+    #[test]
+    fn union_joins_exactly_touching_intervals() {
+        let intervals = [
+            interval("2026-01-01T10:30:00Z", "2026-01-01T11:00:00Z", "n"),
+            interval("2026-01-01T10:00:00Z", "2026-01-01T10:30:00Z", "m"),
+        ];
+        assert_eq!(3600.0, union_seconds(&intervals));
+    }
+
+    #[test]
+    fn durations_parse_within_bounds_and_are_rejected_beyond_them() {
+        assert_eq!(Duration::seconds(30), parse_duration("30s").unwrap());
+        assert_eq!(Duration::minutes(5), parse_duration(" 5m ").unwrap());
+        assert_eq!(Duration::minutes(90), parse_duration("1.5H").unwrap());
+        assert_eq!(Duration::days(366), parse_duration("8784h").unwrap());
+        for value in ["", "5", "5x", "0s", "-5m", "1h30m"] {
+            assert!(parse_duration(value).is_err(), "{value} must be rejected");
+        }
+        // Past the clamp the value used to saturate at i64::MAX microseconds and
+        // panic on the first addition to a timestamp.
+        assert!(parse_duration("8785h").is_err());
+        assert!(parse_duration("99999999999999999999h").is_err());
     }
 
     #[test]
