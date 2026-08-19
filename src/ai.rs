@@ -2941,7 +2941,11 @@ impl PiSessionState {
         // `toolResult` is the harness reporting a tool it just ran, and it is written
         // between an assistant message and the next one. It is bracketed by activity
         // that is already counted, so it adds no interval of its own.
-        if role != "user" && role != "assistant" {
+        //
+        // `bashExecution` is the opposite case and is counted below: it is a `!command`
+        // typed into Pi's own prompt, which is a person at the keyboard rather than a
+        // tool the model chose to call.
+        if role != "user" && role != "assistant" && role != "bashExecution" {
             return;
         }
         if role == "assistant"
@@ -2984,10 +2988,21 @@ impl PiSessionState {
         }
         // A subagent's prompt was written by the agent that delegated to it, so a
         // delegated session has no human prompts at all.
-        let human = role == "user"
-            && message.human_content
-            && self.parent_session.is_none()
-            && !pi_injected_prompt(&message.prefix);
+        //
+        // A `bashExecution` is a command someone typed at Pi's prompt with `!` (or `!!`
+        // to keep the output out of the model's context). The model cannot produce one —
+        // it reaches the shell through the `bash` *tool*, which is recorded as a
+        // toolResult — so it is direct keyboard evidence, and it is counted whatever its
+        // content looks like, without the text ever being read.
+        let human = match role {
+            "user" => {
+                message.human_content
+                    && self.parent_session.is_none()
+                    && !pi_injected_prompt(&message.prefix)
+            }
+            "bashExecution" => self.parent_session.is_none(),
+            _ => false,
+        };
         if human {
             self.human_points.push(ActivityPoint {
                 timestamp,
@@ -3990,6 +4005,81 @@ mod tests {
         let mut wide = PiContent::default();
         wide.push(&"\u{1f600}".repeat(64));
         assert!(wide.prefix.len() <= MAX_PI_PROMPT_PREFIX_BYTES);
+    }
+
+    /// A `!command` typed at Pi's own prompt is a person at the keyboard. The model has no
+    /// way to produce one — it reaches the shell through the `bash` tool, which is logged
+    /// as a toolResult — so it is direct evidence of involvement, and the command itself
+    /// is never read.
+    #[test]
+    fn pi_shell_commands_typed_by_a_person_are_human_evidence() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("--tmp-project--");
+        fs::create_dir(&directory).unwrap();
+        let path = pi_session(
+            &directory,
+            "2026-01-01T00-00-00-000Z_session.jsonl",
+            serde_json::json!({
+                "type": "session", "version": 3, "id": "session-one",
+                "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/tmp/project"
+            }),
+            &[
+                pi_message(
+                    "a",
+                    "2026-01-01T00:00:10.000Z",
+                    serde_json::json!({"role": "bashExecution",
+                        "command": "deploy --token hunter2",
+                        "output": "secret-output", "exitCode": 0,
+                        "cancelled": false, "truncated": false}),
+                ),
+                // `!!` keeps the output out of the model's context; someone still typed it.
+                pi_message(
+                    "b",
+                    "2026-01-01T00:00:20.000Z",
+                    serde_json::json!({"role": "bashExecution", "command": "git status",
+                        "output": "clean", "exitCode": 0, "cancelled": false,
+                        "truncated": false, "excludeFromContext": true}),
+                ),
+            ],
+        );
+
+        let parsed = parse_pi_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        let session = &parsed.sessions[0];
+        assert_eq!(2, session.human_points.len());
+        assert_eq!(2, session.points.len());
+        let serialized = serde_json::to_string(&parsed).unwrap();
+        assert!(!serialized.contains("hunter2"));
+        assert!(!serialized.contains("secret-output"));
+    }
+
+    /// A subagent runs unattended, so a shell command inside one was issued by the agent
+    /// driving it rather than typed by anyone.
+    #[test]
+    fn pi_shell_commands_in_a_delegated_session_are_not_human_evidence() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("--tmp-project--");
+        fs::create_dir(&directory).unwrap();
+        let path = pi_session(
+            &directory,
+            "2026-01-01T01-00-00-000Z_child.jsonl",
+            serde_json::json!({
+                "type": "session", "version": 3, "id": "child",
+                "timestamp": "2026-01-01T01:00:00.000Z", "cwd": "/tmp/project",
+                "parentSession": "/somewhere/parent.jsonl"
+            }),
+            &[pi_message(
+                "a",
+                "2026-01-01T01:00:10.000Z",
+                serde_json::json!({"role": "bashExecution", "command": "cargo test",
+                    "output": "ok", "exitCode": 0, "cancelled": false,
+                    "truncated": false}),
+            )],
+        );
+
+        let parsed = parse_pi_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        let session = &parsed.sessions[0];
+        assert!(session.human_points.is_empty());
+        assert_eq!(1, session.points.len());
     }
 
     /// Compacting a context and summarizing an abandoned branch are model calls Pi bills,

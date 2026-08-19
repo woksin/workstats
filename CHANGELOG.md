@@ -112,8 +112,14 @@ tag are the generated list of pull requests.
   in, an extension's `[SYSTEM]` watchdog notice, a background-task or subagent
   notification, and a tool call in user position are not counted as prompts:
   they are written while the machine works and nobody is at the keyboard.
+  A `!command` typed at Pi's own prompt is the other side of that coin: the
+  model cannot produce one — it reaches the shell through the `bash` *tool*,
+  which is logged as a tool result — so it is counted as direct keyboard
+  evidence, in a foreground session, without the command ever being read.
+
   Message text is examined only far enough to recognise those markers — at most
-  64 bytes of a user message, never a response or a tool result. Compacting a
+  64 bytes of a user message, never a response, a shell command, or a tool
+  result. Compacting a
   context and summarizing an abandoned branch are model calls Pi bills, so they
   count as agent activity and carry their tokens; neither is ever a prompt,
   because the summary is written by the model rather than typed by anyone, and
