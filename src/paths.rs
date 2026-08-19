@@ -317,6 +317,42 @@ pub fn lossy_claude_cwd(project_dir: &Path) -> String {
     }
 }
 
+/// Recovers a working directory from the name of a Pi session directory.
+///
+/// Pi encodes it as `--<path with the leading separator stripped and `/`, `\` and `:`
+/// replaced by `-`>--`. That is only reached when a session header carries no `cwd`,
+/// because the header records the resolved absolute path and is always preferred.
+///
+/// The decoding cannot be exact and is not meant to be: every `-` becomes a separator,
+/// so a directory whose own name contains one is indistinguishable from two nested
+/// directories. Sessions decoded this way are counted in `approximate_cwds` and reported
+/// as approximate, which is why guessing here is safe and silence would not be.
+pub fn lossy_pi_cwd(session_dir: &Path) -> String {
+    let encoded = session_dir
+        .file_name()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_default();
+    // The wrapping `--` is Pi's marker, not part of the path. Stripping it is what keeps
+    // the result from gaining the empty leading and trailing components that a plain
+    // separator substitution would produce.
+    let inner = encoded
+        .strip_prefix("--")
+        .and_then(|value| value.strip_suffix("--"))
+        .unwrap_or(&encoded);
+    // A Windows path arrives as `C--Users-test-project`: the drive's `:` and the
+    // separator after it were both replaced, so the drive letter is followed by two
+    // dashes. Not gated on the host platform, because a session directory copied from a
+    // Windows machine has to decode the same way wherever it is read.
+    if inner.len() >= 3
+        && inner.as_bytes()[0].is_ascii_alphabetic()
+        && &inner.as_bytes()[1..3] == b"--"
+    {
+        let drive = inner.chars().next().unwrap_or('C').to_ascii_uppercase();
+        return format!("{drive}:/{}", inner[3..].replace('-', "/"));
+    }
+    format!("/{}", inner.replace('-', "/"))
+}
+
 fn expand_path(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
         return home.to_path_buf();
@@ -434,6 +470,28 @@ mod tests {
         assert_eq!(
             "C:/Users/test/project",
             lossy_claude_cwd(Path::new("C--Users-test-project"))
+        );
+    }
+
+    /// Pi wraps the encoded path in `--`, which Claude's decoder does not know about and
+    /// would turn into empty leading and trailing path components.
+    #[test]
+    fn pi_session_path_fallback_strips_the_marker_it_is_wrapped_in() {
+        assert_eq!(
+            "/tmp/real/project",
+            lossy_pi_cwd(Path::new("--tmp-real-project--"))
+        );
+        // A Windows drive loses its colon to the same substitution as the separators, so
+        // the letter is followed by two dashes rather than one.
+        assert_eq!(
+            "C:/Users/test/project",
+            lossy_pi_cwd(Path::new("--C--Users-test-project--"))
+        );
+        // Decoded on any host, because a copied session directory has to read the same
+        // way everywhere.
+        assert_eq!(
+            "/tmp/real/project",
+            lossy_pi_cwd(Path::new("tmp-real-project"))
         );
     }
 }

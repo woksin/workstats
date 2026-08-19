@@ -88,6 +88,36 @@ tag are the generated list of pull requests.
   direction-override characters are replaced before drawing so a file cannot
   repaint the terminal.
 - `--no-default-events` skips the event log written by `workstats record`.
+- The Pi coding agent, as the provider `pi`. Pi keeps one JSONL transcript per
+  session under `~/.pi/agent/sessions/--<encoded cwd>--/`, and the session
+  header records the working directory as a resolved absolute path, so sessions
+  are attributed exactly rather than by decoding a directory name. Token counts
+  are read per assistant message; `cacheWrite1h` is a breakdown of `cacheWrite`
+  and is deliberately not added to it, and `totalTokens` and `cost` are derived
+  fields nothing here reads. `PI_CODING_AGENT_SESSION_DIR` and
+  `PI_CODING_AGENT_DIR` are honoured the same way Pi honours them, so a
+  relocated or containerised install is found instead of silently reporting no
+  activity. `pi-agent`, `pi-coding-agent`, and `pi-cli` all name the same
+  provider.
+
+  Two things Pi's format makes ambiguous are resolved rather than guessed.
+  A session created from another one records the parent's path, which covers
+  both a delegated subagent and a `/fork` or `/clone`: delegated work is
+  reported as agent activity and **never** as human time, matching how the
+  OpenCode and Copilot adapters treat a session with a parent. A fork also
+  *copies* the source session's entries into the new file keeping their original
+  timestamps, so those duplicates are counted once — in the session that
+  recorded them — and the run notes how many it set aside. And because Pi has a
+  single `user` role that both typed prompts and machine-written turns arrive
+  in, an extension's `[SYSTEM]` watchdog notice, a background-task or subagent
+  notification, and a tool call in user position are not counted as prompts:
+  they are written while the machine works and nobody is at the keyboard.
+  Message text is examined only far enough to recognise those markers — at most
+  64 bytes of a user message, never a response or a tool result. Compacting a
+  context and summarizing an abandoned branch are model calls Pi bills, so they
+  count as agent activity and carry their tokens; neither is ever a prompt,
+  because the summary is written by the model rather than typed by anyone, and
+  the summary text is not read.
 - GitHub Copilot Chat in VS Code, as the provider `copilot-vscode`. Every
   prompt in a chat session counts as human involvement at the moment it was
   sent, and a turn VS Code timed contributes the interval it actually took

@@ -27,7 +27,7 @@ use aggregate::{DIMENSIONS, build_report};
 use ai::{
     read_claude_sessions_indexed, read_codex_sessions_indexed, read_copilot_sessions_indexed,
     read_copilot_vscode_sessions_indexed, read_event_sessions_indexed,
-    read_gemini_sessions_indexed, read_opencode_sessions_indexed,
+    read_gemini_sessions_indexed, read_opencode_sessions_indexed, read_pi_sessions_indexed,
 };
 use cache::TranscriptCache;
 use git::{DEFAULT_AGENT_AUTHORS, default_git_author, read_agent_commits, read_git_commits};
@@ -710,6 +710,14 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
                     ),
                     "opencode" => read_opencode_sessions_indexed(
                         &resolve_opencode_database(path),
+                        &mut resolver,
+                        &mut diagnostics,
+                        transcript_cache.as_mut(),
+                        since,
+                        until,
+                    ),
+                    "pi" => read_pi_sessions_indexed(
+                        path,
                         &mut resolver,
                         &mut diagnostics,
                         transcript_cache.as_mut(),
