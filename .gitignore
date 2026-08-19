@@ -15,3 +15,8 @@ target/
 *.sqlite
 *.sqlite3
 *.db
+
+# Pi agent run artifacts. Project-level Pi config (.pi/skills, .pi/SYSTEM.md)
+# is deliberately still tracked; only per-run scratch is ignored.
+.pi/fusion/
+.pi/tasks/
