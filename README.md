@@ -96,7 +96,7 @@ setup and review evidence without treating autonomous output as attendance.
 `workstats` keeps those ideas separate:
 
 | Signal | What it answers | How it is treated |
-|---|---|---|
+| --- | --- | --- |
 | **Human-work estimate** | “How much time was plausibly spent developing or supervising?” | Prompts, foreground session boundaries, and authored commits form non-overlapping involvement blocks with setup/review credit. |
 | **Git output** | “What changed?” | Commits, files, additions, deletions, and ignored generated/vendor lines — all of them authored by the identity `--author` names. |
 | **Agent-authored Git output** | “What landed that I did not type?” | Commits a coding agent authored, matched by Git identity in a second pass and reported in their own columns and their own section. **Never human time**: no work blocks, no setup/review credit, no active *human* days, and never added into the Git-output figures above. A `Co-authored-by:` trailer is the other case — it describes a commit you already wrote, so it is a share of your commits and never an addition to them. |
@@ -115,6 +115,7 @@ attendance system, or a universal productivity score.
   ● claude          Claude Code                    built-in
   ● codex           OpenAI Codex                   built-in
   ● gemini          Google Gemini CLI              built-in
+  ● pi              Pi Coding Agent                built-in
   ● copilot         GitHub Copilot CLI             best-effort
   ● copilot-vscode  GitHub Copilot Chat (VS Code)  best-effort
   ● opencode        OpenCode                       best-effort
@@ -314,7 +315,7 @@ breadcrumb, because "when else did this change?" is the next question. Pressing
 `Enter` there opens [the diff](#the-diff-viewer-is-the-one-place-file-contents-are-read).
 
 | Key | Does |
-|---|---|
+| --- | --- |
 | `↑` `↓` / `k` `j` | move the selection |
 | `PgUp` `PgDn` / `Ctrl-b` `Ctrl-f` / `Space` | move by a screen |
 | `Home` `End` / `g` `G` | first / last row |
@@ -447,7 +448,7 @@ An illustrative one-day report over roughly 6.8 GB of retained transcripts on
 an Apple silicon laptop:
 
 | Mode | Time | Peak memory |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Index disabled | 2.7 s | 172 MiB |
 | Warm index | **1.05 s** | **54 MiB** |
 
@@ -495,7 +496,7 @@ The areas are a registry, listed here in match order — **the first category
 whose rules match a path wins**:
 
 | Area | Matched by |
-|---|---|
+| --- | --- |
 | `test` | A `tests/`, `spec/`, `__tests__/`, `fixtures/`, or `benches/` directory; a sibling test project such as `Arc.Core.Specs/` or `Fundamentals.Tests/`; a BDD behaviour folder such as `for_Subject/when_something/given/`; or a name such as `user_spec.rb`, `Button.test.tsx`, `UserServiceTest.java`, `when_binding.cs`. |
 | `docs` | `.md`, `.rst`, `.adoc`, a `docs/` directory, or a `README`/`LICENSE`/`CHANGELOG`-style name. |
 | `config` | Manifests, CI, and tooling — `.toml`, `.yml`, `.json`, `Dockerfile`, `Makefile`, `.github/**`. |
@@ -514,7 +515,7 @@ changed lines, and — for code-like areas such as `source` — by its
 addition/deletion balance:
 
 | Shape | Diff |
-|---|---|
+| --- | --- |
 | `new code` | Code-dominant, deletions under a quarter of additions. |
 | `revision` | Code-dominant, additions and deletions comparable. |
 | `removal` | Code-dominant, deletions more than double additions. |
@@ -590,7 +591,7 @@ makes `.claude/settings.json` land in `ai` rather than `config`.
 Every rule set is a list of plain strings — no regular expressions:
 
 | Rule | Matches |
-|---|---|
+| --- | --- |
 | `directories` | An exact path component above the file name (`"corpus"`, `".claude"`). |
 | `directory_prefixes` / `directory_suffixes` | A path component starting or ending with it (`"for_"`, `".specs"`). |
 | `extensions` | The final extension, written `".rs"` or `"rs"`. |
@@ -712,7 +713,7 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 ## Inputs and index
 
 | Source | Default location |
-|---|---|
+| --- | --- |
 | Codex sessions | `~/.codex/sessions` |
 | Codex metadata | `~/.codex/state_5.sqlite` |
 | Claude Code projects | `~/.claude/projects` |
@@ -721,6 +722,7 @@ See [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 | GitHub Copilot CLI metadata | `~/.copilot/session-store.db` |
 | GitHub Copilot Chat sessions | `~/Library/Application Support/Code/User/workspaceStorage` (macOS) |
 | OpenCode sessions | `~/.local/share/opencode/opencode.db` |
+| Pi sessions | `~/.pi/agent/sessions/--<encoded cwd>--/*.jsonl` |
 | Workstats Events | platform data directory (shown by `workstats sources`) |
 | Git repositories | current directory, `--dir PATH`, or `WORKSTATS_DIR` |
 
@@ -728,6 +730,11 @@ VS Code keeps that chat directory under `%APPDATA%\Code\User\workspaceStorage`
 on Windows and `~/.config/Code/User/workspaceStorage` on Linux. `Code -
 Insiders` and `VSCodium` are read alongside `Code` when they exist; any other
 install is reachable with `--history copilot-vscode=PATH`.
+
+Pi resolves its own session directory from `PI_CODING_AGENT_SESSION_DIR`, then
+`PI_CODING_AGENT_DIR`, then `~/.pi/agent`, and `workstats` reads the same two
+variables — so a relocated or containerised install is found rather than
+silently reported as no activity.
 
 All inputs are optional (`--no-git`, `--no-ai`, `--provider`, and
 `--exclude-provider`). Missing default histories are silently skipped; a
@@ -737,7 +744,7 @@ them all) rather than producing a clean-looking report with data quietly
 missing. The structural index defaults to:
 
 | Platform | Cache | Config | Event log |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | macOS | `~/.cache/workstats/index.sqlite3` | `~/.config/workstats/config.json` | `~/Library/Application Support/workstats/events.jsonl` |
 | Linux | `$XDG_CACHE_HOME/workstats/index.sqlite3` or `~/.cache/workstats/index.sqlite3` | `$XDG_CONFIG_HOME/workstats/config.json` or `~/.config/workstats/config.json` | `$XDG_DATA_HOME/workstats/events.jsonl` or `~/.local/share/workstats/events.jsonl` |
 | Windows | `%LOCALAPPDATA%\workstats\cache\index.sqlite3` | `%APPDATA%\workstats\config.json` | `%LOCALAPPDATA%\workstats\events.jsonl` |
@@ -866,7 +873,7 @@ The built-in identities are matched on the **tail of the e-mail address**, never
 on the number in front of it:
 
 | Identity | Matched by |
-|---|---|
+| --- | --- |
 | GitHub Copilot coding agent | `+Copilot@users.noreply.github.com>` |
 | Copilot on github.com | `<copilot@github.com>` |
 | Claude | `+claude[bot]@users.noreply.github.com>` and `<noreply@anthropic.com>` |

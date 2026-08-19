@@ -14,6 +14,7 @@ pub const BUILTIN_PROVIDERS: &[&str] = &[
     "copilot-vscode",
     "gemini",
     "opencode",
+    "pi",
 ];
 
 #[derive(Clone, Debug, Serialize)]
@@ -36,6 +37,7 @@ pub fn normalize_provider(value: &str) -> String {
         // the surface a session came from is what the reader needs to know.
         "copilot-chat" | "vscode-copilot" | "vs-code-copilot" => "copilot-vscode".to_string(),
         "open-code" => "opencode".to_string(),
+        "pi-agent" | "pi-coding-agent" | "pi-cli" => "pi".to_string(),
         other => other.to_string(),
     }
 }
@@ -95,7 +97,25 @@ pub fn default_history_paths() -> BTreeMap<String, Vec<PathBuf>> {
             "opencode".to_string(),
             vec![home.join(".local/share/opencode/opencode.db")],
         ),
+        ("pi".to_string(), vec![pi_history_path(&home)]),
     ])
+}
+
+/// Where Pi keeps session transcripts.
+///
+/// Pi resolves this itself from `PI_CODING_AGENT_SESSION_DIR`, else
+/// `PI_CODING_AGENT_DIR`, else `~/.pi/agent`, so the same variables are honoured here.
+/// Reading them rather than assuming the default is what makes the tool find the history
+/// of a Pi that stores it elsewhere — which is the normal case under a containerised or
+/// XDG-relocated setup — instead of silently reporting no Pi activity.
+fn pi_history_path(home: &Path) -> PathBuf {
+    if let Some(path) = env::var_os("PI_CODING_AGENT_SESSION_DIR") {
+        return PathBuf::from(path);
+    }
+    if let Some(path) = env::var_os("PI_CODING_AGENT_DIR") {
+        return PathBuf::from(path).join("sessions");
+    }
+    home.join(".pi/agent/sessions")
 }
 
 /// VS Code keeps chat transcripts per install, and several installs coexist happily.
@@ -188,6 +208,7 @@ pub fn source_inventory() -> Vec<SourceInfo> {
             "built-in",
         ),
         ("opencode", "OpenCode", "read-only SQLite", "best-effort"),
+        ("pi", "Pi Coding Agent", "JSONL transcripts", "built-in"),
     ] {
         for path in defaults.get(id).into_iter().flatten() {
             let detected = if id == "opencode" {

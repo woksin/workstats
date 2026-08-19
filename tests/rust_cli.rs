@@ -158,6 +158,97 @@ fn cache_hits_then_invalidates_a_changed_transcript() {
     assert_eq!(60.0, changed["summary"]["agent_wall_seconds"]);
 }
 
+/// Pi records delegated work in its own session file, so a run that reads them has to
+/// keep a subagent's activity out of the human estimate while still reporting it as agent
+/// work. This exercises the whole path — discovery, `--history` override, parsing,
+/// grouping — rather than the parser alone.
+#[test]
+fn pi_subagent_work_is_reported_as_agent_activity_and_never_as_human_time() {
+    let directory = tempdir().unwrap();
+    let project = directory.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let history = directory.path().join("pi-sessions/--encoded--");
+    fs::create_dir_all(&history).unwrap();
+
+    let usage = serde_json::json!({
+        "input": 10, "output": 20, "cacheRead": 30, "cacheWrite": 40,
+        "cacheWrite1h": 40, "totalTokens": 100,
+        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+    });
+    let foreground = history.join("2026-01-01T00-00-00-000Z_foreground.jsonl");
+    let lines = [
+        serde_json::json!({"type": "session", "version": 3, "id": "foreground",
+            "timestamp": "2026-01-01T00:00:00.000Z", "cwd": project}),
+        serde_json::json!({"type": "message", "id": "a", "parentId": null,
+            "timestamp": "2026-01-01T00:00:10.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "do the thing"}]}}),
+        serde_json::json!({"type": "message", "id": "b", "parentId": "a",
+            "timestamp": "2026-01-01T00:01:10.000Z",
+            "message": {"role": "assistant", "model": "pi-test", "provider": "anthropic",
+                "stopReason": "stop", "usage": usage,
+                "content": [{"type": "text", "text": "done"}]}}),
+    ];
+    fs::write(
+        &foreground,
+        lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let child = history.join("2026-01-01T00-02-00-000Z_child.jsonl");
+    let child_lines = [
+        serde_json::json!({"type": "session", "version": 3, "id": "child",
+            "timestamp": "2026-01-01T00:02:00.000Z", "cwd": project,
+            "parentSession": foreground}),
+        // The delegating agent wrote this prompt, not a person.
+        serde_json::json!({"type": "message", "id": "a", "parentId": null,
+            "timestamp": "2026-01-01T00:02:10.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "You are investigating X."}]}}),
+        serde_json::json!({"type": "message", "id": "b", "parentId": "a",
+            "timestamp": "2026-01-01T00:03:10.000Z",
+            "message": {"role": "assistant", "model": "pi-test", "provider": "anthropic",
+                "stopReason": "stop", "usage": usage,
+                "content": [{"type": "text", "text": "reported"}]}}),
+    ];
+    fs::write(
+        &child,
+        child_lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+
+    let report: Value = serde_json::from_slice(
+        &run(&[
+            "--no-git",
+            "--provider",
+            "pi",
+            "--history",
+            &format!("pi={}", directory.path().join("pi-sessions").display()),
+            "--format",
+            "json",
+        ])
+        .stdout,
+    )
+    .unwrap();
+
+    let summary = &report["summary"];
+    assert_eq!(2, summary["session_count"]);
+    assert_eq!(1, summary["foreground_session_count"]);
+    assert_eq!(1, summary["subagent_session_count"]);
+    // One typed prompt, from the foreground session only.
+    assert_eq!(1, summary["prompt_signal_count"]);
+    // Both sessions ran a minute of agent time, and they do not overlap.
+    assert_eq!(120.0, summary["agent_wall_seconds"]);
+    assert_eq!(200, summary["total_tokens"]);
+    assert_eq!(200, summary["provider_tokens"]["pi"]);
+}
+
 #[test]
 fn sources_and_open_event_recording_form_a_complete_integration_path() {
     let sources = run(&["sources", "--format", "json"]);
@@ -173,6 +264,7 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
     assert!(ids.contains(&"copilot"));
     assert!(ids.contains(&"copilot-vscode"));
     assert!(ids.contains(&"opencode"));
+    assert!(ids.contains(&"pi"));
     assert!(ids.contains(&"events"));
 
     let directory = tempdir().unwrap();
