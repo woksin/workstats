@@ -487,7 +487,7 @@ fn a_filter_matching_only_a_nested_session_directory_still_finds_the_commits() {
 }
 
 #[test]
-fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
+fn ai_session_infers_its_git_checkout_outside_the_scan_directory_without_a_repo_filter() {
     let temporary = tempdir().unwrap();
     let project = temporary.path().join("project");
     let unrelated = temporary.path().join("unrelated");
@@ -539,8 +539,6 @@ fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
         unrelated.to_str().unwrap(),
         "--author",
         "fixture@example.com",
-        "--repo-exact",
-        "project",
         "--provider",
         "fixture",
         "--events",
@@ -557,6 +555,7 @@ fn filtered_ai_session_infers_its_git_checkout_outside_the_scan_directory() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(1, report["summary"]["session_count"]);
     assert_eq!(1, report["summary"]["commit_count"]);
     let expected_root = project
         .canonicalize()

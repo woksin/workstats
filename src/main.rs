@@ -757,9 +757,10 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
     let mut agent_commits = Vec::new();
     if !arguments.no_git {
         git_scan_roots.push(directory.clone());
-        if repo_filter.is_some() {
-            git_scan_roots.extend(inferred_repository_roots(&sessions));
-        }
+        // Sessions can belong to locally available checkouts outside `--dir`.
+        // Always scan those roots so adding or removing a repo filter cannot
+        // change which commits contribute to a retained session's report.
+        git_scan_roots.extend(inferred_repository_roots(&sessions));
         let mut seen_roots = BTreeSet::new();
         git_scan_roots
             .retain(|root| seen_roots.insert(root.canonicalize().unwrap_or_else(|_| root.clone())));
@@ -770,7 +771,7 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         for root in &git_scan_roots {
             let scan_root = root.canonicalize().unwrap_or_else(|_| root.clone());
             // Everything but the configured directory got here by being the
-            // checkout of a session the filter already matched.
+            // checkout of a retained session.
             let from_session = scan_root != configured_root;
             let depth = if from_session { 0 } else { arguments.depth };
             // Re-applying the filter to such a root would reject it: the filter

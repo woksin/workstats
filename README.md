@@ -828,11 +828,11 @@ separately as ignored lines.
 the same three labels on both sides — the repository name, the working
 directory, and the source root — so a pattern naming a source root selects
 commits as well as AI sessions. `--repo-exact NAME` avoids mixing names such as
-`api` and `api-tools`. When either filter matches retained AI sessions,
-`workstats` also scans their locally available Git checkouts—even when those
-checkouts are outside `--dir`. This keeps Git and AI results aligned without
-assuming a particular projects folder; `--dir` remains the primary Git
-discovery root.
+`api` and `api-tools`. `workstats` also scans locally available Git checkouts
+for retained AI sessions—even when those checkouts are outside `--dir`. This
+keeps Git and AI results aligned regardless of whether a repository filter is
+used, without assuming a particular projects folder; `--dir` remains the
+primary Git discovery root.
 
 Source roots are customizable without exposing local paths in the repository:
 

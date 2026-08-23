@@ -12,6 +12,12 @@ tag are the generated list of pull requests.
 
 ## [Unreleased]
 
+### Fixed
+
+- Unfiltered reports now scan the locally available Git checkout associated
+  with each retained AI session, even when it is outside `--dir`. Repository
+  filters no longer change whether that session's authored commits are found.
+
 ### Added
 
 - `--agent-commits` reads commits a coding agent authored and reports them as
