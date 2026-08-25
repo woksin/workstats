@@ -14,12 +14,22 @@ tag are the generated list of pull requests.
 
 ### Fixed
 
+- `--review-credit` can no longer exceed `--human-idle`, which could make
+  separately clustered human-time blocks overlap and count the overlap twice.
 - Unfiltered reports now scan the locally available Git checkout associated
   with each retained AI session, even when it is outside `--dir`. Repository
   filters no longer change whether that session's authored commits are found.
 
 ### Added
 
+- `--explain-human-time` prints an auditable signal and work-block ledger in
+  table output and adds the same structured calculation to JSON. It records
+  timestamp-selection decisions, block boundaries, requested and actual review
+  credit, calendar/report clipping, and a reconciling total without exposing
+  prompt text, session identifiers, paths, model names, or commit hashes.
+  Normal JSON now always names the stable human-time algorithm and its timezone
+  and boundary basis. CSV rejects the flag because its grouped-row shape cannot
+  represent a one-to-many block ledger.
 - `--agent-commits` reads commits a coding agent authored and reports them as
   output, never as human time. Once a branch has been fetched, that work is
   ordinary local Git history, and `--author` cannot see it because the agent is

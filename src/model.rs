@@ -373,6 +373,9 @@ impl Diagnostics {
 #[derive(Debug, Serialize)]
 pub struct Methodology {
     pub human_work: &'static str,
+    pub human_time_algorithm_version: &'static str,
+    pub human_time_timezone_basis: &'static str,
+    pub human_time_boundary_basis: &'static str,
     pub human_idle_threshold_seconds: f64,
     pub review_credit_seconds: f64,
     pub human_estimate_caveat: &'static str,
@@ -387,6 +390,75 @@ pub struct Methodology {
     /// that looks like their own output but is not.
     pub agent_output: &'static str,
     pub scope: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HumanTimeSignalExplanation {
+    pub id: String,
+    pub timestamp: String,
+    pub kind: String,
+    pub provider: String,
+    pub repo: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HumanTimeSignalSet {
+    pub count: usize,
+    pub counts_by_kind: BTreeMap<String, usize>,
+    pub signals: Vec<HumanTimeSignalExplanation>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HumanTimeDeduplicationGroup {
+    pub timestamp: String,
+    pub kept_signal_id: String,
+    pub discarded_signal_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HumanTimeDeduplication {
+    pub priority: &'static str,
+    pub equal_priority_tie_break: &'static str,
+    pub discarded_signal_count: usize,
+    pub groups: Vec<HumanTimeDeduplicationGroup>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HumanTimeBlockClipping {
+    pub local_day_start_seconds: f64,
+    pub local_day_end_seconds: f64,
+    pub report_window_start_seconds: f64,
+    pub report_window_end_seconds: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HumanTimeBlockExplanation {
+    pub id: String,
+    pub start: String,
+    pub end: String,
+    pub first_signal_timestamp: String,
+    pub last_signal_timestamp: String,
+    pub seconds: f64,
+    pub requested_review_credit_seconds: f64,
+    pub actual_start_credit_seconds: f64,
+    pub actual_end_credit_seconds: f64,
+    pub signal_count: usize,
+    pub counts_by_kind: BTreeMap<String, usize>,
+    pub signal_ids: Vec<String>,
+    pub clipping: HumanTimeBlockClipping,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HumanTimeExplanation {
+    pub algorithm_version: &'static str,
+    pub timezone_basis: &'static str,
+    pub input_signals: HumanTimeSignalSet,
+    pub effective_signals: HumanTimeSignalSet,
+    pub same_timestamp_deduplication: HumanTimeDeduplication,
+    pub blocks: Vec<HumanTimeBlockExplanation>,
+    pub unrounded_block_seconds_total: f64,
+    pub total_rounding_adjustment_seconds: f64,
+    pub total_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -536,6 +608,8 @@ pub struct Inputs {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub methodology: Methodology,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_time_explanation: Option<HumanTimeExplanation>,
     pub observed: Observed,
     pub summary: Summary,
     pub group_by: Vec<String>,

@@ -5,11 +5,11 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::classify::{CategoryTally, ShapeTally, active_registry, change_shape};
 use crate::model::{
-    CompositionEntry, GitCommit, HumanSignal, Interval, Methodology, Observed, ReportRow, Session,
-    ShapeEntry, Summary, TokenUsage,
+    CompositionEntry, GitCommit, HumanSignal, HumanTimeExplanation, Interval, Methodology,
+    Observed, ReportRow, Session, ShapeEntry, Summary, TokenUsage,
 };
 use crate::timeutil::{
-    build_human_intervals, build_session_intervals, calendar_days, clip_interval, local_date,
+    build_session_intervals, calculate_human_time, calendar_days, clip_interval, local_date,
     local_month, split_interval, union_seconds,
 };
 
@@ -53,6 +53,7 @@ struct Bucket {
 
 pub struct BuiltReport {
     pub methodology: Methodology,
+    pub human_time_explanation: Option<HumanTimeExplanation>,
     pub observed: Observed,
     pub summary: Summary,
     pub group_by: Vec<String>,
@@ -124,6 +125,7 @@ fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
 /// slices at a call site would change nothing about the report — and the human
 /// timeline is reachable only through `GitCommit::human_signal`, which hands
 /// back nothing at all for agent-authored work.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_report(
     sessions: &[Session],
@@ -135,6 +137,33 @@ pub fn build_report(
     dimensions: &[String],
     human_idle: Duration,
     review_credit: Duration,
+) -> BuiltReport {
+    build_report_with_human_time_explanation(
+        sessions,
+        commits,
+        agent_commits,
+        gap_cap,
+        since,
+        until,
+        dimensions,
+        human_idle,
+        review_credit,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_report_with_human_time_explanation(
+    sessions: &[Session],
+    commits: &[GitCommit],
+    agent_commits: &[GitCommit],
+    gap_cap: Duration,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    dimensions: &[String],
+    human_idle: Duration,
+    review_credit: Duration,
+    explain_human_time: bool,
 ) -> BuiltReport {
     let intervals: Vec<_> = sessions
         .iter()
@@ -183,11 +212,17 @@ pub fn build_report(
                 && until.is_none_or(|bound| signal.timestamp < bound)
         })
         .collect();
-    let human_intervals: Vec<_> =
-        build_human_intervals(&filtered_human_signals, human_idle, review_credit)
-            .into_iter()
-            .filter_map(|interval| clip_interval(&interval, since, until))
-            .collect();
+    let human_time = calculate_human_time(
+        &filtered_human_signals,
+        human_idle,
+        review_credit,
+        since,
+        until,
+        explain_human_time,
+    );
+    let human_intervals = human_time.intervals;
+    let human_seconds = human_time.total_seconds;
+    let human_time_explanation = human_time.explanation;
     let session_roles: HashMap<SessionKey, bool> = sessions
         .iter()
         .map(|session| {
@@ -495,7 +530,6 @@ pub fn build_report(
         *model_tokens.entry(token.model.clone()).or_default() += token.usage.total();
         total_tokens += token.usage;
     }
-    let human_seconds: f64 = human_intervals.iter().map(Interval::seconds).sum();
     let agent_seconds: f64 = intervals.iter().map(Interval::seconds).sum();
     let foreground_session_count = eligible_session_keys
         .iter()
@@ -590,6 +624,9 @@ pub fn build_report(
     BuiltReport {
         methodology: Methodology {
             human_work: "human prompts, foreground session boundaries, and authored commits clustered into non-overlapping involvement blocks",
+            human_time_algorithm_version: "signal-blocks-v1",
+            human_time_timezone_basis: "UTC signal and ledger timestamps; review-credit edges clamp to host-local calendar midnights",
+            human_time_boundary_basis: "half-open report window [since, until); a gap strictly greater than the idle threshold starts a block; review credit is split equally around each block",
             human_idle_threshold_seconds: duration_seconds(human_idle),
             review_credit_seconds: duration_seconds(review_credit),
             human_estimate_caveat: "a supervision-inclusive estimate with bounded setup/review credit around foreground sessions; autonomous transcript output is not treated as continuous human presence",
@@ -604,12 +641,13 @@ pub fn build_report(
             agent_output: "commits a coding agent authored are matched by Git identity, reported apart from your own, and contribute no human time; a Co-authored-by trailer flags a commit you already wrote rather than adding another",
             scope: "local retained histories, explicit event logs, and locally available Git repositories only",
         },
+        human_time_explanation,
         observed: Observed {
             first_seen: all_times.iter().min().copied().map(iso),
             last_seen: all_times.iter().max().copied().map(iso),
         },
         summary: Summary {
-            human_estimated_seconds: round3(human_seconds),
+            human_estimated_seconds: human_seconds,
             human_active_days: human_dates.len(),
             average_human_seconds_per_active_day: if human_dates.is_empty() {
                 0.0
@@ -1063,6 +1101,43 @@ mod tests {
                 .iter()
                 .map(|row| row.human_estimated_seconds)
                 .sum::<f64>()
+        );
+    }
+
+    #[test]
+    fn explained_human_total_and_summary_share_the_same_rounding_boundary() {
+        let sessions = vec![session(
+            "fractional",
+            "repo",
+            vec![],
+            vec![
+                point("2026-01-01T10:00:00Z"),
+                point("2026-01-01T10:00:00.062500Z"),
+            ],
+        )];
+        let report = build_report_with_human_time_explanation(
+            &sessions,
+            &[],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::seconds(1),
+            Duration::zero(),
+            true,
+        );
+        let explanation = report.human_time_explanation.unwrap();
+        assert_eq!(0.062, report.summary.human_estimated_seconds);
+        assert_eq!(
+            report.summary.human_estimated_seconds,
+            explanation.total_seconds
+        );
+        assert_eq!(0.0625, explanation.unrounded_block_seconds_total);
+        assert_eq!(
+            explanation.total_seconds,
+            explanation.unrounded_block_seconds_total
+                + explanation.total_rounding_adjustment_seconds
         );
     }
 

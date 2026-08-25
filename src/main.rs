@@ -23,7 +23,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use aggregate::{DIMENSIONS, build_report};
+use aggregate::{DIMENSIONS, build_report_with_human_time_explanation};
 use ai::{
     read_claude_sessions_indexed, read_codex_sessions_indexed, read_copilot_sessions_indexed,
     read_copilot_vscode_sessions_indexed, read_event_sessions_indexed,
@@ -235,6 +235,11 @@ struct ReportArguments {
         help = "Setup and review time credited around each work block"
     )]
     review_credit: String,
+    #[arg(
+        long,
+        help = "Print or serialize the auditable human-time calculation ledger (table and JSON only)"
+    )]
+    explain_human_time: bool,
     // Optional rather than defaulted so clap can tell "the user asked for this
     // grouping" from "nobody said"; the shortcut flags below conflict with the
     // former only.
@@ -540,9 +545,26 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
             "`workstats ui` is interactive and writes no machine-readable output; drop --format, or run workstats without `ui` for json or csv"
         );
     }
+    if presentation == Presentation::Explore && arguments.explain_human_time {
+        bail!(
+            "--explain-human-time is not available in `workstats ui`; run workstats with table or JSON output"
+        );
+    }
+    if arguments.output_format == OutputFormat::Csv && arguments.explain_human_time {
+        bail!(
+            "--explain-human-time is not available with --format csv; use table output or --format json"
+        );
+    }
     let gap_cap = duration_flag("--gap-cap", &arguments.gap_cap)?;
     let human_idle = duration_flag("--human-idle", &arguments.human_idle)?;
     let review_credit = duration_flag("--review-credit", &arguments.review_credit)?;
+    if review_credit > human_idle {
+        bail!(
+            "--review-credit ({}) must not exceed --human-idle ({})",
+            arguments.review_credit,
+            arguments.human_idle
+        );
+    }
     let (since, until) = report_window(&arguments, Utc::now())?;
     let dimensions = grouping_dimensions(&arguments)?;
 
@@ -826,7 +848,7 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         }
     }
     progress.set("Estimating human involvement");
-    let built = build_report(
+    let built = build_report_with_human_time_explanation(
         &sessions,
         &commits,
         &agent_commits,
@@ -836,9 +858,11 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         &dimensions,
         human_idle,
         review_credit,
+        arguments.explain_human_time,
     );
     let report = Report {
         methodology: built.methodology,
+        human_time_explanation: built.human_time_explanation,
         observed: built.observed,
         summary: built.summary,
         group_by: built.group_by,
