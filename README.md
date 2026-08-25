@@ -266,6 +266,7 @@ workstats --exclude-provider copilot
 workstats --repo-exact my-project          # infer its checkout from matching AI sessions
 workstats --agent-commits                  # also read commits a coding agent authored
 workstats --raw                            # provider/model detail (alias --show-agent-work)
+workstats --explain-human-time             # auditable signal and work-block ledger
 workstats classify src/main.rs             # which file area a path lands in, and why
 ```
 
@@ -421,6 +422,9 @@ sources`. For any other provider name, use `--events` or `workstats record`.
 
 ```bash
 workstats --format json > workstats.json
+workstats --explain-human-time                     # readable calculation ledger
+workstats --format json --explain-human-time \
+  | jq '.human_time_explanation.blocks'            # structured calculation ledger
 workstats --group-by month,repo --format csv > workstats.csv
 ```
 
@@ -433,6 +437,9 @@ rather than pretending otherwise.
 
 CSV columns for the file areas follow the
 [category registry](#make-the-areas-your-own), so read them by header name.
+A calculation ledger is one-to-many relative to CSV's grouped rows, so
+`--explain-human-time` supports table and JSON output and deliberately rejects
+`--format csv` rather than silently omitting detail.
 
 ## Why it is fast
 
@@ -469,8 +476,30 @@ runs parse only what changed.
    and agent execution.
 4. Each block receives 30 minutes total for setup and follow-up review, split
    around its first and last signal and clamped to local calendar boundaries.
-5. All human intervals form one global union. Ten concurrent agents cannot make
-   ten simultaneous human hours.
+5. At a shared timestamp, one signal is retained: prompt over commit over
+   foreground-session edge; equal-priority ties keep the first input signal.
+6. All human intervals form one global, non-overlapping timeline. Ten concurrent
+   agents cannot make ten simultaneous human hours.
+
+The stable calculation identifier is `signal-blocks-v1`. A gap must be
+**strictly greater than** the idle threshold to start a new block. Report windows
+are half-open (`since <= signal < until`); ledger timestamps are UTC, while the
+outer review-credit edges clamp to host-local calendar midnights. JSON reports
+always state this algorithm and boundary basis.
+
+To audit one run rather than only read its assumptions:
+
+```bash
+workstats --explain-human-time
+workstats --format json --explain-human-time
+```
+
+The opt-in ledger shows scoped input signals, effective signals after timestamp
+deduplication, every block boundary and duration, actual versus requested
+credit, clipping, and a reconciling total. Block durations retain microsecond
+precision; the ledger exposes the explicit adjustment used to round the final
+summary total to milliseconds. It contains structural metadata only, never
+prompt text.
 
 Tune the assumptions when your workflow needs it:
 
@@ -478,6 +507,9 @@ Tune the assumptions when your workflow needs it:
 workstats --human-idle 90m --review-credit 45m  # more generous
 workstats --human-idle 30m --review-credit 10m  # more conservative
 ```
+
+Review credit may not exceed the idle threshold; enforcing that invariant keeps
+separate blocks from overlapping and being counted twice.
 
 `--gap-cap` controls AI wall-clock estimation only. Durations are written as
 `30s`, `5m`, or `1h` and are accepted up to `8784h` (366 days); anything larger
@@ -672,7 +704,11 @@ and supports `--format json` and `--format csv`.
 The cache contains the structural fields needed for reports: timestamps,
 working directories, session identifiers, model names, roles, derived
 intervals, and token usage counts. JSON/CSV output can contain repository
-names and paths—review a report before sharing it.
+names and paths—review a report before sharing it. `--explain-human-time` is an
+explicitly more detailed view: it includes exact UTC signal/block timestamps,
+signal kinds, providers, and repository labels, but still excludes prompt and
+response text, session identifiers, working-directory/root paths, model names,
+and commit hashes.
 
 ### The diff viewer is the one place file contents are read
 

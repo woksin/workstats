@@ -69,6 +69,33 @@ fn native_cli_reports_version_and_rejects_conflicting_calendar_dimensions() {
     let help = String::from_utf8_lossy(&help.stdout);
     assert!(help.contains("--review-credit"));
     assert!(help.contains("--isolated-credit"));
+    assert!(help.contains("--explain-human-time"));
+
+    let overlapping = run(&[
+        "--no-ai",
+        "--no-git",
+        "--human-idle",
+        "30m",
+        "--review-credit",
+        "31m",
+    ]);
+    assert!(!overlapping.status.success());
+    let error = String::from_utf8_lossy(&overlapping.stderr);
+    assert!(error.contains("--review-credit"), "{error}");
+    assert!(error.contains("--human-idle"), "{error}");
+
+    let csv_explanation = run(&[
+        "--no-ai",
+        "--no-git",
+        "--format",
+        "csv",
+        "--explain-human-time",
+    ]);
+    assert!(!csv_explanation.status.success());
+    assert!(
+        String::from_utf8_lossy(&csv_explanation.stderr)
+            .contains("not available with --format csv")
+    );
 }
 
 #[test]
@@ -100,7 +127,59 @@ fn missing_inputs_still_produce_a_complete_json_report() {
         report["methodology"]["human_idle_threshold_seconds"]
     );
     assert_eq!(1800.0, report["methodology"]["review_credit_seconds"]);
+    assert_eq!(
+        "signal-blocks-v1",
+        report["methodology"]["human_time_algorithm_version"]
+    );
+    assert!(report["methodology"]["human_time_timezone_basis"].is_string());
+    assert!(report["methodology"]["human_time_boundary_basis"].is_string());
+    assert!(report.get("human_time_explanation").is_none());
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn human_time_explanation_is_opt_in_structured_and_reconciled() {
+    let directory = tempdir().unwrap();
+    let output = run(&[
+        "--dir",
+        directory.path().to_str().unwrap(),
+        "--no-ai",
+        "--no-git",
+        "--no-progress",
+        "--format",
+        "json",
+        "--explain-human-time",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let explanation = &report["human_time_explanation"];
+    assert_eq!("signal-blocks-v1", explanation["algorithm_version"]);
+    assert_eq!(0, explanation["input_signals"]["count"]);
+    assert_eq!(0, explanation["effective_signals"]["count"]);
+    assert_eq!(0, explanation["blocks"].as_array().unwrap().len());
+    assert_eq!(
+        report["summary"]["human_estimated_seconds"],
+        explanation["total_seconds"]
+    );
+
+    let table = run(&[
+        "--dir",
+        directory.path().to_str().unwrap(),
+        "--no-ai",
+        "--no-git",
+        "--no-progress",
+        "--explain-human-time",
+    ]);
+    assert!(table.status.success());
+    let table = String::from_utf8_lossy(&table.stdout);
+    assert!(table.contains("Human-time calculation ledger"), "{table}");
+    assert!(
+        table.contains("prompt text, session IDs, paths, and commit hashes are never included")
+    );
 }
 
 #[test]
@@ -275,6 +354,8 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
         "cursor",
         "--session",
         "task-one",
+        "--model",
+        "MODEL_SECRET",
         "--cwd",
         directory.path().to_str().unwrap(),
         "--kind",
@@ -288,11 +369,29 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
     let line: Value = serde_json::from_slice(&fs::read(&events).unwrap()).unwrap();
     assert_eq!("cursor", line["provider"]);
     assert!(line.get("content").is_none());
+    let second = run(&[
+        "record",
+        "--provider",
+        "zed",
+        "--session",
+        "task-two",
+        "--model",
+        "SECOND_MODEL_SECRET",
+        "--cwd",
+        directory.path().to_str().unwrap(),
+        "--kind",
+        "prompt",
+        "--timestamp",
+        "2026-01-01T00:00:00Z",
+        "--output",
+        events.to_str().unwrap(),
+    ]);
+    assert!(second.status.success());
 
     let report = run(&[
         "--no-git",
         "--provider",
-        "cursor",
+        "cursor,zed",
         "--events",
         events.to_str().unwrap(),
         // --events adds to the log `workstats record` writes rather than
@@ -303,6 +402,7 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
         "--no-progress",
         "--format",
         "json",
+        "--explain-human-time",
     ]);
     assert!(
         report.status.success(),
@@ -310,8 +410,55 @@ fn sources_and_open_event_recording_form_a_complete_integration_path() {
         String::from_utf8_lossy(&report.stderr)
     );
     let report: Value = serde_json::from_slice(&report.stdout).unwrap();
-    assert_eq!(1, report["summary"]["session_count"]);
-    assert_eq!(1, report["summary"]["prompt_signal_count"]);
+    assert_eq!(2, report["summary"]["session_count"]);
+    assert_eq!(2, report["summary"]["prompt_signal_count"]);
+    let explanation = &report["human_time_explanation"];
+    assert_eq!(4, explanation["input_signals"]["count"]);
+    assert_eq!(1, explanation["effective_signals"]["count"]);
+    assert_eq!(
+        "prompt",
+        explanation["effective_signals"]["signals"][0]["kind"]
+    );
+    assert_eq!(
+        3,
+        explanation["same_timestamp_deduplication"]["discarded_signal_count"]
+    );
+    assert_eq!(1, explanation["blocks"].as_array().unwrap().len());
+    assert_eq!(
+        report["summary"]["human_estimated_seconds"],
+        explanation["total_seconds"]
+    );
+    let serialized = serde_json::to_string(explanation).unwrap();
+    assert!(!serialized.contains("task-one"));
+    assert!(!serialized.contains("task-two"));
+    assert!(!serialized.contains("MODEL_SECRET"));
+    assert!(!serialized.contains("SECOND_MODEL_SECRET"));
+    assert!(!serialized.contains(&directory.path().to_string_lossy().into_owned()));
+
+    let table = run(&[
+        "--no-git",
+        "--provider",
+        "cursor,zed",
+        "--events",
+        events.to_str().unwrap(),
+        "--no-default-events",
+        "--no-cache",
+        "--no-progress",
+        "--explain-human-time",
+    ]);
+    assert!(table.status.success());
+    let table = String::from_utf8_lossy(&table.stdout);
+    assert!(table.contains("Equal-priority collisions: first input signal wins."));
+    let decisions = table
+        .split("Shared-timestamp decisions")
+        .nth(1)
+        .and_then(|tail| tail.split("  Blocks").next())
+        .unwrap();
+    assert!(decisions.contains("signal:"), "{decisions}");
+    assert!(decisions.contains("cursor"), "{decisions}");
+    assert!(decisions.contains("zed"), "{decisions}");
+    assert!(decisions.contains("kept"), "{decisions}");
+    assert!(decisions.contains("discarded"), "{decisions}");
 }
 
 #[test]

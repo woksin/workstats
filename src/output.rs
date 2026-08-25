@@ -7,7 +7,9 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 
 use crate::classify::active_registry;
-use crate::model::{CompositionEntry, Diagnostics, MAX_STORED_MESSAGES, Report, ReportRow};
+use crate::model::{
+    CompositionEntry, Diagnostics, HumanTimeExplanation, MAX_STORED_MESSAGES, Report, ReportRow,
+};
 
 pub fn print_json(report: &Report) -> Result<()> {
     let stdout = io::stdout();
@@ -151,6 +153,154 @@ const _: () = assert!(MESSAGE_TAIL_CHARACTERS + 1 < MAX_MESSAGE_CHARACTERS);
 /// writes its own placeholder, and `—` for a Git commit, which has no model at
 /// all. The distinction is internal, so it does not reach the table or `--raw`.
 const NO_MODEL: &str = "(no model)";
+
+fn explanation_signal_counts(explanation: &HumanTimeExplanation, effective: bool) -> String {
+    let counts = if effective {
+        &explanation.effective_signals.counts_by_kind
+    } else {
+        &explanation.input_signals.counts_by_kind
+    };
+    format!(
+        "{} prompts, {} session edges, {} commits",
+        number(counts.get("prompt").copied().unwrap_or(0)),
+        number(counts.get("foreground_session_edge").copied().unwrap_or(0)),
+        number(counts.get("commit").copied().unwrap_or(0))
+    )
+}
+
+fn print_human_time_explanation(explanation: &HumanTimeExplanation) {
+    println!(
+        "Human-time calculation ledger  ({})",
+        explanation.algorithm_version
+    );
+    println!("  Basis       {}", explanation.timezone_basis);
+    println!(
+        "  Input       {} signals ({})",
+        number(explanation.input_signals.count),
+        explanation_signal_counts(explanation, false)
+    );
+    println!(
+        "  Effective   {} signals ({}) after one-signal-per-timestamp selection",
+        number(explanation.effective_signals.count),
+        explanation_signal_counts(explanation, true)
+    );
+    println!(
+        "  Discarded   {} shared-timestamp signals; {}",
+        number(
+            explanation
+                .same_timestamp_deduplication
+                .discarded_signal_count
+        ),
+        explanation.same_timestamp_deduplication.priority
+    );
+    println!(
+        "                Equal-priority collisions: {}.",
+        explanation
+            .same_timestamp_deduplication
+            .equal_priority_tie_break
+    );
+
+    if !explanation.same_timestamp_deduplication.groups.is_empty() {
+        let signals: BTreeMap<_, _> = explanation
+            .input_signals
+            .signals
+            .iter()
+            .map(|signal| (signal.id.as_str(), signal))
+            .collect();
+        println!("  Shared-timestamp decisions");
+        let label = |signal: &crate::model::HumanTimeSignalExplanation| {
+            format!(
+                "{} {} {} {}",
+                signal.id,
+                signal.kind,
+                cell(&signal.provider, 14),
+                cell(&signal.repo, 24)
+            )
+        };
+        for group in &explanation.same_timestamp_deduplication.groups {
+            let kept_label = signals
+                .get(group.kept_signal_id.as_str())
+                .map(|signal| label(signal))
+                .unwrap_or_else(|| group.kept_signal_id.clone());
+            let discarded = group
+                .discarded_signal_ids
+                .iter()
+                .map(|id| {
+                    signals
+                        .get(id.as_str())
+                        .map(|signal| label(signal))
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "    {}  kept {}; discarded {}",
+                group.timestamp, kept_label, discarded
+            );
+        }
+    }
+
+    let signals: BTreeMap<_, _> = explanation
+        .effective_signals
+        .signals
+        .iter()
+        .map(|signal| (signal.id.as_str(), signal))
+        .collect();
+    println!("  Blocks");
+    if explanation.blocks.is_empty() {
+        println!("    none");
+    }
+    for block in &explanation.blocks {
+        let actual_credit = block.actual_start_credit_seconds + block.actual_end_credit_seconds;
+        println!(
+            "    {}  {} → {}  {}  {} signals  credit {} / requested {}",
+            block.id,
+            block.start,
+            block.end,
+            ledger_duration(block.seconds),
+            number(block.signal_count),
+            ledger_duration(actual_credit),
+            ledger_duration(block.requested_review_credit_seconds)
+        );
+        let clipped = block.clipping.local_day_start_seconds
+            + block.clipping.local_day_end_seconds
+            + block.clipping.report_window_start_seconds
+            + block.clipping.report_window_end_seconds;
+        if clipped > 0.0 {
+            println!(
+                "      clipped {} (local day start {}, local day end {}, report start {}, report end {})",
+                ledger_duration(clipped),
+                ledger_duration(block.clipping.local_day_start_seconds),
+                ledger_duration(block.clipping.local_day_end_seconds),
+                ledger_duration(block.clipping.report_window_start_seconds),
+                ledger_duration(block.clipping.report_window_end_seconds)
+            );
+        }
+        for id in &block.signal_ids {
+            if let Some(signal) = signals.get(id.as_str()) {
+                println!(
+                    "      {}  {:<23} {:<14} {}",
+                    signal.timestamp,
+                    signal.kind,
+                    cell(&signal.provider, 14),
+                    cell(&signal.repo, 32)
+                );
+            }
+        }
+    }
+    println!(
+        "  Block subtotal  {:.6}s; millisecond rounding adjustment {:+.6}s",
+        explanation.unrounded_block_seconds_total, explanation.total_rounding_adjustment_seconds
+    );
+    println!(
+        "  Total       {}",
+        ledger_duration(explanation.total_seconds)
+    );
+    println!(
+        "  Signal and block timestamps are included only because --explain-human-time was requested; prompt text, session IDs, paths, and commit hashes are never included."
+    );
+    println!();
+}
 
 pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
     let summary = &report.summary;
@@ -495,6 +645,9 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             println!("  … {hidden} more in rows not shown; use --top 0");
         }
         println!();
+    }
+    if let Some(explanation) = &report.human_time_explanation {
+        print_human_time_explanation(explanation);
     }
     println!(
         "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
@@ -896,6 +1049,16 @@ fn hours(seconds: f64) -> String {
     format!("{}h {:02}m", rounded / 3600, rounded % 3600 / 60)
 }
 
+fn ledger_duration(seconds: f64) -> String {
+    let rounded = seconds.round().max(0.0) as u64;
+    format!(
+        "{}h {:02}m {:02}s",
+        rounded / 3600,
+        rounded % 3600 / 60,
+        rounded % 60
+    )
+}
+
 /// A present-but-tiny share reads as `<1%` rather than rounding away to `0%`.
 fn percent(share: f64) -> String {
     if share > 0.0 && share < 0.005 {
@@ -1154,6 +1317,9 @@ mod tests {
         Report {
             methodology: Methodology {
                 human_work: "",
+                human_time_algorithm_version: "signal-blocks-v1",
+                human_time_timezone_basis: "",
+                human_time_boundary_basis: "",
                 human_idle_threshold_seconds: 0.0,
                 review_credit_seconds: 0.0,
                 human_estimate_caveat: "",
@@ -1165,6 +1331,7 @@ mod tests {
                 agent_output: "",
                 scope: "",
             },
+            human_time_explanation: None,
             observed: Observed {
                 first_seen: None,
                 last_seen: None,

@@ -5,7 +5,11 @@ use anyhow::{Result, bail};
 use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Utc};
 use regex::Regex;
 
-use crate::model::{ActivityPoint, HumanSignal, Interval, Session};
+use crate::model::{
+    ActivityPoint, HumanSignal, HumanTimeBlockClipping, HumanTimeBlockExplanation,
+    HumanTimeDeduplication, HumanTimeDeduplicationGroup, HumanTimeExplanation,
+    HumanTimeSignalExplanation, HumanTimeSignalSet, Interval, Session,
+};
 
 pub fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
@@ -356,42 +360,138 @@ fn interval_for_session(
     }
 }
 
-pub fn build_human_intervals(
+pub struct HumanTimeCalculation {
+    pub intervals: Vec<Interval>,
+    pub total_seconds: f64,
+    pub explanation: Option<HumanTimeExplanation>,
+}
+
+fn human_signal_kind(kind: &str) -> &'static str {
+    if kind.ends_with("_prompt") {
+        "prompt"
+    } else if kind == "commit" {
+        "commit"
+    } else {
+        "foreground_session_edge"
+    }
+}
+
+fn human_signal_priority(kind: &str) -> u8 {
+    match human_signal_kind(kind) {
+        "prompt" => 3,
+        "commit" => 2,
+        _ => 1,
+    }
+}
+
+fn signal_id(index: usize) -> String {
+    format!("signal:{}", index + 1)
+}
+
+fn explanation_timestamp(value: DateTime<Utc>) -> String {
+    let precision = if value.timestamp_subsec_micros() == 0 {
+        chrono::SecondsFormat::Secs
+    } else {
+        chrono::SecondsFormat::Micros
+    };
+    value.to_rfc3339_opts(precision, false)
+}
+
+fn positive_seconds(value: Duration) -> f64 {
+    duration_seconds(value).max(0.0)
+}
+
+fn round_microseconds_to_milliseconds(microseconds: i128) -> i128 {
+    let milliseconds = microseconds / 1000;
+    let remainder = microseconds % 1000;
+    if remainder > 500 || (remainder == 500 && milliseconds % 2 != 0) {
+        milliseconds + 1
+    } else {
+        milliseconds
+    }
+}
+
+fn microseconds_as_seconds(microseconds: i128) -> f64 {
+    microseconds as f64 / 1_000_000.0
+}
+
+fn signal_counts<'a>(
+    signals: impl IntoIterator<Item = &'a HumanSignal>,
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::from([
+        ("commit".to_string(), 0),
+        ("foreground_session_edge".to_string(), 0),
+        ("prompt".to_string(), 0),
+    ]);
+    for signal in signals {
+        *counts
+            .entry(human_signal_kind(&signal.kind).to_string())
+            .or_default() += 1;
+    }
+    counts
+}
+
+fn signal_explanation(index: usize, signal: &HumanSignal) -> HumanTimeSignalExplanation {
+    HumanTimeSignalExplanation {
+        id: signal_id(index),
+        timestamp: explanation_timestamp(signal.timestamp),
+        kind: human_signal_kind(&signal.kind).to_string(),
+        provider: signal.provider.clone(),
+        repo: signal.repo.clone(),
+    }
+}
+
+pub fn calculate_human_time(
     signals: &[HumanSignal],
     idle_threshold: Duration,
     block_credit: Duration,
-) -> Vec<Interval> {
-    if signals.is_empty() {
-        return Vec::new();
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    explain: bool,
+) -> HumanTimeCalculation {
+    let mut by_timestamp: BTreeMap<DateTime<Utc>, Vec<usize>> = BTreeMap::new();
+    for (index, signal) in signals.iter().enumerate() {
+        by_timestamp
+            .entry(signal.timestamp)
+            .or_default()
+            .push(index);
     }
-    let priority = |kind: &str| {
-        if kind.ends_with("_prompt") {
-            3
-        } else if kind == "commit" {
-            2
-        } else {
-            1
-        }
-    };
-    let mut by_timestamp: BTreeMap<DateTime<Utc>, &HumanSignal> = BTreeMap::new();
-    for signal in signals {
-        match by_timestamp.get(&signal.timestamp) {
-            Some(existing) if priority(&existing.kind) >= priority(&signal.kind) => {}
-            _ => {
-                by_timestamp.insert(signal.timestamp, signal);
+
+    let mut effective_indices = Vec::new();
+    let mut deduplication_groups = Vec::new();
+    for (timestamp, indices) in by_timestamp {
+        let kept = indices.iter().copied().fold(indices[0], |kept, candidate| {
+            if human_signal_priority(&signals[candidate].kind)
+                > human_signal_priority(&signals[kept].kind)
+            {
+                candidate
+            } else {
+                kept
             }
+        });
+        effective_indices.push(kept);
+        if explain && indices.len() > 1 {
+            deduplication_groups.push(HumanTimeDeduplicationGroup {
+                timestamp: explanation_timestamp(timestamp),
+                kept_signal_id: signal_id(kept),
+                discarded_signal_ids: indices
+                    .into_iter()
+                    .filter(|index| *index != kept)
+                    .map(signal_id)
+                    .collect(),
+            });
         }
     }
-    let ordered: Vec<&HumanSignal> = by_timestamp.into_values().collect();
-    let mut blocks: Vec<Vec<&HumanSignal>> = Vec::new();
+
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
     let mut current = Vec::new();
-    for signal in ordered {
-        if current.last().is_some_and(|previous: &&HumanSignal| {
-            signal.timestamp - previous.timestamp > idle_threshold
+    for index in effective_indices.iter().copied() {
+        if current.last().is_some_and(|previous: &usize| {
+            signals[index].timestamp - signals[*previous].timestamp > idle_threshold
         }) {
             blocks.push(std::mem::take(&mut current));
         }
-        current.push(signal);
+        current.push(index);
     }
     if !current.is_empty() {
         blocks.push(current);
@@ -399,41 +499,144 @@ pub fn build_human_intervals(
 
     let edge = block_credit / 2;
     let mut intervals = Vec::new();
+    let mut block_microsecond_totals = Vec::new();
+    let mut explained_blocks = Vec::new();
     for (block_index, block) in blocks.into_iter().enumerate() {
-        let first_day = local_midnight(block[0].timestamp.with_timezone(&Local).date_naive());
-        let next_day = local_midnight(
-            block
-                .last()
-                .unwrap()
-                .timestamp
-                .with_timezone(&Local)
-                .date_naive()
-                .succ_opt()
-                .unwrap(),
-        );
-        let mut left = saturating_sub(block[0].timestamp, edge).max(first_day);
-        for (index, signal) in block.iter().enumerate() {
-            let right = if let Some(next) = block.get(index + 1) {
+        let first = signals[block[0]].timestamp;
+        let last = signals[*block.last().unwrap()].timestamp;
+        let first_day = local_midnight(first.with_timezone(&Local).date_naive());
+        let next_day = local_midnight(last.with_timezone(&Local).date_naive().succ_opt().unwrap());
+        let requested_start = saturating_sub(first, edge);
+        let requested_end = saturating_add(last, edge);
+        let local_start = requested_start.max(first_day);
+        let local_end = requested_end.min(next_day);
+        let final_start = since.map_or(local_start, |bound| local_start.max(bound));
+        let final_end = until.map_or(local_end, |bound| local_end.min(bound));
+        if final_end <= final_start {
+            continue;
+        }
+
+        let block_id = format!("work-block:{block_index}");
+        let first_interval = intervals.len();
+        let mut left = final_start;
+        for (position, index) in block.iter().copied().enumerate() {
+            let signal = &signals[index];
+            let boundary = if let Some(next_index) = block.get(position + 1) {
+                let next = &signals[*next_index];
                 saturating_add(signal.timestamp, (next.timestamp - signal.timestamp) / 2)
             } else {
-                saturating_add(signal.timestamp, edge).min(next_day)
+                local_end
             };
+            let right = boundary.min(final_end);
             if right > left {
                 intervals.push(Interval {
                     start: left,
                     end: right,
                     provider: signal.provider.clone(),
                     model: signal.model.clone(),
-                    session_id: format!("work-block:{block_index}"),
+                    session_id: block_id.clone(),
                     cwd: signal.cwd.clone(),
                     repo: signal.repo.clone(),
                     root: signal.root.clone(),
                 });
             }
-            left = right;
+            left = left.max(right);
+        }
+        let block_microseconds: i128 = intervals[first_interval..]
+            .iter()
+            .map(|interval| {
+                (interval.end - interval.start)
+                    .num_microseconds()
+                    .unwrap_or(0)
+                    .max(0) as i128
+            })
+            .sum();
+        let block_seconds = microseconds_as_seconds(block_microseconds);
+        block_microsecond_totals.push(block_microseconds);
+
+        if explain {
+            let block_signals: Vec<_> = block.iter().map(|index| &signals[*index]).collect();
+            explained_blocks.push(HumanTimeBlockExplanation {
+                id: block_id,
+                start: explanation_timestamp(final_start),
+                end: explanation_timestamp(final_end),
+                first_signal_timestamp: explanation_timestamp(first),
+                last_signal_timestamp: explanation_timestamp(last),
+                seconds: block_seconds,
+                requested_review_credit_seconds: positive_seconds(block_credit),
+                actual_start_credit_seconds: positive_seconds(first - final_start),
+                actual_end_credit_seconds: positive_seconds(final_end - last),
+                signal_count: block.len(),
+                counts_by_kind: signal_counts(block_signals.iter().copied()),
+                signal_ids: block.iter().copied().map(signal_id).collect(),
+                clipping: HumanTimeBlockClipping {
+                    local_day_start_seconds: positive_seconds(local_start - requested_start),
+                    local_day_end_seconds: positive_seconds(requested_end - local_end),
+                    report_window_start_seconds: positive_seconds(final_start - local_start),
+                    report_window_end_seconds: positive_seconds(local_end - final_end),
+                },
+            });
         }
     }
-    intervals
+
+    let total_microseconds: i128 = block_microsecond_totals.iter().sum();
+    let unrounded_block_seconds_total = microseconds_as_seconds(total_microseconds);
+    let total_seconds = round_microseconds_to_milliseconds(total_microseconds) as f64 / 1000.0;
+    let explanation = explain.then(|| {
+        let input_signals = HumanTimeSignalSet {
+            count: signals.len(),
+            counts_by_kind: signal_counts(signals),
+            signals: signals
+                .iter()
+                .enumerate()
+                .map(|(index, signal)| signal_explanation(index, signal))
+                .collect(),
+        };
+        let effective_signals = HumanTimeSignalSet {
+            count: effective_indices.len(),
+            counts_by_kind: signal_counts(
+                effective_indices
+                    .iter()
+                    .map(|index| &signals[*index]),
+            ),
+            signals: effective_indices
+                .iter()
+                .map(|index| signal_explanation(*index, &signals[*index]))
+                .collect(),
+        };
+        let discarded_signal_count = input_signals.count - effective_signals.count;
+        HumanTimeExplanation {
+            algorithm_version: "signal-blocks-v1",
+            timezone_basis: "UTC ledger timestamps; review-credit edges clamp to host-local calendar midnights",
+            input_signals,
+            effective_signals,
+            same_timestamp_deduplication: HumanTimeDeduplication {
+                priority: "prompt > commit > foreground_session_edge",
+                equal_priority_tie_break: "first input signal wins",
+                discarded_signal_count,
+                groups: deduplication_groups,
+            },
+            blocks: explained_blocks,
+            unrounded_block_seconds_total,
+            total_rounding_adjustment_seconds: total_seconds - unrounded_block_seconds_total,
+            total_seconds,
+        }
+    });
+
+    HumanTimeCalculation {
+        intervals,
+        total_seconds,
+        explanation,
+    }
+}
+
+#[cfg(test)]
+pub fn build_human_intervals(
+    signals: &[HumanSignal],
+    idle_threshold: Duration,
+    block_credit: Duration,
+) -> Vec<Interval> {
+    calculate_human_time(signals, idle_threshold, block_credit, None, None, false).intervals
 }
 
 pub fn clip_interval(
@@ -825,6 +1028,138 @@ mod tests {
             HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()]),
             intervals.iter().map(|item| item.repo.clone()).collect()
         );
+    }
+
+    #[test]
+    fn human_time_explanation_records_timestamp_selection_and_reconciles() {
+        let signal = |provider: &str, repo: &str, kind: &str| HumanSignal {
+            timestamp: parse_timestamp("2026-01-01T10:00:00Z").unwrap(),
+            provider: provider.into(),
+            session_id: repo.into(),
+            cwd: format!("/{repo}"),
+            repo: repo.into(),
+            root: "root".into(),
+            kind: kind.into(),
+            model: "model".into(),
+        };
+        let calculation = calculate_human_time(
+            &[
+                signal("claude", "edge", "claude_session_edge"),
+                signal("git", "commit", "commit"),
+                signal("codex", "prompt", "codex_prompt"),
+            ],
+            Duration::minutes(30),
+            Duration::minutes(10),
+            None,
+            None,
+            true,
+        );
+        let explanation = calculation.explanation.unwrap();
+        assert_eq!(3, explanation.input_signals.count);
+        assert_eq!(1, explanation.effective_signals.count);
+        assert_eq!("prompt", explanation.effective_signals.signals[0].kind);
+        assert_eq!(
+            2,
+            explanation
+                .same_timestamp_deduplication
+                .discarded_signal_count
+        );
+        assert_eq!(1, explanation.same_timestamp_deduplication.groups.len());
+        assert_eq!(600.0, explanation.blocks[0].seconds);
+        assert_eq!(calculation.total_seconds, explanation.total_seconds);
+        assert_eq!(
+            explanation.total_seconds,
+            explanation.unrounded_block_seconds_total
+                + explanation.total_rounding_adjustment_seconds
+        );
+    }
+
+    #[test]
+    fn human_time_uses_one_rounding_boundary_and_reports_its_adjustment() {
+        assert_eq!(2000, round_microseconds_to_milliseconds(2_000_500));
+        assert_eq!(2002, round_microseconds_to_milliseconds(2_001_500));
+
+        let signal = |timestamp: &str| HumanSignal {
+            timestamp: parse_timestamp(timestamp).unwrap(),
+            provider: "provider".into(),
+            session_id: timestamp.into(),
+            cwd: "/repo".into(),
+            repo: "repo".into(),
+            root: "root".into(),
+            kind: "provider_prompt".into(),
+            model: "model".into(),
+        };
+        let calculation = calculate_human_time(
+            &[
+                signal("2026-01-01T10:00:00Z"),
+                signal("2026-01-01T10:00:00.062500Z"),
+            ],
+            Duration::seconds(1),
+            Duration::zero(),
+            None,
+            None,
+            true,
+        );
+        let explanation = calculation.explanation.unwrap();
+        assert_eq!(0.0625, explanation.blocks[0].seconds);
+        assert_eq!(0.0625, explanation.unrounded_block_seconds_total);
+        assert_eq!(0.062, explanation.total_seconds);
+        assert_eq!(calculation.total_seconds, explanation.total_seconds);
+        assert_eq!(
+            explanation.total_seconds,
+            explanation.unrounded_block_seconds_total
+                + explanation.total_rounding_adjustment_seconds
+        );
+    }
+
+    #[test]
+    fn human_time_explanation_excludes_sensitive_source_identifiers() {
+        let timestamp = parse_timestamp("2026-01-01T10:00:00Z").unwrap();
+        let signals = [
+            HumanSignal {
+                timestamp,
+                provider: "provider".into(),
+                session_id: "SESSION_ID_SECRET".into(),
+                cwd: "/CWD_SECRET/project".into(),
+                repo: "safe-repo".into(),
+                root: "/ROOT_SECRET".into(),
+                kind: "provider_prompt".into(),
+                model: "MODEL_SECRET".into(),
+            },
+            HumanSignal {
+                timestamp: timestamp + Duration::seconds(1),
+                provider: "git".into(),
+                session_id: "COMMIT_HASH_SECRET".into(),
+                cwd: "/CWD_SECRET/project".into(),
+                repo: "safe-repo".into(),
+                root: "/ROOT_SECRET".into(),
+                kind: "commit".into(),
+                model: "MODEL_SECRET".into(),
+            },
+        ];
+        let explanation = calculate_human_time(
+            &signals,
+            Duration::minutes(30),
+            Duration::minutes(10),
+            None,
+            None,
+            true,
+        )
+        .explanation
+        .unwrap();
+        let serialized = serde_json::to_string(&explanation).unwrap();
+        for secret in [
+            "SESSION_ID_SECRET",
+            "CWD_SECRET",
+            "ROOT_SECRET",
+            "MODEL_SECRET",
+            "COMMIT_HASH_SECRET",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "leaked {secret}: {serialized}"
+            );
+        }
     }
 
     #[test]
