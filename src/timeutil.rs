@@ -356,6 +356,7 @@ fn interval_for_session(
         session_id: session.session_id.clone(),
         cwd: session.cwd.clone(),
         repo: session.repo.clone(),
+        repo_id: session.repo_id.clone(),
         root: session.root.clone(),
     }
 }
@@ -537,6 +538,7 @@ pub fn calculate_human_time(
                     session_id: block_id.clone(),
                     cwd: signal.cwd.clone(),
                     repo: signal.repo.clone(),
+                    repo_id: signal.repo_id.clone(),
                     root: signal.root.clone(),
                 });
             }
@@ -759,6 +761,7 @@ mod tests {
             session_id: "s".into(),
             cwd: "/x".into(),
             repo: "x".into(),
+            repo_id: "x".into(),
             root: "root".into(),
             points,
             exact_intervals: vec![],
@@ -792,6 +795,7 @@ mod tests {
             session_id: "s".into(),
             cwd: "/x".into(),
             repo: "x".into(),
+            repo_id: "x".into(),
             root: "root".into(),
         }
     }
@@ -901,6 +905,7 @@ mod tests {
             session_id: "commit".into(),
             cwd: "/repo".into(),
             repo: "repo".into(),
+            repo_id: "repo".into(),
             root: "root".into(),
             kind: "commit".into(),
             model: "—".into(),
@@ -1009,6 +1014,7 @@ mod tests {
             session_id: repo.into(),
             cwd: format!("/{repo}"),
             repo: repo.into(),
+            repo_id: repo.into(),
             root: "root".into(),
             kind: kind.into(),
             model: "model".into(),
@@ -1038,6 +1044,7 @@ mod tests {
             session_id: repo.into(),
             cwd: format!("/{repo}"),
             repo: repo.into(),
+            repo_id: repo.into(),
             root: "root".into(),
             kind: kind.into(),
             model: "model".into(),
@@ -1085,6 +1092,7 @@ mod tests {
             session_id: timestamp.into(),
             cwd: "/repo".into(),
             repo: "repo".into(),
+            repo_id: "repo".into(),
             root: "root".into(),
             kind: "provider_prompt".into(),
             model: "model".into(),
@@ -1122,6 +1130,7 @@ mod tests {
                 session_id: "SESSION_ID_SECRET".into(),
                 cwd: "/CWD_SECRET/project".into(),
                 repo: "safe-repo".into(),
+                repo_id: "REPO_ID_SECRET".into(),
                 root: "/ROOT_SECRET".into(),
                 kind: "provider_prompt".into(),
                 model: "MODEL_SECRET".into(),
@@ -1132,6 +1141,7 @@ mod tests {
                 session_id: "COMMIT_HASH_SECRET".into(),
                 cwd: "/CWD_SECRET/project".into(),
                 repo: "safe-repo".into(),
+                repo_id: "REPO_ID_SECRET".into(),
                 root: "/ROOT_SECRET".into(),
                 kind: "commit".into(),
                 model: "MODEL_SECRET".into(),
@@ -1151,6 +1161,7 @@ mod tests {
         for secret in [
             "SESSION_ID_SECRET",
             "CWD_SECRET",
+            "REPO_ID_SECRET",
             "ROOT_SECRET",
             "MODEL_SECRET",
             "COMMIT_HASH_SECRET",
@@ -1175,6 +1186,7 @@ mod tests {
             session_id: "commit".into(),
             cwd: "/repo".into(),
             repo: "repo".into(),
+            repo_id: "repo".into(),
             root: "root".into(),
             kind: "commit".into(),
             model: "—".into(),
@@ -1198,6 +1210,7 @@ mod tests {
             session_id: "s".into(),
             cwd: "/x".into(),
             repo: "x".into(),
+            repo_id: "x".into(),
             root: "root".into(),
         };
         let pieces = split_interval(&interval, "month");

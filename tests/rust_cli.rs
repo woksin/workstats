@@ -56,10 +56,8 @@ fn commit_as(repo: &str, file: &str, body: &str, author: &str, message: &[&str])
 fn native_cli_reports_version_and_rejects_conflicting_calendar_dimensions() {
     let version = run(&["--version"]);
     assert!(version.status.success());
-    assert!(
-        String::from_utf8_lossy(&version.stdout)
-            .contains(&format!("workstats {}", env!("CARGO_PKG_VERSION")))
-    );
+    assert!(String::from_utf8_lossy(&version.stdout)
+        .contains(&format!("workstats {}", env!("CARGO_PKG_VERSION"))));
 
     let invalid = run(&["--no-ai", "--no-git", "--group-by", "day,month"]);
     assert_eq!(Some(2), invalid.status.code());
@@ -70,6 +68,7 @@ fn native_cli_reports_version_and_rejects_conflicting_calendar_dimensions() {
     assert!(help.contains("--review-credit"));
     assert!(help.contains("--isolated-credit"));
     assert!(help.contains("--explain-human-time"));
+    assert!(help.contains("--explain-repository-attribution"));
 
     let overlapping = run(&[
         "--no-ai",
@@ -92,10 +91,19 @@ fn native_cli_reports_version_and_rejects_conflicting_calendar_dimensions() {
         "--explain-human-time",
     ]);
     assert!(!csv_explanation.status.success());
-    assert!(
-        String::from_utf8_lossy(&csv_explanation.stderr)
-            .contains("not available with --format csv")
-    );
+    assert!(String::from_utf8_lossy(&csv_explanation.stderr)
+        .contains("not available with --format csv"));
+
+    let csv_repositories = run(&[
+        "--no-ai",
+        "--no-git",
+        "--format",
+        "csv",
+        "--explain-repository-attribution",
+    ]);
+    assert!(!csv_repositories.status.success());
+    assert!(String::from_utf8_lossy(&csv_repositories.stderr)
+        .contains("explanation flags are not available with --format csv"));
 }
 
 #[test]
@@ -177,9 +185,7 @@ fn human_time_explanation_is_opt_in_structured_and_reconciled() {
     assert!(table.status.success());
     let table = String::from_utf8_lossy(&table.stdout);
     assert!(table.contains("Human-time calculation ledger"), "{table}");
-    assert!(
-        table.contains("prompt text, session IDs, paths, and commit hashes are never included")
-    );
+    assert!(table.contains("prompt text, session IDs, paths, and commit hashes are never included"));
 }
 
 #[test]
@@ -473,21 +479,19 @@ fn git_output_is_reported_by_file_area_in_json_and_csv() {
     fs::write(project.join("README.md"), "docs\n").unwrap();
     let path = project.to_str().unwrap();
     assert!(git(&["-C", path, "add", "."]).status.success());
-    assert!(
-        git(&[
-            "-C",
-            path,
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.com",
-            "commit",
-            "-m",
-            "areas",
-        ])
-        .status
-        .success()
-    );
+    assert!(git(&[
+        "-C",
+        path,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-m",
+        "areas",
+    ])
+    .status
+    .success());
 
     let arguments = |format: &str| {
         vec![
@@ -553,6 +557,277 @@ fn git_output_is_reported_by_file_area_in_json_and_csv() {
 }
 
 #[test]
+fn worktrees_of_one_repository_are_combined_into_one_stat_row() {
+    let temporary = tempdir().unwrap();
+    let primary = temporary.path().join("product-primary");
+    let worktree = temporary.path().join("feature-checkout");
+    assert!(git(&["init", "-q", primary.to_str().unwrap()])
+        .status
+        .success());
+    assert!(git(&[
+        "-C",
+        primary.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/product.git",
+    ])
+    .status
+    .success());
+    commit_as(
+        primary.to_str().unwrap(),
+        "src/lib.rs",
+        "primary\n",
+        "Fixture <fixture@example.com>",
+        &["primary"],
+    );
+    assert!(git(&[
+        "-C",
+        primary.to_str().unwrap(),
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "feature",
+        worktree.to_str().unwrap(),
+    ])
+    .status
+    .success());
+    commit_as(
+        worktree.to_str().unwrap(),
+        "tests/lib.rs",
+        "worktree\n",
+        "Fixture <fixture@example.com>",
+        &["worktree"],
+    );
+
+    let output = run(&[
+        "--dir",
+        temporary.path().to_str().unwrap(),
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-progress",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = report["rows"].as_array().unwrap();
+
+    assert_eq!(2, report["summary"]["commit_count"]);
+    assert_eq!(1, rows.len(), "worktree checkouts became separate rows");
+    assert_eq!("product", rows[0]["key"]["repo"]);
+    assert_eq!(2, rows[0]["commit_count"]);
+}
+
+#[test]
+fn configured_project_alias_combines_distinct_git_repositories() {
+    let temporary = tempdir().unwrap();
+    let api = temporary.path().join("api");
+    let web = temporary.path().join("web");
+    for (checkout, remote, file) in [
+        (&api, "https://github.com/acme/api.git", "api.rs"),
+        (&web, "git@github.com:acme/web.git", "web.rs"),
+    ] {
+        assert!(git(&["init", "-q", checkout.to_str().unwrap()])
+            .status
+            .success());
+        assert!(git(&[
+            "-C",
+            checkout.to_str().unwrap(),
+            "remote",
+            "add",
+            "origin",
+            remote,
+        ])
+        .status
+        .success());
+        commit_as(
+            checkout.to_str().unwrap(),
+            file,
+            "one\n",
+            "Fixture <fixture@example.com>",
+            &["fixture"],
+        );
+    }
+    let config = temporary.path().join("config.json");
+    fs::write(
+        &config,
+        r#"{"project_aliases":{"acme":{"label":"Acme Product","remotes":["https://github.com/acme/api.git","https://github.com/acme/web.git"]}}}"#,
+    )
+    .unwrap();
+    let base = [
+        "--dir",
+        temporary.path().to_str().unwrap(),
+        "--author",
+        "fixture@example.com",
+        "--config",
+        config.to_str().unwrap(),
+        "--no-ai",
+        "--no-progress",
+        "--format",
+        "json",
+    ];
+
+    let output = run(&base);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(1, report["rows"].as_array().unwrap().len());
+    assert_eq!("Acme Product", report["rows"][0]["key"]["repo"]);
+    assert_eq!(2, report["rows"][0]["commit_count"]);
+
+    let mut by_cwd = base.to_vec();
+    by_cwd.splice(0..0, ["--group-by", "cwd"]);
+    let output = run(&by_cwd);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(2, report["rows"].as_array().unwrap().len());
+}
+
+#[test]
+fn repository_history_recovers_a_deleted_foreground_worktree() {
+    let temporary = tempdir().unwrap();
+    let primary = temporary.path().join("primary");
+    let worktree = temporary.path().join("foreground-worktree");
+    let unrelated = temporary.path().join("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
+    assert!(git(&["init", "-q", primary.to_str().unwrap()])
+        .status
+        .success());
+    assert!(git(&[
+        "-C",
+        primary.to_str().unwrap(),
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/acme/product.git",
+    ])
+    .status
+    .success());
+    commit_as(
+        primary.to_str().unwrap(),
+        "README.md",
+        "one\n",
+        "Fixture <fixture@example.com>",
+        &["fixture"],
+    );
+    assert!(git(&[
+        "-C",
+        primary.to_str().unwrap(),
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "foreground",
+        worktree.to_str().unwrap(),
+    ])
+    .status
+    .success());
+    let events = temporary.path().join("events.jsonl");
+    assert!(run(&[
+        "record",
+        "--provider",
+        "fixture",
+        "--session",
+        "foreground",
+        "--cwd",
+        worktree.to_str().unwrap(),
+        "--kind",
+        "prompt",
+        "--timestamp",
+        "2026-01-01T00:00:00Z",
+        "--output",
+        events.to_str().unwrap(),
+    ])
+    .status
+    .success());
+    let cache = temporary.path().join("cache.sqlite3");
+    let seed = run(&[
+        "--dir",
+        temporary.path().to_str().unwrap(),
+        "--author",
+        "fixture@example.com",
+        "--provider",
+        "fixture",
+        "--events",
+        events.to_str().unwrap(),
+        "--no-default-events",
+        "--cache",
+        cache.to_str().unwrap(),
+        "--no-progress",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    assert!(git(&[
+        "-C",
+        primary.to_str().unwrap(),
+        "worktree",
+        "remove",
+        "--force",
+        worktree.to_str().unwrap(),
+    ])
+    .status
+    .success());
+
+    let recovered = run(&[
+        "--dir",
+        unrelated.to_str().unwrap(),
+        "--no-git",
+        "--provider",
+        "fixture",
+        "--events",
+        events.to_str().unwrap(),
+        "--no-default-events",
+        "--cache",
+        cache.to_str().unwrap(),
+        "--no-progress",
+        "--format",
+        "json",
+        "--explain-repository-attribution",
+    ]);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let report: Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!("product", report["rows"][0]["key"]["repo"]);
+    assert_eq!(1, report["repository_attribution"]["history_hits"]);
+    let explanation = serde_json::to_string(&report["repository_attribution"]).unwrap();
+    assert!(!explanation.contains(temporary.path().to_str().unwrap()));
+
+    let unresolved = run(&[
+        "--dir",
+        unrelated.to_str().unwrap(),
+        "--no-git",
+        "--provider",
+        "fixture",
+        "--events",
+        events.to_str().unwrap(),
+        "--no-default-events",
+        "--no-cache",
+        "--no-progress",
+        "--format",
+        "json",
+    ]);
+    let report: Value = serde_json::from_slice(&unresolved.stdout).unwrap();
+    assert_eq!("foreground-worktree", report["rows"][0]["key"]["repo"]);
+}
+
+#[test]
 fn a_filter_matching_only_a_nested_session_directory_still_finds_the_commits() {
     // `--repo api` matches the session's own working directory, which is deep
     // inside the checkout. The repository is described by its root, which does
@@ -568,42 +843,38 @@ fn a_filter_matching_only_a_nested_session_directory_still_finds_the_commits() {
     fs::write(nested.join("service.rs"), "one\ntwo\n").unwrap();
     let path = project.to_str().unwrap();
     assert!(git(&["-C", path, "add", "."]).status.success());
-    assert!(
-        git(&[
-            "-C",
-            path,
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.com",
-            "commit",
-            "-m",
-            "service",
-        ])
-        .status
-        .success()
-    );
+    assert!(git(&[
+        "-C",
+        path,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-m",
+        "service",
+    ])
+    .status
+    .success());
 
     let events = temporary.path().join("events.jsonl");
-    assert!(
-        run(&[
-            "record",
-            "--provider",
-            "fixture",
-            "--session",
-            "nested",
-            "--cwd",
-            nested.to_str().unwrap(),
-            "--kind",
-            "prompt",
-            "--timestamp",
-            "2026-01-01T00:00:00Z",
-            "--output",
-            events.to_str().unwrap(),
-        ])
-        .status
-        .success()
-    );
+    assert!(run(&[
+        "record",
+        "--provider",
+        "fixture",
+        "--session",
+        "nested",
+        "--cwd",
+        nested.to_str().unwrap(),
+        "--kind",
+        "prompt",
+        "--timestamp",
+        "2026-01-01T00:00:00Z",
+        "--output",
+        events.to_str().unwrap(),
+    ])
+    .status
+    .success());
 
     let output = run(&[
         "--dir",
@@ -642,26 +913,22 @@ fn ai_session_infers_its_git_checkout_outside_the_scan_directory_without_a_repo_
     fs::create_dir_all(&unrelated).unwrap();
     assert!(git(&["init", project.to_str().unwrap()]).status.success());
     fs::write(project.join("README.md"), "fixture\n").unwrap();
-    assert!(
-        git(&["-C", project.to_str().unwrap(), "add", "README.md"])
-            .status
-            .success()
-    );
-    assert!(
-        git(&[
-            "-C",
-            project.to_str().unwrap(),
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.com",
-            "commit",
-            "-m",
-            "fixture",
-        ])
+    assert!(git(&["-C", project.to_str().unwrap(), "add", "README.md"])
         .status
-        .success()
-    );
+        .success());
+    assert!(git(&[
+        "-C",
+        project.to_str().unwrap(),
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.com",
+        "commit",
+        "-m",
+        "fixture",
+    ])
+    .status
+    .success());
 
     let events = temporary.path().join("events.jsonl");
     let recorded = run(&[
@@ -709,13 +976,11 @@ fn ai_session_infers_its_git_checkout_outside_the_scan_directory_without_a_repo_
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    assert!(
-        report["inputs"]["git_scan_roots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|root| root.as_str() == Some(&expected_root))
-    );
+    assert!(report["inputs"]["git_scan_roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|root| root.as_str() == Some(&expected_root)));
 }
 
 /// The invariant the whole agent-authorship feature rests on, driven end to end

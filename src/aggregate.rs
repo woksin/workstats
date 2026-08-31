@@ -16,11 +16,13 @@ use crate::timeutil::{
 pub const DIMENSIONS: &[&str] = &["repo", "root", "cwd", "provider", "model", "day", "month"];
 
 type SessionKey = (String, String);
+type CommitIdentity = (String, String);
 type SignalKey = (DateTime<Utc>, String, String);
 
 #[derive(Default)]
 struct Bucket {
     key: BTreeMap<String, String>,
+    repo_id: Option<String>,
     active_seconds: f64,
     sessions: HashSet<SessionKey>,
     foreground_sessions: HashSet<SessionKey>,
@@ -32,17 +34,17 @@ struct Bucket {
     human_days: HashSet<String>,
     providers: BTreeSet<String>,
     models: BTreeSet<String>,
-    commits: HashSet<String>,
-    files: HashSet<String>,
+    commits: HashSet<CommitIdentity>,
+    files: HashSet<(String, String)>,
     additions: u64,
     deletions: u64,
     ignored_additions: u64,
     ignored_deletions: u64,
-    agent_commits: HashSet<String>,
+    agent_commits: HashSet<CommitIdentity>,
     agent_additions: u64,
     agent_deletions: u64,
-    ai_assisted_commits: HashSet<String>,
-    autofix_assisted_commits: HashSet<String>,
+    ai_assisted_commits: HashSet<CommitIdentity>,
+    autofix_assisted_commits: HashSet<CommitIdentity>,
     categories: CategoryTally,
     shapes: ShapeTally,
     tokens: TokenUsage,
@@ -54,6 +56,9 @@ struct Bucket {
 pub struct BuiltReport {
     pub methodology: Methodology,
     pub human_time_explanation: Option<HumanTimeExplanation>,
+    /// Logical repositories with evidence that actually survives the report
+    /// window and contributes to at least one row.
+    pub active_repository_checkouts: HashSet<(String, String)>,
     pub observed: Observed,
     pub summary: Summary,
     pub group_by: Vec<String>,
@@ -72,6 +77,7 @@ fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
                 session_id: session.session_id.clone(),
                 cwd: session.cwd.clone(),
                 repo: session.repo.clone(),
+                repo_id: session.repo_id.clone(),
                 root: session.root.clone(),
                 kind: kind.to_string(),
                 model: model.to_string(),
@@ -184,6 +190,7 @@ pub fn build_report_with_human_time_explanation(
             session.token_events.iter().map(move |event| TokenRecord {
                 timestamp: event.timestamp,
                 repo: session.repo.clone(),
+                repo_id: session.repo_id.clone(),
                 root: session.root.clone(),
                 cwd: session.cwd.clone(),
                 provider: session.provider.clone(),
@@ -235,8 +242,8 @@ pub fn build_report_with_human_time_explanation(
     let mut buckets: HashMap<Vec<String>, Bucket> = HashMap::new();
 
     for interval in &intervals {
-        for (key, piece) in keys_for_interval(interval, dimensions) {
-            let row = bucket(&mut buckets, key, dimensions);
+        for (group_key, key, piece) in keys_for_interval(interval, dimensions) {
+            let row = bucket(&mut buckets, group_key, key, dimensions);
             row.active_seconds += piece.seconds();
             let role_key = (piece.provider.clone(), piece.session_id.clone());
             row.sessions.insert(role_key.clone());
@@ -258,8 +265,8 @@ pub fn build_report_with_human_time_explanation(
     }
 
     for interval in &human_intervals {
-        for (key, piece) in keys_for_interval(interval, dimensions) {
-            let row = bucket(&mut buckets, key, dimensions);
+        for (group_key, key, piece) in keys_for_interval(interval, dimensions) {
+            let row = bucket(&mut buckets, group_key, key, dimensions);
             row.human_seconds += piece.seconds();
             row.human_blocks.insert(piece.session_id.clone());
             include_time(row, piece.start, piece.end);
@@ -268,11 +275,8 @@ pub fn build_report_with_human_time_explanation(
 
     for signal in &filtered_human_signals {
         let values = signal_values(signal);
-        let key = dimensions
-            .iter()
-            .map(|name| bounded_value(&values[name]))
-            .collect();
-        let row = bucket(&mut buckets, key, dimensions);
+        let (group_key, key) = dimension_keys(&values, &signal.repo_id, dimensions);
+        let row = bucket(&mut buckets, group_key, key, dimensions);
         row.human_signals.insert((
             signal.timestamp,
             signal.kind.clone(),
@@ -305,11 +309,8 @@ pub fn build_report_with_human_time_explanation(
             .map(|point| point.model.clone())
             .unwrap_or_else(|| "unknown".to_string());
         let values = session_values(session, &model, first);
-        let key = dimensions
-            .iter()
-            .map(|name| bounded_value(&values[name]))
-            .collect();
-        let row = bucket(&mut buckets, key, dimensions);
+        let (group_key, key) = dimension_keys(&values, &session.repo_id, dimensions);
+        let row = bucket(&mut buckets, group_key, key, dimensions);
         row.sessions.insert(session_key.clone());
         if session.is_subagent {
             row.subagent_sessions.insert(session_key);
@@ -325,13 +326,21 @@ pub fn build_report_with_human_time_explanation(
     }
 
     for commit in &filtered_commits {
-        let key = dimensions
+        let key: Vec<_> = dimensions
             .iter()
             .map(|dimension| bounded_value(&commit_value(commit, dimension)))
             .collect();
-        let row = bucket(&mut buckets, key, dimensions);
-        row.commits.insert(commit.sha.clone());
-        row.files.extend(commit.files.iter().cloned());
+        let group_key = grouped_key(&key, &commit.repo_id, dimensions);
+        let row = bucket(&mut buckets, group_key, key, dimensions);
+        let commit_identity = (commit.repo_member_id.clone(), commit.sha.clone());
+        row.commits.insert(commit_identity.clone());
+        row.files.extend(
+            commit
+                .files
+                .iter()
+                .cloned()
+                .map(|path| (commit.repo_member_id.clone(), path)),
+        );
         row.additions += commit.additions;
         row.deletions += commit.deletions;
         row.ignored_additions += commit.ignored_additions;
@@ -342,10 +351,10 @@ pub fn build_report_with_human_time_explanation(
         }
         // A share of the commits just counted, never an addition to them.
         if commit.authorship.is_agent_assisted() {
-            row.ai_assisted_commits.insert(commit.sha.clone());
+            row.ai_assisted_commits.insert(commit_identity.clone());
         }
         if commit.authorship.is_autofix_assisted() {
-            row.autofix_assisted_commits.insert(commit.sha.clone());
+            row.autofix_assisted_commits.insert(commit_identity);
         }
         row.active_days.insert(local_date(commit.timestamp));
         include_time(row, commit.timestamp, commit.timestamp);
@@ -357,12 +366,14 @@ pub fn build_report_with_human_time_explanation(
     // calendar coverage — the day an agent landed code is a day AI worked on
     // this repository — and nothing whatever to the human estimate.
     for commit in &filtered_agent_commits {
-        let key = dimensions
+        let key: Vec<_> = dimensions
             .iter()
             .map(|dimension| bounded_value(&commit_value(commit, dimension)))
             .collect();
-        let row = bucket(&mut buckets, key, dimensions);
-        row.agent_commits.insert(commit.sha.clone());
+        let group_key = grouped_key(&key, &commit.repo_id, dimensions);
+        let row = bucket(&mut buckets, group_key, key, dimensions);
+        row.agent_commits
+            .insert((commit.repo_member_id.clone(), commit.sha.clone()));
         row.agent_additions += commit.additions;
         row.agent_deletions += commit.deletions;
         row.active_days.insert(local_date(commit.timestamp));
@@ -370,11 +381,12 @@ pub fn build_report_with_human_time_explanation(
     }
 
     for token in &filtered_tokens {
-        let key = dimensions
+        let key: Vec<_> = dimensions
             .iter()
             .map(|dimension| bounded_value(&token_value(token, dimension)))
             .collect();
-        let row = bucket(&mut buckets, key, dimensions);
+        let group_key = grouped_key(&key, &token.repo_id, dimensions);
+        let row = bucket(&mut buckets, group_key, key, dimensions);
         row.tokens += token.usage;
         row.active_days.insert(local_date(token.timestamp));
         include_time(row, token.timestamp, token.timestamp);
@@ -387,6 +399,7 @@ pub fn build_report_with_human_time_explanation(
             let days = calendar_days(row.first_seen, row.last_seen);
             ReportRow {
                 key: row.key,
+                repo_id: row.repo_id,
                 active_seconds: round3(row.active_seconds),
                 parallel_agent_seconds: round3(row.active_seconds),
                 ai_wall_seconds: round3(union_seconds(&row.ai_intervals)),
@@ -409,7 +422,7 @@ pub fn build_report_with_human_time_explanation(
                 ai_assisted_commit_count: row.ai_assisted_commits.len(),
                 autofix_assisted_commit_count: row.autofix_assisted_commits.len(),
                 composition: composition_entries(
-                    row.files.iter().map(String::as_str),
+                    row.files.iter().map(|(_, path)| path.as_str()),
                     &row.categories,
                 ),
                 change_shapes: shape_entries(&row.shapes),
@@ -539,32 +552,41 @@ pub fn build_report_with_human_time_explanation(
         .iter()
         .filter(|key| session_roles.get(*key).copied().unwrap_or(false))
         .count();
-    let unique_commits: HashSet<_> = filtered_commits.iter().map(|commit| &commit.sha).collect();
+    let unique_commits: HashSet<_> = filtered_commits
+        .iter()
+        .map(|commit| (&commit.repo_member_id, &commit.sha))
+        .collect();
     let unique_agent_commits: HashSet<_> = filtered_agent_commits
         .iter()
-        .map(|commit| &commit.sha)
+        .map(|commit| (&commit.repo_member_id, &commit.sha))
         .collect();
-    // Shas rather than a running count, so a commit reachable from two scan
-    // roots is described once — the same discipline `unique_commits` uses.
-    let mut ai_assisted_commits: HashSet<&String> = HashSet::new();
-    let mut autofix_assisted_commits: HashSet<&String> = HashSet::new();
+    // Member-qualified SHAs rather than a running count, so a commit reachable
+    // from two worktrees is described once while distinct alias members that
+    // legitimately share history remain distinct.
+    let mut ai_assisted_commits: HashSet<(&String, &String)> = HashSet::new();
+    let mut autofix_assisted_commits: HashSet<(&String, &String)> = HashSet::new();
     for commit in &filtered_commits {
         if commit.authorship.is_agent_assisted() {
-            ai_assisted_commits.insert(&commit.sha);
+            ai_assisted_commits.insert((&commit.repo_member_id, &commit.sha));
         }
         if commit.authorship.is_autofix_assisted() {
-            autofix_assisted_commits.insert(&commit.sha);
+            autofix_assisted_commits.insert((&commit.repo_member_id, &commit.sha));
         }
     }
     let mut summary_categories = CategoryTally::default();
     let mut summary_shapes = ShapeTally::default();
-    let mut summary_files: HashSet<&str> = HashSet::new();
+    let mut summary_files: HashSet<(&str, &str)> = HashSet::new();
     for commit in &filtered_commits {
         summary_categories.merge(&commit.categories);
         if let Some(shape) = change_shape(&commit.categories) {
             summary_shapes.add(shape);
         }
-        summary_files.extend(commit.files.iter().map(String::as_str));
+        summary_files.extend(
+            commit
+                .files
+                .iter()
+                .map(|path| (commit.repo_member_id.as_str(), path.as_str())),
+        );
     }
     let (foreground_sessions_with_commits, foreground_sessions_without_commits) =
         foreground_session_output(
@@ -621,6 +643,25 @@ pub fn build_report_with_human_time_explanation(
         .collect::<HashSet<_>>()
         .len();
 
+    let mut active_repository_checkouts: HashSet<(String, String)> = sessions
+        .iter()
+        .filter(|session| {
+            eligible_session_keys.contains(&(session.provider.clone(), session.session_id.clone()))
+        })
+        .map(|session| (session.repo_id.clone(), session.cwd.clone()))
+        .collect();
+    active_repository_checkouts.extend(
+        filtered_commits
+            .iter()
+            .chain(filtered_agent_commits.iter())
+            .map(|commit| (commit.repo_id.clone(), commit.cwd.clone())),
+    );
+    active_repository_checkouts.extend(
+        filtered_tokens
+            .iter()
+            .map(|token| (token.repo_id.clone(), token.cwd.clone())),
+    );
+
     BuiltReport {
         methodology: Methodology {
             human_work: "human prompts, foreground session boundaries, and authored commits clustered into non-overlapping involvement blocks",
@@ -642,6 +683,7 @@ pub fn build_report_with_human_time_explanation(
             scope: "local retained histories, explicit event logs, and locally available Git repositories only",
         },
         human_time_explanation,
+        active_repository_checkouts,
         observed: Observed {
             first_seen: all_times.iter().min().copied().map(iso),
             last_seen: all_times.iter().max().copied().map(iso),
@@ -694,7 +736,10 @@ pub fn build_report_with_human_time_explanation(
                 .sum(),
             ai_assisted_commit_count: ai_assisted_commits.len(),
             autofix_assisted_commit_count: autofix_assisted_commits.len(),
-            composition: composition_entries(summary_files.iter().copied(), &summary_categories),
+            composition: composition_entries(
+                summary_files.iter().map(|(_, path)| *path),
+                &summary_categories,
+            ),
             change_shapes: shape_entries(&summary_shapes),
             active_days: active_dates.len(),
             provider_seconds,
@@ -796,7 +841,7 @@ fn foreground_session_output(
     let mut by_repo: HashMap<&str, Vec<DateTime<Utc>>> = HashMap::new();
     for commit in commits {
         by_repo
-            .entry(commit.repo.as_str())
+            .entry(commit.repo_id.as_str())
             .or_default()
             .push(commit.timestamp);
     }
@@ -813,7 +858,7 @@ fn foreground_session_output(
         if roles.get(key).copied().unwrap_or(false) {
             continue;
         }
-        let Some(times) = by_repo.get(session.repo.as_str()) else {
+        let Some(times) = by_repo.get(session.repo_id.as_str()) else {
             continue;
         };
         comparable.insert(key);
@@ -831,16 +876,51 @@ fn foreground_session_output(
 
 fn bucket<'a>(
     buckets: &'a mut HashMap<Vec<String>, Bucket>,
+    group_key: Vec<String>,
     key: Vec<String>,
     dimensions: &[String],
 ) -> &'a mut Bucket {
-    buckets.entry(key.clone()).or_insert_with(|| Bucket {
+    let repo_id = dimensions
+        .iter()
+        .position(|dimension| dimension == "repo")
+        .and_then(|index| group_key.get(index).cloned());
+    buckets.entry(group_key).or_insert_with(|| Bucket {
         key: dimensions.iter().cloned().zip(key).collect(),
+        repo_id,
         ..Bucket::default()
     })
 }
 
-fn keys_for_interval(interval: &Interval, dimensions: &[String]) -> Vec<(Vec<String>, Interval)> {
+fn grouped_key(key: &[String], repo_id: &str, dimensions: &[String]) -> Vec<String> {
+    key.iter()
+        .zip(dimensions)
+        .map(|(value, dimension)| {
+            if dimension == "repo" {
+                bounded_value(repo_id)
+            } else {
+                value.clone()
+            }
+        })
+        .collect()
+}
+
+fn dimension_keys(
+    values: &HashMap<String, String>,
+    repo_id: &str,
+    dimensions: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let key: Vec<_> = dimensions
+        .iter()
+        .map(|name| bounded_value(&values[name]))
+        .collect();
+    let group_key = grouped_key(&key, repo_id, dimensions);
+    (group_key, key)
+}
+
+fn keys_for_interval(
+    interval: &Interval,
+    dimensions: &[String],
+) -> Vec<(Vec<String>, Vec<String>, Interval)> {
     let calendar = dimensions
         .iter()
         .find(|name| name.as_str() == "day" || name.as_str() == "month");
@@ -852,11 +932,8 @@ fn keys_for_interval(interval: &Interval, dimensions: &[String]) -> Vec<(Vec<Str
         .into_iter()
         .map(|(calendar_key, piece)| {
             let values = interval_values(&piece, &calendar_key);
-            let key = dimensions
-                .iter()
-                .map(|name| bounded_value(&values[name]))
-                .collect();
-            (key, piece)
+            let (group_key, key) = dimension_keys(&values, &piece.repo_id, dimensions);
+            (group_key, key, piece)
         })
         .collect()
 }
@@ -923,6 +1000,7 @@ fn commit_value(commit: &GitCommit, dimension: &str) -> String {
 struct TokenRecord {
     timestamp: DateTime<Utc>,
     repo: String,
+    repo_id: String,
     root: String,
     cwd: String,
     provider: String,
@@ -1020,6 +1098,8 @@ mod tests {
             sha: sha.into(),
             timestamp: parse_timestamp(at).unwrap(),
             repo: repo.into(),
+            repo_id: repo.into(),
+            repo_member_id: repo.into(),
             cwd: format!("/{repo}"),
             root: "root".into(),
             additions,
@@ -1050,6 +1130,7 @@ mod tests {
             session_id: id.into(),
             cwd: format!("/{repo}"),
             repo: repo.into(),
+            repo_id: repo.into(),
             root: "root".into(),
             points,
             exact_intervals: vec![],
@@ -1570,6 +1651,138 @@ mod tests {
             .find(|row| row.key.get("repo") == Some(&"repo-b".to_string()))
             .unwrap();
         assert_eq!(60, repo_b.total_tokens);
+    }
+
+    #[test]
+    fn attribution_repositories_come_from_evidence_inside_the_window() {
+        let mut sparse = session(
+            "sparse",
+            "sparse-repo",
+            vec![point("2026-01-01T09:00:00Z"), point("2026-01-01T11:00:00Z")],
+            vec![],
+        );
+        sparse.exact_intervals.push(ExactInterval {
+            start: parse_timestamp("2026-01-01T09:30:00Z").unwrap(),
+            end: parse_timestamp("2026-01-01T10:00:00Z").unwrap(),
+            model: "model".into(),
+        });
+        let report = build_report(
+            &[sparse],
+            &[],
+            &[],
+            Duration::minutes(5),
+            Some(parse_timestamp("2026-01-01T10:00:00Z").unwrap()),
+            Some(parse_timestamp("2026-01-01T10:30:00Z").unwrap()),
+            &["repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+        assert!(report.rows.is_empty());
+        assert!(report.active_repository_checkouts.is_empty());
+
+        let mut token_only = session(
+            "token",
+            "token-repo",
+            vec![point("2026-01-01T09:00:00Z")],
+            vec![],
+        );
+        token_only.token_events.push(TokenEvent {
+            timestamp: parse_timestamp("2026-01-01T10:15:00Z").unwrap(),
+            model: "model".into(),
+            usage: TokenUsage {
+                output_tokens: 1,
+                ..TokenUsage::default()
+            },
+        });
+        let report = build_report(
+            &[token_only],
+            &[],
+            &[],
+            Duration::minutes(5),
+            Some(parse_timestamp("2026-01-01T10:00:00Z").unwrap()),
+            Some(parse_timestamp("2026-01-01T10:30:00Z").unwrap()),
+            &["repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+        assert_eq!(
+            HashSet::from([("token-repo".to_string(), "/token-repo".to_string())]),
+            report.active_repository_checkouts
+        );
+    }
+
+    #[test]
+    fn logical_repository_identity_combines_checkout_rows() {
+        let mut primary = session(
+            "primary",
+            "product-primary",
+            vec![point("2026-01-01T10:00:00Z")],
+            vec![],
+        );
+        primary.repo_id = "remote:github.com/acme/product".into();
+        let mut worktree = session(
+            "worktree",
+            "feature-checkout",
+            vec![point("2026-01-01T11:00:00Z")],
+            vec![],
+        );
+        worktree.repo_id = primary.repo_id.clone();
+
+        let report = build_report(
+            &[primary, worktree],
+            &[],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+
+        assert_eq!(1, report.rows.len());
+        assert_eq!(2, report.rows[0].session_count);
+        assert_eq!(
+            Some("remote:github.com/acme/product"),
+            report.rows[0].repo_id.as_deref()
+        );
+    }
+
+    #[test]
+    fn project_alias_members_keep_identical_relative_files_distinct() {
+        let mut api = commit(
+            "aaaaaaaaaaaa",
+            "Product",
+            "2026-01-01T10:00:00Z",
+            &[("README.md", 2, 0)],
+        );
+        api.repo_id = "project:product".into();
+        api.repo_member_id = "remote:host/acme/api".into();
+        let mut web = commit(
+            "aaaaaaaaaaaa",
+            "Product",
+            "2026-01-01T11:00:00Z",
+            &[("README.md", 3, 0)],
+        );
+        web.repo_id = api.repo_id.clone();
+        web.repo_member_id = "remote:host/acme/web".into();
+
+        let report = build_report(
+            &[],
+            &[api, web],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+
+        assert_eq!(1, report.rows.len());
+        assert_eq!(2, report.rows[0].commit_count);
+        assert_eq!(2, report.rows[0].file_count);
+        assert_eq!(2, report.summary.composition[0].files);
     }
 
     /// A key is an identifier a consumer joins on, so it is bounded and

@@ -69,6 +69,11 @@ pub struct RawSession {
     pub session_id: String,
     pub source_file: PathBuf,
     pub cwd: String,
+    /// A trusted parent session's working directory, used only when `cwd` no
+    /// longer has enough Git metadata to identify a deleted temporary
+    /// worktree. The reported checkout remains `cwd`.
+    #[serde(default)]
+    pub repository_hint_cwd: Option<String>,
     pub points: Vec<ActivityPoint>,
     pub exact_intervals: Vec<ExactInterval>,
     pub human_points: Vec<ActivityPoint>,
@@ -84,7 +89,11 @@ pub struct Session {
     pub provider: String,
     pub session_id: String,
     pub cwd: String,
+    /// Short, human-facing repository name.
     pub repo: String,
+    /// Stable local grouping identity. Worktrees share their common Git
+    /// directory; clones of one remote share its normalized fetch URL.
+    pub repo_id: String,
     pub root: String,
     pub points: Vec<ActivityPoint>,
     pub exact_intervals: Vec<ExactInterval>,
@@ -120,6 +129,7 @@ pub struct HumanSignal {
     pub session_id: String,
     pub cwd: String,
     pub repo: String,
+    pub repo_id: String,
     pub root: String,
     pub kind: String,
     pub model: String,
@@ -134,6 +144,7 @@ pub struct Interval {
     pub session_id: String,
     pub cwd: String,
     pub repo: String,
+    pub repo_id: String,
     pub root: String,
 }
 
@@ -234,6 +245,11 @@ pub struct GitCommit {
     pub sha: String,
     pub timestamp: DateTime<Utc>,
     pub repo: String,
+    pub repo_id: String,
+    /// Natural repository identity before configured project aliases combine
+    /// several repositories. Worktrees/clones share it; distinct alias members
+    /// keep it separate for file counting and history navigation.
+    pub repo_member_id: String,
     pub cwd: String,
     pub root: String,
     pub additions: u64,
@@ -261,9 +277,10 @@ impl GitCommit {
         Some(HumanSignal {
             timestamp: self.timestamp,
             provider: "git".to_string(),
-            session_id: self.sha.clone(),
+            session_id: format!("{}:{}", self.repo_member_id, self.sha),
             cwd: self.cwd.clone(),
             repo: self.repo.clone(),
+            repo_id: self.repo_id.clone(),
             root: self.root.clone(),
             kind: "commit".to_string(),
             model: "—".to_string(),
@@ -293,6 +310,12 @@ pub struct Diagnostics {
     pub cache_misses: u64,
     pub cache_writes: u64,
     pub pruned_files: u64,
+    #[serde(default)]
+    pub repository_history_hits: u64,
+    #[serde(default)]
+    pub repository_history_ambiguities: u64,
+    #[serde(default)]
+    pub unresolved_repository_cwds: u64,
     /// Copilot sessions whose store row named a repository the session's own
     /// working directory contradicts. Counted rather than warned about: the
     /// directory already decided, so nothing is lost and nothing is actionable
@@ -349,6 +372,9 @@ impl Diagnostics {
         self.cache_misses += other.cache_misses;
         self.cache_writes += other.cache_writes;
         self.pruned_files += other.pruned_files;
+        self.repository_history_hits += other.repository_history_hits;
+        self.repository_history_ambiguities += other.repository_history_ambiguities;
+        self.unresolved_repository_cwds += other.unresolved_repository_cwds;
         self.repository_conflicts += other.repository_conflicts;
         // Only the warnings `other` could not store are added here: the loop
         // below goes through `warn`, which counts every message it replays, so
@@ -467,6 +493,25 @@ pub struct Observed {
     pub last_seen: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RepositoryAttributionProject {
+    pub label: String,
+    pub methods: Vec<String>,
+    pub checkout_count: usize,
+    pub natural_repository_count: usize,
+    pub configured_alias: bool,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RepositoryAttribution {
+    pub version: &'static str,
+    pub history_hits: u64,
+    pub history_ambiguities: u64,
+    pub unresolved_checkouts: usize,
+    pub projects: Vec<RepositoryAttributionProject>,
+}
+
 /// Changed Git lines attributed to one file area. `files` counts distinct
 /// paths, so it deduplicates a file touched by several commits.
 #[derive(Clone, Debug, Serialize)]
@@ -541,6 +586,10 @@ pub struct Summary {
 #[derive(Debug, Serialize)]
 pub struct ReportRow {
     pub key: BTreeMap<String, String>,
+    /// Internal identity used by the explorer to join a logical repository
+    /// without exposing local Git paths or remote URLs in machine output.
+    #[serde(skip)]
+    pub repo_id: Option<String>,
     pub active_seconds: f64,
     pub parallel_agent_seconds: f64,
     pub ai_wall_seconds: f64,
@@ -610,6 +659,8 @@ pub struct Report {
     pub methodology: Methodology,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub human_time_explanation: Option<HumanTimeExplanation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_attribution: Option<RepositoryAttribution>,
     pub observed: Observed,
     pub summary: Summary,
     pub group_by: Vec<String>,
@@ -657,6 +708,8 @@ mod tests {
             sha: sha.to_string(),
             timestamp: DateTime::from_timestamp(1_767_225_600, 0).unwrap(),
             repo: "repo".into(),
+            repo_id: "repo".into(),
+            repo_member_id: "repo".into(),
             cwd: "/repo".into(),
             root: "root".into(),
             additions: 10,

@@ -792,8 +792,8 @@ workstats --cache /safe/path.db # choose another index
 workstats --config ./team.json  # read source roots and categories from elsewhere
 ```
 
-The config file holds `source_roots`, `categories`, `category_mode`, and
-`check_updates`. `workstats ui`'s saved views are kept beside it as
+The config file holds `source_roots`, `categories`, `category_mode`,
+`project_aliases`, and `check_updates`. `workstats ui`'s saved views are kept beside it as
 `views.json` — configuration, never cache — so `--rebuild-cache` and
 `--no-cache` leave them alone.
 
@@ -826,6 +826,49 @@ affects the time-based metrics.
 
 Dimensions can be composed: `root`, `repo`, `cwd`, `provider`, `model`, `day`,
 and `month`. The default is `repo`.
+
+`repo` means the logical Git repository, not the checkout folder. Linked
+worktrees share their Git common directory, and separately named clones that
+have the same fetch remote share its normalized identity, so their sessions,
+tokens, human involvement, and deduplicated commits appear in one project row.
+Deduplication is scoped to each natural repository: worktrees and clones share
+commit/file identity, while distinct `project_aliases` members that happen to
+share a SHA or relative path remain separate. This reads local `.git` metadata
+only and never contacts the remote. A deleted
+Pi delegated worktree can still be attributed from the parent transcript's
+bounded session header; that hint is used only when the child's own path has no
+Git identity, and no message content is read. Live checkout identities are also
+remembered in the transcript index, so a later report can recover a deleted
+foreground worktree. Ambiguous directory reuse is left unresolved rather than
+guessed. `--rebuild-cache` preserves this identity history; deleting the cache
+file removes it. Use `cwd` (or `--by-dir`) when you deliberately want one row
+per checkout/worktree.
+
+Distinct repositories that form one product can be combined explicitly:
+
+```json
+{
+  "project_aliases": {
+    "cratis": {
+      "label": "Cratis",
+      "paths": ["/work/repos/cratis"],
+      "remotes": [
+        "https://github.com/acme/api.git",
+        "git@github.com:acme/web.git"
+      ]
+    }
+  }
+}
+```
+
+A path matches every repository below it; remote spellings are normalized the
+same way as discovered Git remotes. Alias members are ORed, overlapping aliases
+are rejected, and the stable lowercase map key controls grouping while `label`
+is display-only. Aliases change `repo`, never `cwd`, so `--by-dir` still shows
+each checkout. `--explain-repository-attribution` (or `--explain-repos`) prints
+the privacy-safe evidence used for every row and adds the structured explanation
+to JSON; CSV and `workstats ui` reject it because their shape cannot represent
+the one-to-many ledger.
 
 ```bash
 workstats --group-by provider,model
@@ -863,8 +906,13 @@ separately as ignored lines.
 `--repo PATTERN` is a broad case-insensitive substring filter, matched against
 the same three labels on both sides — the repository name, the working
 directory, and the source root — so a pattern naming a source root selects
-commits as well as AI sessions. `--repo-exact NAME` avoids mixing names such as
-`api` and `api-tools`. `workstats` also scans locally available Git checkouts
+commits as well as AI sessions. `--repo-exact NAME` first matches final displayed
+logical-repository names (including a disambiguation suffix when shown). If no
+label matches, it falls back to a final checkout folder name. Label precedence
+lets an explicit project alias be selected without also matching a checkout
+folder with the same name, while preserving exact path-based selection. It
+avoids mixing names such as `api` and `api-tools`.
+`workstats` also scans locally available Git checkouts
 for retained AI sessions—even when those checkouts are outside `--dir`. This
 keeps Git and AI results aligned regardless of whether a repository filter is
 used, without assuming a particular projects folder; `--dir` remains the
