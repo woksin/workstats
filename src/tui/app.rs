@@ -12,8 +12,8 @@ use super::diff::{DiffRequest, DiffView};
 use super::event::Action;
 use super::search::{Index, Target};
 use super::state::{
-    columns, default_sort, default_views_path, key_of, path_from_file_key, Column, Dataset, Entry,
-    Field, Grain, Level, LevelKind, Mode, SavedView, SavedViews, Sort,
+    Column, Dataset, Entry, Field, Grain, Level, LevelKind, Mode, SavedView, SavedViews, Sort,
+    columns, default_sort, default_views_path, key_of, path_from_file_key,
 };
 use super::{diff, search};
 use crate::model::{GitCommit, Report};

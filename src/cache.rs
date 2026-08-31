@@ -4,9 +4,9 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::ai::{file_time_range, ParsedFile};
+use crate::ai::{ParsedFile, file_time_range};
 use crate::paths::RepositoryHistoryEntry;
 
 /// Bumped whenever a parser changes what it stores or how a range is derived, so that

@@ -11,12 +11,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::classify::{active_registry, CategoryTally};
+use crate::classify::{CategoryTally, active_registry};
 use crate::model::{GitCommit, Report};
 use crate::output::number;
 use crate::paths::{default_config_path, home_dir};
@@ -1143,9 +1143,11 @@ mod tests {
         )
         .unwrap();
         assert!(SavedViews::load(&path).views.is_empty());
-        assert!(SavedViews::load(&directory.path().join("missing.json"))
-            .views
-            .is_empty());
+        assert!(
+            SavedViews::load(&directory.path().join("missing.json"))
+                .views
+                .is_empty()
+        );
     }
 
     #[test]
