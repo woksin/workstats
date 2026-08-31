@@ -11,11 +11,12 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::classify::{CategoryTally, active_registry};
+use crate::classify::{active_registry, CategoryTally};
 use crate::model::{GitCommit, Report};
 use crate::output::number;
 use crate::paths::{default_config_path, home_dir};
@@ -28,7 +29,7 @@ const MAX_VIEW_NAME_BYTES: usize = 64;
 /// The five keys it takes to reach a file. A saved view never stores the diff
 /// level: restoring one would read file contents nobody asked for.
 const MAX_VIEW_DEPTH: usize = 5;
-const VIEWS_VERSION: u32 = 1;
+const VIEWS_VERSION: u32 = 2;
 
 /// One level of the drill-down. The order of the variants IS the drill-down
 /// order, and `child` is the only place that order is written down.
@@ -371,6 +372,13 @@ impl SavedViews {
             return Self::default();
         };
         let mut views: Self = serde_json::from_slice(&bytes).unwrap_or_default();
+        // Repository keys changed from checkout paths to logical identities in
+        // version 2. An older bookmark can therefore point at a row that no
+        // longer exists; discard the incompatible set instead of presenting
+        // apparently valid views that silently stop during restoration.
+        if views.version != VIEWS_VERSION {
+            return Self::default();
+        }
         views.views.retain(SavedView::is_valid);
         views.views.truncate(MAX_SAVED_VIEWS);
         views
@@ -437,18 +445,28 @@ pub fn default_views_path() -> PathBuf {
 /// One changed path of a commit, with the category it classified into.
 #[derive(Clone, Debug)]
 pub struct FileRecord {
+    /// Stable member-qualified identity. Distinct repositories combined by a
+    /// project alias can both contain `README.md`; their histories must not be
+    /// merged just because the relative spelling matches.
+    pub key: String,
     pub path: String,
     pub category: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct CommitRecord {
+    /// Member-qualified identity used for navigation when two configured alias
+    /// members contain the same Git object id.
+    pub key: String,
     pub sha: String,
     pub short_sha: String,
     pub timestamp: DateTime<Utc>,
     pub day: String,
     pub month: String,
+    /// Logical repository identity used for drill-down scope.
     pub repo_key: String,
+    /// Concrete checkout that can show this commit's diff.
+    pub cwd: String,
     /// A derived description of the change. `git log` is asked for a sha and a
     /// date only, so there is no commit subject to show; see
     /// `HANDOFF-tui-core.md` for the request to carry one.
@@ -470,8 +488,8 @@ impl CommitRecord {
 
 #[derive(Clone, Debug)]
 pub struct RepoRecord {
-    /// The repository working directory. Unique, and what the diff viewer runs
-    /// `git -C` against.
+    /// Logical repository identity shared by linked worktrees and clones of the
+    /// same fetch remote.
     pub key: String,
     pub label: String,
     pub root: String,
@@ -492,7 +510,7 @@ pub struct Dataset {
     pub categories: Vec<String>,
     pub repos: Vec<RepoRecord>,
     commits: Vec<CommitRecord>,
-    by_sha: BTreeMap<String, usize>,
+    by_commit: BTreeMap<String, usize>,
     by_repo: BTreeMap<String, usize>,
 }
 
@@ -516,9 +534,9 @@ impl Dataset {
 
         for commit in commits {
             let index = records.len();
-            let slot = *by_repo.entry(commit.cwd.clone()).or_insert_with(|| {
+            let slot = *by_repo.entry(commit.repo_id.clone()).or_insert_with(|| {
                 repos.push(RepoRecord {
-                    key: commit.cwd.clone(),
+                    key: commit.repo_id.clone(),
                     label: commit.repo.clone(),
                     root: commit.root.clone(),
                     commits: Vec::new(),
@@ -537,20 +555,24 @@ impl Dataset {
 
             let mut files = Vec::with_capacity(commit.files.len());
             for path in &commit.files {
-                repo_files[slot].insert(path.clone());
+                let key = file_key(&commit.repo_member_id, path);
+                repo_files[slot].insert(key.clone());
                 files.push(FileRecord {
+                    key,
                     path: path.clone(),
                     category: registry.classify(path),
                 });
             }
             records.push(CommitRecord {
+                key: commit_key(&commit.repo_member_id, &commit.sha),
                 short_sha: commit.sha.chars().take(9).collect(),
                 summary: describe_change(&files, &categories),
                 sha: commit.sha,
                 timestamp: commit.timestamp,
                 day: local_date(commit.timestamp),
                 month: local_month(commit.timestamp),
-                repo_key: commit.cwd,
+                repo_key: commit.repo_id,
+                cwd: commit.cwd,
                 additions: commit.additions,
                 deletions: commit.deletions,
                 categories: commit.categories,
@@ -561,17 +583,17 @@ impl Dataset {
         for (repo, paths) in repos.iter_mut().zip(&repo_files) {
             repo.files = paths.len();
         }
-        let by_sha = records
+        let by_commit = records
             .iter()
             .enumerate()
-            .map(|(index, record)| (record.sha.clone(), index))
+            .map(|(index, record)| (record.key.clone(), index))
             .collect();
         Self {
             summary: Vec::new(),
             categories,
             repos,
             commits: records,
-            by_sha,
+            by_commit,
             by_repo,
         }
     }
@@ -580,9 +602,9 @@ impl Dataset {
         &self.commits
     }
 
-    pub fn commit(&self, sha: &str) -> Option<&CommitRecord> {
-        self.by_sha
-            .get(sha)
+    pub fn commit(&self, key: &str) -> Option<&CommitRecord> {
+        self.by_commit
+            .get(key)
             .and_then(|index| self.commits.get(*index))
     }
 
@@ -716,7 +738,7 @@ impl Dataset {
             .map(|index| &self.commits[index])
             .filter(|commit| wanted.is_none_or(|slot| commit.categories.get(slot).touched() > 0))
             .map(|commit| Entry {
-                id: commit.sha.clone(),
+                id: commit.key.clone(),
                 fields: vec![
                     Field::moment(commit.timestamp),
                     Field::text(&commit.short_sha),
@@ -731,15 +753,15 @@ impl Dataset {
 
     /// Every path the commit touched, not only the category that was drilled
     /// through: a commit is one atomic change and hiding half of it misleads.
-    fn file_rows(&self, sha: &str) -> Vec<Entry> {
-        let Some(commit) = self.commit(sha) else {
+    fn file_rows(&self, commit_key: &str) -> Vec<Entry> {
+        let Some(commit) = self.commit(commit_key) else {
             return Vec::new();
         };
         commit
             .files
             .iter()
             .map(|file| Entry {
-                id: file.path.clone(),
+                id: file.key.clone(),
                 fields: vec![
                     Field::text(&file.path),
                     Field::text(self.category_name(file.category)),
@@ -751,13 +773,13 @@ impl Dataset {
     /// The file's whole history in this repository rather than only the period
     /// that was drilled through: "when else did this change?" is the question a
     /// reader has once they are looking at a single file.
-    fn history_rows(&self, repo: &str, path: &str, grain: Grain) -> Vec<Entry> {
+    fn history_rows(&self, repo: &str, file_key: &str, grain: Grain) -> Vec<Entry> {
         self.scope(repo, "", grain)
             .into_iter()
             .map(|index| &self.commits[index])
-            .filter(|commit| commit.files.iter().any(|file| file.path == path))
+            .filter(|commit| commit.files.iter().any(|file| file.key == file_key))
             .map(|commit| Entry {
-                id: commit.sha.clone(),
+                id: commit.key.clone(),
                 fields: vec![
                     Field::moment(commit.timestamp),
                     Field::text(&commit.short_sha),
@@ -784,7 +806,7 @@ impl Bucket {
         self.additions = self.additions.saturating_add(commit.additions);
         self.deletions = self.deletions.saturating_add(commit.deletions);
         for file in &commit.files {
-            self.files.insert(file.path.clone());
+            self.files.insert(file.key.clone());
         }
     }
 }
@@ -832,15 +854,15 @@ fn join_report_seconds(report: &Report, repos: &mut [RepoRecord]) {
     }
     let mut seconds: BTreeMap<&str, (f64, f64)> = BTreeMap::new();
     for row in &report.rows {
-        let Some(repo) = row.key.get("repo") else {
+        let Some(repo_id) = row.repo_id.as_deref() else {
             continue;
         };
-        let entry = seconds.entry(repo.as_str()).or_default();
+        let entry = seconds.entry(repo_id).or_default();
         entry.0 += row.active_seconds;
         entry.1 += row.human_estimated_seconds;
     }
     for repo in repos {
-        if let Some((active, human)) = seconds.get(repo.label.as_str()) {
+        if let Some((active, human)) = seconds.get(repo.key.as_str()) {
             repo.active_seconds = *active;
             repo.human_seconds = *human;
         }
@@ -885,6 +907,26 @@ fn date_part(value: &str) -> &str {
     &value[..value.len().min(10)]
 }
 
+fn member_key(member_id: &str) -> String {
+    let digest = Sha256::digest(member_id.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn commit_key(member_id: &str, sha: &str) -> String {
+    format!("{}:{sha}", member_key(member_id))
+}
+
+fn file_key(member_id: &str, path: &str) -> String {
+    format!("{}:{path}", member_key(member_id))
+}
+
+pub(super) fn path_from_file_key(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(_, path)| path)
+}
+
 /// Shared by the tests in this module and in `app`, so both exercise the same
 /// two-commit repository rather than each inventing one.
 #[cfg(test)]
@@ -906,6 +948,8 @@ pub(super) fn sample_commit(sha: &str, cwd: &str, files: &[(&str, u64, u64)]) ->
         sha: sha.to_string(),
         timestamp: Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap(),
         repo: cwd.rsplit('/').next().unwrap_or(cwd).to_string(),
+        repo_id: cwd.to_string(),
+        repo_member_id: cwd.to_string(),
         cwd: cwd.to_string(),
         root: "studio".to_string(),
         additions,
@@ -970,6 +1014,54 @@ mod tests {
     }
 
     #[test]
+    fn logical_repository_overview_combines_worktree_checkouts() {
+        let mut primary = sample_commit("aaaaaaaaaaaa", "/repos/widget", &[("src/lib.rs", 10, 2)]);
+        primary.repo_id = "remote:github.com/acme/widget".into();
+        let mut worktree = sample_commit(
+            "bbbbbbbbbbbb",
+            "/worktrees/widget-feature",
+            &[("tests/lib.rs", 20, 1)],
+        );
+        worktree.repo = "widget".into();
+        worktree.repo_id = primary.repo_id.clone();
+        worktree.repo_member_id = primary.repo_member_id.clone();
+
+        let data = Dataset::from_commits(vec![primary, worktree]);
+
+        assert_eq!(1, data.repos.len());
+        assert_eq!(2, data.repos[0].commits.len());
+        assert_eq!(30, data.repos[0].additions);
+        assert_eq!(3, data.repos[0].deletions);
+        assert_eq!("/worktrees/widget-feature", data.commits[1].cwd);
+    }
+
+    #[test]
+    fn alias_members_with_the_same_relative_path_keep_separate_file_histories() {
+        let mut api = sample_commit("aaaaaaaaaaaa", "/repos/api", &[("README.md", 2, 0)]);
+        api.repo = "Product".into();
+        api.repo_id = "project:product".into();
+        api.repo_member_id = "remote:host/acme/api".into();
+        let mut web = sample_commit("aaaaaaaaaaaa", "/repos/web", &[("README.md", 3, 0)]);
+        web.repo = "Product".into();
+        web.repo_id = api.repo_id.clone();
+        web.repo_member_id = "remote:host/acme/web".into();
+
+        let data = Dataset::from_commits(vec![api, web]);
+        assert_eq!(1, data.repos.len());
+        assert_eq!(2, data.repos[0].files);
+        assert_eq!(2, data.commits.len());
+        assert_ne!(data.commits[0].key, data.commits[1].key);
+        assert_eq!("/repos/api", data.commit(&data.commits[0].key).unwrap().cwd);
+        assert_eq!("/repos/web", data.commit(&data.commits[1].key).unwrap().cwd);
+        let api_readme = data.commits[0].files[0].key.clone();
+        assert_eq!(
+            1,
+            data.history_rows("project:product", &api_readme, Grain::Month)
+                .len()
+        );
+    }
+
+    #[test]
     fn drilling_narrows_to_the_chosen_repository_and_period() {
         let data = sample_dataset();
         let stack = vec![
@@ -996,8 +1088,16 @@ mod tests {
             Level::new(LevelKind::Repo, "/repos/widget", "widget"),
             Level::new(LevelKind::Period, "2026-06", "2026-06"),
             Level::new(LevelKind::Category, "source", "source"),
-            Level::new(LevelKind::Commit, "aaaaaaaaaaaa", "aaaaaaaaa"),
-            Level::new(LevelKind::File, "src/lib.rs", "src/lib.rs"),
+            Level::new(
+                LevelKind::Commit,
+                commit_key("/repos/widget", "aaaaaaaaaaaa"),
+                "aaaaaaaaa",
+            ),
+            Level::new(
+                LevelKind::File,
+                file_key("/repos/widget", "src/lib.rs"),
+                "src/lib.rs",
+            ),
         ];
         assert_eq!(2, data.rows(&stack, Grain::Month).len());
     }
@@ -1037,11 +1137,15 @@ mod tests {
         let path = directory.path().join("views.json");
         fs::write(&path, b"{not json").unwrap();
         assert!(SavedViews::load(&path).views.is_empty());
-        assert!(
-            SavedViews::load(&directory.path().join("missing.json"))
-                .views
-                .is_empty()
-        );
+        fs::write(
+            &path,
+            br#"{"version":1,"views":[{"name":"old","path":["/checkout"]}]}"#,
+        )
+        .unwrap();
+        assert!(SavedViews::load(&path).views.is_empty());
+        assert!(SavedViews::load(&directory.path().join("missing.json"))
+            .views
+            .is_empty());
     }
 
     #[test]

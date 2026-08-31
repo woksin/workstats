@@ -12,7 +12,7 @@ mod timeutil;
 mod tui;
 mod update;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -34,7 +34,8 @@ use git::{DEFAULT_AGENT_AUTHORS, default_git_author, read_agent_commits, read_gi
 use model::{Diagnostics, Inputs, Report, Session};
 use output::{print_csv, print_json, print_table};
 use paths::{
-    PathResolver, configured_rules, default_cache_path, default_update_check_path, load_config,
+    PathResolver, configured_rules, default_cache_path, default_update_check_path,
+    disambiguated_repository_label, home_dir, load_config,
 };
 use progress::Progress;
 use sources::{
@@ -192,7 +193,10 @@ struct ReportArguments {
         help = "Case-insensitive repository/path substring filter"
     )]
     repo: Option<String>,
-    #[arg(long, help = "Exact repo label or final folder name")]
+    #[arg(
+        long,
+        help = "Exact repo label, or final folder name when no label matches"
+    )]
     repo_exact: Option<String>,
     #[arg(short = 's', long, help = "Inclusive YYYY-MM or YYYY-MM-DD")]
     since: Option<String>,
@@ -240,6 +244,12 @@ struct ReportArguments {
         help = "Print or serialize the auditable human-time calculation ledger (table and JSON only)"
     )]
     explain_human_time: bool,
+    #[arg(
+        long = "explain-repository-attribution",
+        visible_alias = "explain-repos",
+        help = "Explain how checkouts were combined into logical repositories (table and JSON only)"
+    )]
+    explain_repository_attribution: bool,
     // Optional rather than defaulted so clap can tell "the user asked for this
     // grouping" from "nobody said"; the shortcut flags below conflict with the
     // former only.
@@ -545,14 +555,18 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
             "`workstats ui` is interactive and writes no machine-readable output; drop --format, or run workstats without `ui` for json or csv"
         );
     }
-    if presentation == Presentation::Explore && arguments.explain_human_time {
+    if presentation == Presentation::Explore
+        && (arguments.explain_human_time || arguments.explain_repository_attribution)
+    {
         bail!(
-            "--explain-human-time is not available in `workstats ui`; run workstats with table or JSON output"
+            "explanation flags are not available in `workstats ui`; run workstats with table or JSON output"
         );
     }
-    if arguments.output_format == OutputFormat::Csv && arguments.explain_human_time {
+    if arguments.output_format == OutputFormat::Csv
+        && (arguments.explain_human_time || arguments.explain_repository_attribution)
+    {
         bail!(
-            "--explain-human-time is not available with --format csv; use table output or --format json"
+            "explanation flags are not available with --format csv; use table output or --format json"
         );
     }
     let gap_cap = duration_flag("--gap-cap", &arguments.gap_cap)?;
@@ -660,8 +674,8 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
     // Before anything classifies a path, so every commit in this run is read
     // through the same registry.
     classify::install(config.category_registry()?)?;
-    let rules = configured_rules(config, &arguments.source_rule)?;
-    let mut resolver = PathResolver::new(rules);
+    let rules = configured_rules(&config, &arguments.source_rule)?;
+    let aliases = config.compiled_project_aliases(&home_dir())?;
     let cache_path = arguments.cache.clone().unwrap_or_else(default_cache_path);
     if arguments.rebuild_cache {
         progress.set("Rebuilding transcript index");
@@ -679,6 +693,19 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
             }
         }
     };
+
+    let repository_history = if let Some(cache) = transcript_cache.as_ref() {
+        match cache.load_repository_history() {
+            Ok(history) => history,
+            Err(error) => {
+                diagnostics.warn(format!("repository identity history ignored: {error}"));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut resolver = PathResolver::with_context(rules, aliases, repository_history, home_dir());
 
     let mut sessions = Vec::new();
     if !arguments.no_ai {
@@ -764,15 +791,12 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         }
     }
     sessions.retain(|session| provider_enabled(&session.provider, &included, &excluded));
-    filter_sessions(
-        &mut sessions,
-        arguments.repo.as_deref(),
-        arguments.repo_exact.as_deref(),
-    );
-    let repo_filter = arguments
-        .repo
-        .as_deref()
-        .or(arguments.repo_exact.as_deref());
+    // Broad substring filtering can happen immediately. Exact filtering waits
+    // until every session and Git repository has its final disambiguated label;
+    // otherwise an explicit alias and a natural repository with the same raw
+    // name are both retained even though only the alias is displayed plainly.
+    filter_sessions(&mut sessions, arguments.repo.as_deref(), None, true);
+    let repo_filter = arguments.repo.as_deref();
     let agent_authors = agent_author_patterns(arguments.agent_commits.as_deref());
     let mut git_scan_roots = Vec::new();
     let mut commits = Vec::new();
@@ -833,20 +857,70 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
             ));
         }
         let mut seen_agent_commits = HashSet::new();
-        agent_commits.retain(|commit| seen_agent_commits.insert(commit.sha.clone()));
+        agent_commits.retain(|commit| {
+            seen_agent_commits.insert((commit.repo_member_id.clone(), commit.sha.clone()))
+        });
         let mut seen_commits = HashSet::new();
         commits.retain(|commit| {
             // An `--author` wide enough to match a bot — a developer literally
             // named Copilot, or a deliberately broad regex — would otherwise
-            // put one commit on both sides. Agent authorship wins: the cost of
-            // being wrong the other way is inventing hours nobody worked.
-            !seen_agent_commits.contains(&commit.sha) && seen_commits.insert(commit.sha.clone())
+            // put one commit on both sides. Agent authorship wins within the
+            // same natural repository; an alias may legitimately combine two
+            // repositories that happen to contain the same SHA.
+            let key = (commit.repo_member_id.clone(), commit.sha.clone());
+            !seen_agent_commits.contains(&key) && seen_commits.insert(key)
         });
-        if let Some(exact) = &arguments.repo_exact {
-            commits.retain(|commit| exact_repo(&commit.repo, &commit.cwd, exact));
-            agent_commits.retain(|commit| exact_repo(&commit.repo, &commit.cwd, exact));
-        }
     }
+    resolver.validate_project_aliases()?;
+    let display_labels =
+        disambiguate_repository_labels(&mut sessions, &mut commits, &mut agent_commits);
+    resolver.apply_display_labels(&display_labels);
+    if let Some(exact) = arguments.repo_exact.as_deref() {
+        // A final display label wins globally. Only when no label matches do
+        // final checkout folder names participate, preserving the historical
+        // path fallback without making a natural `Product` checkout shadow an
+        // explicit alias whose final label is exactly `Product`.
+        let label_matches = sessions
+            .iter()
+            .map(|item| (&item.repo, &item.repo_id))
+            .chain(
+                commits
+                    .iter()
+                    .chain(agent_commits.iter())
+                    .map(|item| (&item.repo, &item.repo_id)),
+            )
+            .any(|(repo, repo_id)| exact_repo_label(repo, repo_id, exact));
+        let allow_folder = !label_matches;
+        filter_sessions(&mut sessions, None, Some(exact), allow_folder);
+        commits.retain(|commit| {
+            exact_repo(
+                &commit.repo,
+                &commit.repo_id,
+                &commit.cwd,
+                exact,
+                allow_folder,
+            )
+        });
+        agent_commits.retain(|commit| {
+            exact_repo(
+                &commit.repo,
+                &commit.repo_id,
+                &commit.cwd,
+                exact,
+                allow_folder,
+            )
+        });
+    }
+
+    let observations = resolver.take_repository_observations();
+    if let Some(cache) = transcript_cache.as_mut()
+        && let Err(error) = cache.remember_repository_identities(&observations)
+    {
+        diagnostics.warn(format!(
+            "repository identity history write ignored: {error}"
+        ));
+    }
+
     progress.set("Estimating human involvement");
     let built = build_report_with_human_time_explanation(
         &sessions,
@@ -860,9 +934,17 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         review_credit,
         arguments.explain_human_time,
     );
+    let attribution = resolver.repository_attribution(&built.active_repository_checkouts);
+    diagnostics.repository_history_hits = attribution.history_hits;
+    diagnostics.repository_history_ambiguities = attribution.history_ambiguities;
+    diagnostics.unresolved_repository_cwds = attribution.unresolved_checkouts as u64;
+    let repository_attribution = arguments
+        .explain_repository_attribution
+        .then_some(attribution);
     let report = Report {
         methodology: built.methodology,
         human_time_explanation: built.human_time_explanation,
+        repository_attribution,
         observed: built.observed,
         summary: built.summary,
         group_by: built.group_by,
@@ -1185,25 +1267,122 @@ fn record_event(arguments: &RecordArguments) -> Result<()> {
     Ok(())
 }
 
-fn filter_sessions(sessions: &mut Vec<Session>, pattern: Option<&str>, exact: Option<&str>) {
+fn filter_sessions(
+    sessions: &mut Vec<Session>,
+    pattern: Option<&str>,
+    exact: Option<&str>,
+    allow_folder: bool,
+) {
     if let Some(exact) = exact {
-        sessions.retain(|session| exact_repo(&session.repo, &session.cwd, exact));
+        sessions.retain(|session| {
+            exact_repo(
+                &session.repo,
+                &session.repo_id,
+                &session.cwd,
+                exact,
+                allow_folder,
+            )
+        });
     }
     if let Some(pattern) = pattern {
         let needle = pattern.to_lowercase();
         sessions.retain(|session| {
             session.repo.to_lowercase().contains(&needle)
+                || disambiguated_repository_label(&session.repo, &session.repo_id)
+                    .to_lowercase()
+                    .contains(&needle)
                 || session.cwd.to_lowercase().contains(&needle)
                 || session.root.to_lowercase().contains(&needle)
         });
     }
 }
 
-fn exact_repo(repo: &str, cwd: &str, exact: &str) -> bool {
+fn exact_repo_label(repo: &str, repo_id: &str, exact: &str) -> bool {
     repo.eq_ignore_ascii_case(exact)
-        || Path::new(cwd)
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(exact))
+        || disambiguated_repository_label(repo, repo_id).eq_ignore_ascii_case(exact)
+}
+
+fn exact_repo(repo: &str, repo_id: &str, cwd: &str, exact: &str, allow_folder: bool) -> bool {
+    exact_repo_label(repo, repo_id, exact)
+        || (allow_folder
+            && Path::new(cwd)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(exact)))
+}
+
+fn repository_display_labels<'a>(
+    repositories: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> HashMap<String, String> {
+    let mut by_label: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut labels = HashMap::new();
+    for (repo_id, label) in repositories {
+        by_label
+            .entry(label.to_lowercase())
+            .or_default()
+            .insert(repo_id.to_string());
+        labels
+            .entry(repo_id.to_string())
+            .or_insert_with(|| label.to_string());
+    }
+    for (_, repo_ids) in by_label {
+        if repo_ids.len() < 2 {
+            continue;
+        }
+        let configured: Vec<_> = repo_ids
+            .iter()
+            .filter(|repo_id| repo_id.starts_with("project:"))
+            .collect();
+        for repo_id in &repo_ids {
+            // An explicit product label wins over colliding natural repository
+            // names. Two aliases cannot collide because config validation
+            // rejects that before scanning.
+            if configured.len() == 1 && repo_id == configured[0] {
+                continue;
+            }
+            let label = labels
+                .get(repo_id)
+                .cloned()
+                .expect("every grouped repository has a label");
+            labels.insert(
+                repo_id.clone(),
+                disambiguated_repository_label(&label, repo_id),
+            );
+        }
+    }
+    labels
+}
+
+fn disambiguate_repository_labels(
+    sessions: &mut [Session],
+    commits: &mut [model::GitCommit],
+    agent_commits: &mut [model::GitCommit],
+) -> HashMap<String, String> {
+    let labels = repository_display_labels(
+        sessions
+            .iter()
+            .map(|item| (item.repo_id.as_str(), item.repo.as_str()))
+            .chain(
+                commits
+                    .iter()
+                    .chain(agent_commits.iter())
+                    .map(|item| (item.repo_id.as_str(), item.repo.as_str())),
+            ),
+    );
+    for (repo_id, label) in sessions
+        .iter_mut()
+        .map(|item| (&item.repo_id, &mut item.repo))
+        .chain(
+            commits
+                .iter_mut()
+                .chain(agent_commits.iter_mut())
+                .map(|item| (&item.repo_id, &mut item.repo)),
+        )
+    {
+        if let Some(final_label) = labels.get(repo_id) {
+            label.clone_from(final_label);
+        }
+    }
+    labels
 }
 
 fn inferred_repository_roots(sessions: &[Session]) -> Vec<PathBuf> {
@@ -1271,16 +1450,75 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_repository_labels_are_disambiguated_without_renaming_an_explicit_project() {
+        let labels = repository_display_labels([
+            ("remote:host/one/product", "product"),
+            ("remote:host/two/product", "product"),
+        ]);
+        assert_ne!(
+            labels["remote:host/one/product"],
+            labels["remote:host/two/product"]
+        );
+        assert!(labels["remote:host/one/product"].starts_with("product ["));
+
+        let labels = repository_display_labels([
+            ("project:product", "Product"),
+            ("remote:host/other/product", "Product"),
+        ]);
+        assert_eq!("Product", labels["project:product"]);
+        assert!(labels["remote:host/other/product"].starts_with("Product ["));
+        assert!(exact_repo(
+            &labels["project:product"],
+            "project:product",
+            "/checkouts/alias",
+            "Product",
+            false
+        ));
+        assert!(!exact_repo(
+            &labels["remote:host/other/product"],
+            "remote:host/other/product",
+            "/checkouts/Product",
+            "Product",
+            false
+        ));
+        assert!(exact_repo(
+            &labels["remote:host/other/product"],
+            "remote:host/other/product",
+            "/checkouts/Product",
+            "Product",
+            true
+        ));
+
+        let case_only = repository_display_labels([
+            ("remote:host/upper", "Product"),
+            ("remote:host/lower", "product"),
+        ]);
+        assert!(case_only.values().all(|label| label.contains('[')));
+    }
+
+    #[test]
     fn exact_repo_filter_does_not_match_similar_names() {
         assert!(exact_repo(
             "studio/widget",
+            "remote:host/studio/widget",
             "/repos/studio/widget",
-            "widget"
+            "widget",
+            true
         ));
         assert!(!exact_repo(
             "misc/widget-tools",
+            "remote:host/misc/widget-tools",
             "/repos/misc/widget-tools",
-            "widget"
+            "widget",
+            true
+        ));
+        let displayed = disambiguated_repository_label("widget", "remote:host/studio/widget");
+        assert!(exact_repo(
+            "widget",
+            "remote:host/studio/widget",
+            "/repos/other",
+            &displayed,
+            false
         ));
     }
 
@@ -1646,6 +1884,7 @@ mod tests {
             session_id: "session".into(),
             cwd: nested.to_string_lossy().into_owned(),
             repo: "project".into(),
+            repo_id: "project".into(),
             root: "tmp/scratch".into(),
             points: Vec::new(),
             exact_intervals: Vec::new(),

@@ -649,6 +649,36 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     if let Some(explanation) = &report.human_time_explanation {
         print_human_time_explanation(explanation);
     }
+    if let Some(attribution) = &report.repository_attribution {
+        println!("Repository attribution");
+        println!(
+            "  {:<34} {:<12} {:>7}  Evidence",
+            "Project", "Result", "Checkouts"
+        );
+        println!("  {}", "─".repeat(78));
+        for project in &attribution.projects {
+            let result = if project.configured_alias {
+                "alias"
+            } else if project.resolved {
+                "resolved"
+            } else {
+                "unresolved"
+            };
+            println!(
+                "  {:<34} {:<12} {:>7}  {}",
+                cell(&safe_text(&project.label), 34),
+                result,
+                project.checkout_count,
+                project.methods.join(", ")
+            );
+        }
+        println!(
+            "  {} history recovery hit(s), {} ambiguous, {} unresolved checkout(s).\n",
+            attribution.history_hits,
+            attribution.history_ambiguities,
+            attribution.unresolved_checkouts
+        );
+    }
     println!(
         "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
         compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
@@ -721,6 +751,24 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
     if let Some(note) = repository_conflict_note(diagnostics.repository_conflicts) {
         println!("{note}");
+    }
+    if diagnostics.unresolved_repository_cwds != 0 {
+        println!(
+            "Repository attribution: {} could not be linked{}; use --explain-repository-attribution.",
+            counted(
+                diagnostics.unresolved_repository_cwds,
+                "checkout",
+                "checkouts"
+            ),
+            if diagnostics.repository_history_ambiguities == 0 {
+                String::new()
+            } else {
+                format!(
+                    " ({} had ambiguous history)",
+                    diagnostics.repository_history_ambiguities
+                )
+            }
+        );
     }
     // Without these a mistyped --history or --events path produces a clean
     // looking report with silently missing data.
@@ -1272,6 +1320,7 @@ mod tests {
     fn row_with(composition: Vec<CompositionEntry>) -> ReportRow {
         ReportRow {
             key: BTreeMap::new(),
+            repo_id: None,
             active_seconds: 0.0,
             parallel_agent_seconds: 0.0,
             ai_wall_seconds: 0.0,
@@ -1332,6 +1381,7 @@ mod tests {
                 scope: "",
             },
             human_time_explanation: None,
+            repository_attribution: None,
             observed: Observed {
                 first_seen: None,
                 last_seen: None,

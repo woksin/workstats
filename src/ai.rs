@@ -1239,9 +1239,10 @@ pub fn read_pi_sessions_indexed(
         diagnostics,
         cache,
         "pi",
-        // A session file is append-only and its own mtime and size already tell the
-        // cache when it changed, so nothing outside the file feeds the fingerprint.
-        |_| "pi-v1".to_string(),
+        // A delegated session's repository hint comes from its parent header,
+        // so the cache context must change when that parent changes, appears,
+        // or disappears even if the child transcript itself is untouched.
+        |path| pi_context_fingerprint(path, root),
         since,
         until,
         |path| parse_pi_file(path, root, MAX_JSONL_LINE_BYTES),
@@ -1450,6 +1451,7 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         ),
         source_file: path.to_path_buf(),
         cwd,
+        repository_hint_cwd: None,
         points,
         exact_intervals: Vec::new(),
         human_points,
@@ -1648,6 +1650,7 @@ pub fn parse_copilot_file(
             },
             source_file: path.to_path_buf(),
             cwd: resolved_cwd,
+            repository_hint_cwd: None,
             points,
             exact_intervals: Vec::new(),
             human_points,
@@ -1668,6 +1671,7 @@ pub fn parse_copilot_file(
             source_file: path.to_path_buf(),
             cwd: resolved
                 .unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned()),
+            repository_hint_cwd: None,
             points: Vec::new(),
             exact_intervals: vec![interval],
             human_points: Vec::new(),
@@ -1971,6 +1975,7 @@ pub fn parse_copilot_vscode_file(path: &Path, max_bytes: u64) -> ParsedFile {
         },
         source_file: path.to_path_buf(),
         cwd,
+        repository_hint_cwd: None,
         points,
         exact_intervals,
         human_points,
@@ -2149,6 +2154,7 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
                 session_id: record.session_id,
                 source_file: path.to_path_buf(),
                 cwd: record.cwd,
+                repository_hint_cwd: None,
                 points: Vec::new(),
                 exact_intervals: Vec::new(),
                 human_points: Vec::new(),
@@ -2391,6 +2397,7 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                     session_id: session.id,
                     source_file: path.to_path_buf(),
                     cwd: session.cwd,
+                    repository_hint_cwd: None,
                     points: session.points,
                     exact_intervals: Vec::new(),
                     human_points: session.human_points,
@@ -2764,6 +2771,7 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         ),
         source_file: path.to_path_buf(),
         cwd,
+        repository_hint_cwd: None,
         points,
         exact_intervals: Vec::new(),
         human_points,
@@ -2803,6 +2811,49 @@ fn pi_injected_prompt(prefix: &str) -> bool {
     PI_INJECTED_USER_PREFIXES
         .iter()
         .any(|marker| prefix.starts_with(marker))
+}
+
+/// Reads only the bounded session header of a Pi parent transcript.
+///
+/// A delegated Pi session records its parent transcript path. That is enough to
+/// retain the logical repository after a temporary worktree is deleted, but it
+/// is also transcript-controlled input: only a JSONL file below the configured
+/// Pi session root may be opened, and no message line is ever inspected.
+const MAX_PI_HEADER_BYTES: usize = 64 * 1024;
+
+fn pi_session_header(path: &Path) -> Option<PiRecord> {
+    let mut reader = BufReader::new(File::open(path).ok()?);
+    let (line, oversized) = read_bounded_line(&mut reader, MAX_PI_HEADER_BYTES).ok()??;
+    if oversized {
+        return None;
+    }
+    let record: PiRecord = serde_json::from_slice(&line).ok()?;
+    (record.record_type.as_deref() == Some("session")).then_some(record)
+}
+
+fn pi_parent_path(parent_session: &str, root: &Path) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    let parent = Path::new(parent_session).canonicalize().ok()?;
+    (parent.starts_with(root)
+        && parent.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+    .then_some(parent)
+}
+
+fn pi_context_fingerprint(path: &Path, root: &Path) -> String {
+    let parent = pi_session_header(path)
+        .and_then(|record| record.parent_session)
+        .and_then(|parent| pi_parent_path(&parent, root));
+    match parent {
+        Some(parent) => format!("pi-v2:parent:{}", crate::cache::file_context(&parent)),
+        None => "pi-v2:no-parent".to_string(),
+    }
+}
+
+fn pi_parent_cwd(parent_session: &str, root: &Path) -> Option<String> {
+    let parent = pi_parent_path(parent_session, root)?;
+    pi_session_header(&parent)?
+        .cwd
+        .filter(|cwd| !cwd.is_empty())
 }
 
 /// Reads one Pi session transcript.
@@ -3050,6 +3101,10 @@ impl PiSessionState {
             }
         }
         let approximate_cwd = self.cwd.is_none();
+        let repository_hint_cwd = self
+            .parent_session
+            .as_deref()
+            .and_then(|parent| pi_parent_cwd(parent, root));
         // The header's `cwd` is the resolved absolute path. Only when it is missing does
         // the directory name have to be decoded, and that is lossy: Pi replaces both
         // separators and `:` with `-`, so a path that contained a dash cannot be told
@@ -3069,6 +3124,7 @@ impl PiSessionState {
             ),
             source_file: path.to_path_buf(),
             cwd,
+            repository_hint_cwd,
             points: self.points,
             exact_intervals: Vec::new(),
             human_points,
@@ -3237,6 +3293,7 @@ pub fn parse_codex_file(
             session_id: split_id,
             source_file: path.to_path_buf(),
             cwd: resolved_cwd,
+            repository_hint_cwd: None,
             points,
             exact_intervals,
             human_points,
@@ -3693,6 +3750,48 @@ mod tests {
         })
     }
 
+    #[test]
+    fn pi_cache_context_tracks_the_parent_header() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("--tmp-project--");
+        fs::create_dir(&directory).unwrap();
+        let parent = pi_session(
+            &directory,
+            "parent.jsonl",
+            serde_json::json!({
+                "type": "session", "id": "parent", "cwd": "/tmp/one"
+            }),
+            &[],
+        );
+        let child = pi_session(
+            &directory,
+            "child.jsonl",
+            serde_json::json!({
+                "type": "session", "id": "child", "cwd": "/tmp/child",
+                "parentSession": parent
+            }),
+            &[],
+        );
+
+        let original = pi_context_fingerprint(&child, root.path());
+        fs::write(
+            &parent,
+            serde_json::json!({
+                "type": "session", "id": "parent", "cwd": "/tmp/different-parent"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let changed = pi_context_fingerprint(&child, root.path());
+        assert_ne!(original, changed);
+
+        fs::remove_file(parent).unwrap();
+        assert_eq!(
+            "pi-v2:no-parent",
+            pi_context_fingerprint(&child, root.path())
+        );
+    }
+
     /// Pi has one `user` role, and a person typing into it is only one of the things that
     /// arrive there. An extension's watchdog notice and a background-task notification are
     /// written while the machine works and nobody is at the keyboard, and a `toolCall` is
@@ -3802,6 +3901,48 @@ mod tests {
         assert_eq!(13, session.token_events[0].usage.cache_creation_tokens);
         assert_eq!(36, session.token_events[0].usage.total());
         assert_eq!("claude-opus-5", session.token_events[0].model);
+        // A transcript cannot make the reader open an arbitrary path outside
+        // the configured Pi history root.
+        assert!(session.repository_hint_cwd.is_none());
+    }
+
+    #[test]
+    fn pi_subagent_retains_its_parent_cwd_as_a_repository_hint() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("--tmp-project--");
+        fs::create_dir(&directory).unwrap();
+        let parent = pi_session(
+            &directory,
+            "2026-01-01T00-00-00-000Z_parent.jsonl",
+            serde_json::json!({
+                "type": "session", "version": 3, "id": "parent",
+                "timestamp": "2026-01-01T00:00:00.000Z", "cwd": "/repos/product"
+            }),
+            &[],
+        );
+        let child = pi_session(
+            &directory,
+            "2026-01-01T01-00-00-000Z_child.jsonl",
+            serde_json::json!({
+                "type": "session", "version": 3, "id": "child",
+                "timestamp": "2026-01-01T01:00:00.000Z", "cwd": "/tmp/pi-agent-deleted",
+                "parentSession": parent
+            }),
+            &[pi_message(
+                "a",
+                "2026-01-01T01:00:10.000Z",
+                serde_json::json!({"role": "assistant", "model": "test-model",
+                    "content": [{"type": "text", "text": "done"}]}),
+            )],
+        );
+
+        let parsed = parse_pi_file(&child, root.path(), MAX_JSONL_LINE_BYTES);
+
+        assert_eq!(
+            Some("/repos/product"),
+            parsed.sessions[0].repository_hint_cwd.as_deref()
+        );
+        assert_eq!("/tmp/pi-agent-deleted", parsed.sessions[0].cwd);
     }
 
     /// `/fork` and `/clone` also record a parent, but unlike a subagent they copy the
@@ -4800,6 +4941,7 @@ mod tests {
             session_id: "session".to_string(),
             source_file: PathBuf::from("events.jsonl"),
             cwd: "/tmp/repo".to_string(),
+            repository_hint_cwd: None,
             points: vec![ActivityPoint {
                 timestamp: parse_timestamp("2026-01-01T23:00:00Z").unwrap(),
                 model: "gpt-test".to_string(),

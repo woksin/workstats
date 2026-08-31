@@ -12,8 +12,8 @@ use super::diff::{DiffRequest, DiffView};
 use super::event::Action;
 use super::search::{Index, Target};
 use super::state::{
-    Column, Dataset, Entry, Field, Grain, Level, LevelKind, Mode, SavedView, SavedViews, Sort,
-    columns, default_sort, default_views_path, key_of,
+    columns, default_sort, default_views_path, key_of, path_from_file_key, Column, Dataset, Entry,
+    Field, Grain, Level, LevelKind, Mode, SavedView, SavedViews, Sort,
 };
 use super::{diff, search};
 use crate::model::{GitCommit, Report};
@@ -412,11 +412,15 @@ impl App {
     /// Reads one file's contents through `git show` for display. This is the
     /// only path in the whole tool that does so; the result is never cached,
     /// reported, or written to a saved view.
-    fn open_diff(&mut self, sha: &str) -> bool {
+    fn open_diff(&mut self, key: &str) -> bool {
+        let Some(commit) = self.data.commit(key) else {
+            self.status = Some(format!("commit {key} is not available"));
+            return false;
+        };
         let request = DiffRequest {
-            cwd: PathBuf::from(key_of(&self.stack, LevelKind::Repo)),
-            sha: sha.to_string(),
-            path: key_of(&self.stack, LevelKind::File).to_string(),
+            cwd: PathBuf::from(&commit.cwd),
+            sha: commit.sha.clone(),
+            path: path_from_file_key(key_of(&self.stack, LevelKind::File)).to_string(),
         };
         match diff::load(&request) {
             Ok(view) => {
@@ -693,11 +697,11 @@ fn search_targets(data: &Dataset, grain: Grain) -> Vec<Target> {
                 commit.repo_key.clone(),
                 period.clone(),
                 dominant.to_string(),
-                commit.sha.clone(),
+                commit.key.clone(),
             ],
         });
         for file in &commit.files {
-            if !seen.insert((commit.repo_key.as_str(), file.path.as_str())) {
+            if !seen.insert((commit.repo_key.as_str(), file.key.as_str())) {
                 continue;
             }
             targets.push(Target {
@@ -707,8 +711,8 @@ fn search_targets(data: &Dataset, grain: Grain) -> Vec<Target> {
                     commit.repo_key.clone(),
                     period.clone(),
                     data.category_name(file.category).to_string(),
-                    commit.sha.clone(),
-                    file.path.clone(),
+                    commit.key.clone(),
+                    file.key.clone(),
                 ],
             });
         }

@@ -14,6 +14,23 @@ tag are the generated list of pull requests.
 
 ### Fixed
 
+- Repository rows now represent logical projects rather than checkout folder
+  names. Linked Git worktrees are combined through their common Git directory,
+  and separately named clones of the same fetch remote are combined through a
+  locally normalized remote identity. Deleted delegated Pi worktrees are
+  recovered from the parent transcript's bounded session header, but only when
+  the child's own path no longer has a Git identity; no message content is
+  read. Orphaned worktree pointers also recover their common Git directory.
+  Live identities are retained in the transcript index so deleted foreground
+  worktrees remain attributable on later runs; ambiguous directory reuse is
+  left unresolved. Configurable `project_aliases` can combine distinct remotes
+  or every repository below a path into one named product, while
+  `--explain-repository-attribution` provides a path-free evidence ledger.
+  Sessions, tokens, human involvement, and unique commits therefore land in one
+  row; `--group-by cwd` remains available when checkout-level detail is wanted.
+  Commit and file deduplication remains scoped to each natural repository, so
+  distinct alias members that share a SHA or relative path stay distinct. No
+  remote is contacted.
 - `--review-credit` can no longer exceed `--human-idle`, which could make
   separately clustered human-time blocks overlap and count the overlap twice.
 - Unfiltered reports now scan the locally available Git checkout associated

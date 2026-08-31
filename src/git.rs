@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -11,7 +11,7 @@ use tempfile::tempfile;
 
 use crate::classify::{CategoryTally, classify};
 use crate::model::{Authorship, Diagnostics, GitCommit};
-use crate::paths::PathResolver;
+use crate::paths::{PathResolver, disambiguated_repository_label};
 
 pub const DEFAULT_IGNORES: &[&str] = &[
     "*/node_modules/*",
@@ -361,14 +361,18 @@ fn collect_commits(
         }
     };
     let mut commits = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
     for repo_path in discover_repositories(base, depth, diagnostics) {
-        let (cwd, repo, root) = resolver.describe(&repo_path.to_string_lossy());
+        let (cwd, repo, root, repo_id, repo_member_id) =
+            resolver.describe(&repo_path.to_string_lossy());
         // The same three fields the session filter in `main.rs` matches, so a
         // filter naming a source root selects commits as well as sessions.
         if repo_filter.is_some_and(|filter| {
             let filter = filter.to_lowercase();
             !repo.to_lowercase().contains(&filter)
+                && !disambiguated_repository_label(&repo, &repo_id)
+                    .to_lowercase()
+                    .contains(&filter)
                 && !cwd.to_lowercase().contains(&filter)
                 && !root.to_lowercase().contains(&filter)
         }) {
@@ -452,15 +456,19 @@ fn collect_commits(
             ));
             continue;
         };
+        let empty_seen = HashSet::new();
+        let member_seen = seen.get(&repo_member_id).unwrap_or(&empty_seen);
         let repo_commits = parse_git_log(
             BufReader::new(stdout),
             pass,
             &repo,
+            &repo_id,
+            &repo_member_id,
             &cwd,
             &root,
             includes.as_ref(),
             ignores.as_ref(),
-            &seen,
+            member_seen,
         );
         let status = child.wait();
         let _ = errors.seek(SeekFrom::Start(0));
@@ -469,7 +477,9 @@ fn collect_commits(
         match status {
             Ok(status) if status.success() => {
                 for commit in repo_commits {
-                    seen.insert(commit.sha.clone());
+                    seen.entry(commit.repo_member_id.clone())
+                        .or_default()
+                        .insert(commit.sha.clone());
                     commits.push(commit);
                 }
             }
@@ -536,6 +546,8 @@ fn parse_git_log(
     mut reader: impl BufRead,
     pass: &Pass<'_>,
     repo: &str,
+    repo_id: &str,
+    repo_member_id: &str,
     cwd: &str,
     root: &str,
     includes: Option<&GlobSet>,
@@ -559,6 +571,8 @@ fn parse_git_log(
                     sha: pending.sha,
                     timestamp,
                     repo: repo.to_string(),
+                    repo_id: repo_id.to_string(),
+                    repo_member_id: repo_member_id.to_string(),
                     cwd: cwd.to_string(),
                     root: root.to_string(),
                     additions: pending.additions,
@@ -1228,6 +1242,8 @@ mod tests {
             stream,
             &human_pass(),
             "repo",
+            "repo-id",
+            "repo-member-id",
             "cwd",
             "root",
             None,
@@ -1561,6 +1577,61 @@ mod tests {
     }
 
     #[test]
+    fn identical_shas_in_distinct_natural_repositories_are_both_retained() {
+        let base = tempdir().unwrap();
+        let first = repository(base.path(), "first");
+        let first_path = first.to_str().unwrap();
+        fs::write(first.join("README.md"), "shared\n").unwrap();
+        git(&["-C", first_path, "add", "."]);
+        git(&["-C", first_path, "commit", "-qm", "shared"]);
+        git(&[
+            "-C",
+            first_path,
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/acme/first.git",
+        ]);
+        let second = base.path().join("second");
+        git(&[
+            "clone",
+            "-q",
+            "--no-hardlinks",
+            first_path,
+            second.to_str().unwrap(),
+        ]);
+        git(&[
+            "-C",
+            second.to_str().unwrap(),
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/acme/second.git",
+        ]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+        );
+
+        assert_eq!(2, commits.len());
+        assert_eq!(commits[0].sha, commits[1].sha);
+        assert_ne!(commits[0].repo_member_id, commits[1].repo_member_id);
+    }
+
+    #[test]
     fn the_repository_filter_also_matches_the_source_root() {
         let base = tempdir().unwrap();
         let repo = repository(base.path(), "studio/widget");
@@ -1592,5 +1663,24 @@ mod tests {
         );
         assert_eq!(1, commits.len());
         assert_eq!("acme-portfolio", commits[0].root);
+
+        // A disambiguated label copied from report output must remain a valid
+        // filter even though collision handling happens after Git discovery.
+        let displayed = disambiguated_repository_label(&commits[0].repo, &commits[0].repo_id);
+        let commits = read_git_commits(
+            base.path(),
+            "Test Author",
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            Some(&displayed),
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(1, commits.len());
     }
 }

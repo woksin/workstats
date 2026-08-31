@@ -4,14 +4,15 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::ai::{ParsedFile, file_time_range};
+use crate::ai::{file_time_range, ParsedFile};
+use crate::paths::RepositoryHistoryEntry;
 
 /// Bumped whenever a parser changes what it stores or how a range is derived, so that
-/// entries written by an older build are recomputed instead of answered from. Version 3
-/// deduplicates Claude token events and folds token timestamps into the cached range.
-const PARSER_VERSION: i64 = 3;
+/// entries written by an older build are recomputed instead of answered from. Version 4
+/// retains Pi parent-CWD repository hints for deleted temporary worktrees.
+const PARSER_VERSION: i64 = 4;
 
 type CacheRow = (
     i64,
@@ -67,7 +68,16 @@ impl TranscriptCache {
                 PRIMARY KEY(path, provider)
             );
             CREATE INDEX IF NOT EXISTS transcript_cache_range
-                ON transcript_cache(provider, min_micros, max_micros);",
+                ON transcript_cache(provider, min_micros, max_micros);
+            CREATE TABLE IF NOT EXISTS repository_identity_history (
+                cwd_key TEXT NOT NULL,
+                natural_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                repo_path TEXT NOT NULL,
+                PRIMARY KEY(cwd_key, natural_id)
+            );
+            CREATE INDEX IF NOT EXISTS repository_identity_history_cwd
+                ON repository_identity_history(cwd_key);",
         )?;
         let has_role_payload = {
             let mut statement = connection.prepare("PRAGMA table_info(transcript_cache)")?;
@@ -93,6 +103,55 @@ impl TranscriptCache {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn load_repository_history(&self) -> Result<Vec<RepositoryHistoryEntry>> {
+        let mut statement = self.connection.prepare(
+            "SELECT cwd_key, natural_id, label, repo_path
+               FROM repository_identity_history
+              ORDER BY cwd_key, natural_id",
+        )?;
+        let entries = statement
+            .query_map([], |row| {
+                Ok(RepositoryHistoryEntry {
+                    cwd_key: row.get(0)?,
+                    natural_id: row.get(1)?,
+                    label: row.get(2)?,
+                    repo_path: PathBuf::from(row.get::<_, String>(3)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(entries)
+    }
+
+    pub fn remember_repository_identities(
+        &mut self,
+        entries: &[RepositoryHistoryEntry],
+    ) -> Result<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self.connection.transaction()?;
+        let mut written = 0;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO repository_identity_history(cwd_key, natural_id, label, repo_path)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(cwd_key, natural_id) DO UPDATE SET
+                    label = excluded.label,
+                    repo_path = excluded.repo_path",
+            )?;
+            for entry in entries {
+                written += statement.execute(params![
+                    entry.cwd_key,
+                    entry.natural_id,
+                    entry.label,
+                    entry.repo_path.to_string_lossy(),
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(written)
     }
 
     pub fn lookup(
@@ -266,6 +325,7 @@ mod tests {
                 session_id: "session".into(),
                 source_file: source.to_path_buf(),
                 cwd: "/tmp/repo".into(),
+                repository_hint_cwd: Some("/tmp/parent".into()),
                 points: vec![ActivityPoint {
                     timestamp: parse_timestamp("2026-01-01T00:00:00Z").unwrap(),
                     model: "gpt".into(),
@@ -322,6 +382,10 @@ mod tests {
         assert_eq!(1, pruned.sessions.len());
         assert!(pruned.sessions[0].points.is_empty());
         assert!(pruned.sessions[0].is_subagent);
+        assert_eq!(
+            Some("/tmp/parent"),
+            pruned.sessions[0].repository_hint_cwd.as_deref()
+        );
 
         fs::write(&source, "{}\n{}\n").unwrap();
         let changed_stamp = file_stamp(&source).unwrap();
@@ -367,6 +431,38 @@ mod tests {
             panic!("expected a cache hit covering the token event");
         };
         assert_eq!(1, hit.sessions[0].token_events.len());
+    }
+
+    #[test]
+    fn repository_identity_history_survives_reopen_and_transcript_rebuild() {
+        let directory = tempdir().unwrap();
+        let cache_path = directory.path().join("index.sqlite3");
+        let cwd = directory.path().join("deleted-worktree");
+        let mut cache = TranscriptCache::open(&cache_path, false).unwrap();
+        cache
+            .remember_repository_identities(&[
+                RepositoryHistoryEntry {
+                    cwd_key: cwd.to_string_lossy().into_owned(),
+                    natural_id: "remote:host/one".into(),
+                    label: "one".into(),
+                    repo_path: directory.path().join("one"),
+                },
+                RepositoryHistoryEntry {
+                    cwd_key: cwd.to_string_lossy().into_owned(),
+                    natural_id: "remote:host/two".into(),
+                    label: "two".into(),
+                    repo_path: directory.path().join("two"),
+                },
+            ])
+            .unwrap();
+        drop(cache);
+
+        let cache = TranscriptCache::open(&cache_path, true).unwrap();
+        let history = cache.load_repository_history().unwrap();
+
+        assert_eq!(2, history.len());
+        assert_eq!("remote:host/one", history[0].natural_id);
+        assert_eq!("remote:host/two", history[1].natural_id);
     }
 
     #[test]
