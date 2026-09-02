@@ -91,10 +91,9 @@ struct AllocateArguments {
     #[arg(
         long = "project",
         short = 'p',
-        required = true,
         value_name = "NAME",
         action = clap::ArgAction::Append,
-        help = "Repository the spend is being apportioned to; repeatable"
+        help = "Repository the spend is being apportioned to; omit to break the whole spend down by project"
     )]
     projects: Vec<String>,
     #[arg(
@@ -716,11 +715,13 @@ fn run_allocation(command: AllocateArguments) -> Result<()> {
     }
     report.group_by = Some("repo,provider,model,month".to_string());
 
+    let top = report.top;
     run(
         report,
         Presentation::Print,
         Some(allocate::AllocationOptions {
             projects,
+            top,
             subscriptions: plans,
             vat_percent: vat,
             currency,

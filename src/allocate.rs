@@ -112,7 +112,11 @@ impl Plan {
 
 #[derive(Clone, Debug)]
 pub struct AllocationOptions {
+    /// Empty means no claim is being made: report how the whole spend divides
+    /// across every project instead of what one of them is owed.
     pub projects: Vec<String>,
+    /// Rows to show in that breakdown; 0 means all.
+    pub top: usize,
     pub subscriptions: BTreeMap<String, Plan>,
     /// Consumption tax added at checkout, as a percentage. Vendors advertise
     /// ex-tax prices, so what left the account is usually more than `price`.
@@ -206,6 +210,18 @@ pub struct ModelRow {
     pub priced: bool,
 }
 
+/// One project's slice of the whole spend, for the no-claim breakdown.
+#[derive(Debug, Serialize)]
+pub struct ProjectRow {
+    pub project: String,
+    /// Amount drawn from each pool, keyed by pool name.
+    pub amounts: BTreeMap<String, f64>,
+    pub total: f64,
+    pub share_of_billed: f64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CrossCheckRow {
     pub basis: Basis,
@@ -232,7 +248,13 @@ pub struct Allocation {
     /// `attributable / documented` — the share of *documented* spend, which is
     /// not the same as the share of everything billed when gaps were skipped.
     pub effective_share: f64,
+    #[serde(skip)]
+    pub top: usize,
     pub periods: Vec<PeriodRow>,
+    /// Every project's slice of the spend. Present only when no project was
+    /// named, because that is the question being asked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub breakdown: Vec<ProjectRow>,
     pub models: Vec<ModelRow>,
     pub cross_check: Vec<CrossCheckRow>,
     pub rates_as_of: &'static str,
@@ -276,6 +298,8 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
     let mut unclassified: BTreeMap<String, u64> = BTreeMap::new();
     let mut unpriced: BTreeMap<String, u64> = BTreeMap::new();
     let mut seen_repos: BTreeSet<String> = BTreeSet::new();
+    let mut by_repo: BTreeMap<String, BTreeMap<String, Measures>> = BTreeMap::new();
+    let mut repo_tokens: BTreeMap<String, (u64, u64)> = BTreeMap::new();
 
     for row in rows {
         let model = row.key.get("model").map(String::as_str).unwrap_or("");
@@ -316,6 +340,21 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
         }
         let is_project = wanted.contains(&repo);
         let measures = row_value(row, model);
+
+        let label = row
+            .key
+            .get("repo")
+            .cloned()
+            .unwrap_or_else(|| "(unattributed)".to_string());
+        by_repo
+            .entry(label.clone())
+            .or_default()
+            .entry(pool.clone())
+            .or_default()
+            .add(&measures);
+        let counted = repo_tokens.entry(label).or_default();
+        counted.0 += row.output_tokens;
+        counted.1 += row.total_tokens;
 
         cells
             .entry((month, pool.clone()))
@@ -420,6 +459,60 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
                 .to_string(),
         );
     }
+    // Without a named project there is no claim to make, so the question
+    // becomes how the whole spend divides. Same pool shares, applied to every
+    // repository, which makes the rows sum to what was billed.
+    let mut breakdown = Vec::new();
+    if options.projects.is_empty() {
+        let mut pool_totals: BTreeMap<&str, f64> = BTreeMap::new();
+        let mut pool_spend: BTreeMap<&str, f64> = BTreeMap::new();
+        for (pool, plan) in &options.subscriptions {
+            let total: f64 = by_repo
+                .values()
+                .filter_map(|pools| pools.get(pool))
+                .map(|measures| measures.get(options.basis))
+                .sum();
+            pool_totals.insert(pool.as_str(), total);
+            pool_spend.insert(
+                pool.as_str(),
+                plan.spend(options.vat_percent) * months.len() as f64,
+            );
+        }
+        for (project, pools) in &by_repo {
+            let mut amounts = BTreeMap::new();
+            let mut total = 0.0;
+            for (pool, plan_total) in &pool_totals {
+                let measure = pools
+                    .get(*pool)
+                    .map(|measures| measures.get(options.basis))
+                    .unwrap_or(0.0);
+                let amount = if *plan_total > 0.0 {
+                    measure / plan_total * pool_spend[pool]
+                } else {
+                    0.0
+                };
+                amounts.insert((*pool).to_string(), amount);
+                total += amount;
+            }
+            let (output_tokens, total_tokens) =
+                repo_tokens.get(project).copied().unwrap_or_default();
+            breakdown.push(ProjectRow {
+                project: project.clone(),
+                amounts,
+                total,
+                share_of_billed: if billed > 0.0 { total / billed } else { 0.0 },
+                output_tokens,
+                total_tokens,
+            });
+        }
+        breakdown.sort_by(|left, right| {
+            right
+                .total
+                .partial_cmp(&left.total)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     if !unpriced.is_empty() {
         warnings.push(format!(
             "no published rate for {} — counted in token and wall-clock bases, excluded from list-price value",
@@ -449,7 +542,9 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
         } else {
             0.0
         },
+        top: options.top,
         periods,
+        breakdown,
         models: model_rows,
         cross_check,
         rates_as_of: RATES_AS_OF,
@@ -664,7 +759,14 @@ pub fn print_table(allocation: &Allocation) {
         .map(|plan| plan.count)
         .sum();
     println!();
-    println!("  ALLOCATION  {}", allocation.projects.join(", "));
+    println!(
+        "  ALLOCATION  {}",
+        if allocation.projects.is_empty() {
+            "every project".to_string()
+        } else {
+            allocation.projects.join(", ")
+        }
+    );
     let tax = if allocation.vat_percent > 0.0 {
         format!(" incl. {}% tax", trim_percent(allocation.vat_percent))
     } else {
@@ -679,6 +781,10 @@ pub fn print_table(allocation: &Allocation) {
     );
     println!();
 
+    if !allocation.breakdown.is_empty() {
+        print_breakdown(allocation);
+        return;
+    }
     println!(
         "  {:<9} {:<8} {:>4} {:>10} {:>12} {:>12} {:>8} {:>11}",
         "month", "family", "subs", "plan/mo", "project", "pool", "share", "owed"
@@ -790,6 +896,80 @@ pub fn print_table(allocation: &Allocation) {
     println!();
 }
 
+/// The no-claim view: how the whole spend divides across every project.
+fn print_breakdown(allocation: &Allocation) {
+    let pools: Vec<&String> = allocation.subscriptions.keys().collect();
+    let mut header = format!("  {:<30}", "project");
+    for pool in &pools {
+        header.push_str(&format!(" {:>12}", pool));
+    }
+    header.push_str(&format!(
+        " {:>12} {:>7} {:>10} {:>9}",
+        "TOTAL", "%", "out", "tokens"
+    ));
+    let width = header.chars().count();
+    println!("  PROJECTS");
+    println!("{header}");
+    println!("  {}", "─".repeat(width.saturating_sub(2)));
+
+    let shown = if allocation.top == 0 {
+        allocation.breakdown.len()
+    } else {
+        allocation.top.min(allocation.breakdown.len())
+    };
+    for project in &allocation.breakdown[..shown] {
+        let mut line = format!("  {:<30}", truncate(&project.project, 30));
+        for pool in &pools {
+            let amount = project.amounts.get(*pool).copied().unwrap_or(0.0);
+            line.push_str(&format!(" {:>12}", money(amount, &allocation.currency)));
+        }
+        line.push_str(&format!(
+            " {:>12} {:>6.1}% {:>9} {:>8}",
+            money(project.total, &allocation.currency),
+            project.share_of_billed * 100.0,
+            tokens_short(project.output_tokens),
+            tokens_short(project.total_tokens),
+        ));
+        println!("{line}");
+    }
+    if shown < allocation.breakdown.len() {
+        let rest = &allocation.breakdown[shown..];
+        let total: f64 = rest.iter().map(|project| project.total).sum();
+        println!(
+            "  {:<30}{:>width$} {:>6.1}%",
+            format!("({} smaller projects)", rest.len()),
+            money(total, &allocation.currency),
+            total / allocation.billed * 100.0,
+            width = 13 * pools.len() + 13,
+        );
+    }
+    println!("  {}", "─".repeat(width.saturating_sub(2)));
+    let mut totals = format!("  {:<30}", "TOTAL");
+    for pool in &pools {
+        let sum: f64 = allocation
+            .breakdown
+            .iter()
+            .map(|project| project.amounts.get(*pool).copied().unwrap_or(0.0))
+            .sum();
+        totals.push_str(&format!(" {:>12}", money(sum, &allocation.currency)));
+    }
+    totals.push_str(&format!(
+        " {:>12} {:>6.1}%",
+        money(allocation.billed, &allocation.currency),
+        100.0
+    ));
+    println!("{totals}");
+
+    if !allocation.warnings.is_empty() {
+        println!();
+        println!("  WARNINGS");
+        for warning in &allocation.warnings {
+            println!("   ! {warning}");
+        }
+    }
+    println!();
+}
+
 pub fn print_json(allocation: &Allocation) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(allocation)?);
     Ok(())
@@ -858,6 +1038,7 @@ mod tests {
     fn options(basis: Basis, gap: GapPolicy) -> AllocationOptions {
         AllocationOptions {
             projects: vec!["Ada".to_string()],
+            top: 0,
             subscriptions: BTreeMap::from([
                 (
                     "claude".to_string(),
@@ -1241,6 +1422,64 @@ mod tests {
             .find(|period| period.family == "claude")
             .expect("claude row");
         assert!((claude.plan_price - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn without_a_named_project_every_project_is_reported_and_the_rows_total_the_bill() {
+        // No project named means no claim is being made, so the question is
+        // how the whole spend divides. The rows must reconcile exactly to what
+        // was billed, or the table is not a breakdown of anything.
+        let mut options = options(Basis::Output, GapPolicy::Skip);
+        options.projects = Vec::new();
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Chronicle", "claude-opus-5", "2026-08", 40, 40),
+                row("Ada", "gpt-5.6-sol", "2026-08", 25, 25),
+                row("Varde", "gpt-5.6-sol", "2026-08", 75, 75),
+            ],
+            &options,
+        );
+
+        assert_eq!(3, allocation.breakdown.len());
+        let total: f64 = allocation.breakdown.iter().map(|row| row.total).sum();
+        assert!(
+            (total - allocation.billed).abs() < 1e-6,
+            "breakdown {total} must reconcile to billed {}",
+            allocation.billed
+        );
+        // Ranked by money, not by tokens: Varde holds 75% of the four-plan
+        // OpenAI pool (600) and outranks Ada's 440 across both pools, even
+        // though Ada produced more output overall.
+        assert_eq!("Varde", allocation.breakdown[0].project);
+        let ada = allocation
+            .breakdown
+            .iter()
+            .find(|row| row.project == "Ada")
+            .expect("Ada row");
+        assert!((ada.total - (0.6 * 400.0 + 0.25 * 800.0)).abs() < 1e-6);
+        // A project absent from a pool contributes nothing to it rather than
+        // silently borrowing another project's share.
+        let varde = allocation
+            .breakdown
+            .iter()
+            .find(|row| row.project == "Varde")
+            .expect("Varde row");
+        assert_eq!(0.0, varde.amounts["claude"]);
+        assert!((varde.amounts["openai"] - 0.75 * 800.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn naming_a_project_reports_a_claim_rather_than_a_breakdown() {
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Chronicle", "claude-opus-5", "2026-08", 40, 40),
+            ],
+            &options(Basis::Output, GapPolicy::Skip),
+        );
+        assert!(allocation.breakdown.is_empty());
+        assert!(allocation.attributable > 0.0);
     }
 
     #[test]

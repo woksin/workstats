@@ -850,6 +850,34 @@ Under the summary, every model that ran is listed with its project and pool
 tokens and its list-price value, because a share nobody can audit is just an
 assertion.
 
+### Leave the project out to see where everything went
+
+`-p` names the project a claim is being made for. Omit it and no claim is being
+made, so the question becomes how the whole spend divided:
+
+```console
+$ workstats allocate --sub claude=2@1866 --sub codex=3@1992 \
+    --currency NOK --vat 25 --month 2026-08 --top 6
+
+  ALLOCATION  every project
+  2026-08 · 5 subscriptions · 12,135 kr billed incl. 25% tax · basis: output tokens
+
+  PROJECTS
+  project                              claude       openai        TOTAL       %        out    tokens
+  ──────────────────────────────────────────────────────────────────────────────────────────────────
+  Ada                                2,072 kr     3,048 kr     5,121 kr   42.2%    111.3M   38.28B
+  Chronicle.Wolverine [f81e3bee]       102 kr     1,020 kr     1,121 kr    9.2%     18.5M    7.56B
+  AI                                   295 kr       433 kr       728 kr    6.0%     15.8M    7.41B
+  cratis                               385 kr       261 kr       646 kr    5.3%     16.1M    5.89B
+  Screenplay                            83 kr       532 kr       616 kr    5.1%     10.6M    5.07B
+  Strategy                              90 kr       491 kr       581 kr    4.8%     10.2M    5.55B
+  (59 smaller projects)                                        3,322 kr   27.4%
+```
+
+One column per plan you hold, so a project that leans on one vendor is obvious.
+The rows reconcile exactly to what was billed. `--top` bounds the list and the
+remainder is stated rather than dropped; `--top 0` shows every project.
+
 ### Pick the measure, then check it against the others
 
 `--basis` chooses what the split is computed from: `output` tokens (default),

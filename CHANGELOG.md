@@ -14,6 +14,12 @@ tag are the generated list of pull requests.
 
 ### Added
 
+- `workstats allocate` no longer requires `--project`. Naming one asks what it
+  is owed; omitting it asks where the whole spend went, and answers with every
+  project ranked by amount, one column per plan held. The rows reconcile
+  exactly to what was billed, and `--top` bounds the list with the remainder
+  stated rather than dropped.
+
 - `workstats allocate` gained currency and tax handling. `--vat` adds the
   consumption tax checkout adds, because the advertised price and the amount
   that left the account differ wherever one applies, and the difference is real
