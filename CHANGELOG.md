@@ -12,6 +12,34 @@ tag are the generated list of pull requests.
 
 ## [Unreleased]
 
+### Added
+
+- `workstats allocate` apportions flat-rate subscription spend to one project.
+  Given the plans you hold (`--sub claude=2 --sub codex=4`) it reports what
+  share of that spend a project accounts for, split per vendor and per month,
+  with a per-model breakdown behind every share. Works with the existing
+  `--month`, `--since` and `--until` window flags, and prints table, JSON or
+  CSV.
+
+  The split runs on measured quantities. `--basis` chooses between output
+  tokens (the default), list-price value, agent wall clock, total tokens, and
+  estimated human time; every run prints all five side by side so a share that
+  depends on the metric is visible rather than asserted. Human time is marked
+  as estimated, and is not the default: it is built from prompt counts and
+  session edges, so orchestration-heavy work books more apparent attention per
+  real hour than a single long session does.
+
+  Models are weighed by published list rate, so a million Opus tokens and a
+  million Haiku tokens are not treated as equal claims on a plan. List value is
+  reported as a ceiling and as the weighting, never as an amount owed.
+
+  Two things it refuses to do quietly. A month whose transcripts have been
+  pruned is not a month of no work, so it is named and `--gap-policy` decides
+  explicitly whether to exclude it, claim nothing for it, or impute that
+  vendor's mean share. And a client that bills on its own seat — Copilot —
+  forms its own pool instead of diluting the vendor pool it was never billed
+  to.
+
 ### Fixed
 
 - Repository rows now represent logical projects rather than checkout folder

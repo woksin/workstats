@@ -1174,3 +1174,155 @@ fn agent_authored_commits_are_reported_as_output_and_never_as_human_time() {
     assert_eq!(0, narrowed["summary"]["agent_commit_count"]);
     assert_eq!(2, narrowed["summary"]["commit_count"]);
 }
+
+/// Writes one pi session under `history` that ran `model` in `cwd` and produced
+/// `output` output tokens, so an allocation fixture can be described in the
+/// terms allocation actually splits on.
+fn pi_session(history: &Path, name: &str, cwd: &Path, model: &str, output: u64) {
+    let directory = history.join(format!("--{name}--"));
+    fs::create_dir_all(&directory).unwrap();
+    let usage = serde_json::json!({
+        "input": 1, "output": output, "cacheRead": 0, "cacheWrite": 0,
+        "totalTokens": output + 1,
+        "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+    });
+    let lines = [
+        serde_json::json!({"type": "session", "version": 3, "id": name,
+            "timestamp": "2026-03-02T00:00:00.000Z", "cwd": cwd}),
+        serde_json::json!({"type": "message", "id": "a", "parentId": null,
+            "timestamp": "2026-03-02T00:00:10.000Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "go"}]}}),
+        serde_json::json!({"type": "message", "id": "b", "parentId": "a",
+            "timestamp": "2026-03-02T00:01:10.000Z",
+            "message": {"role": "assistant", "model": model, "provider": "anthropic",
+                "stopReason": "stop", "usage": usage,
+                "content": [{"type": "text", "text": "done"}]}}),
+    ];
+    fs::write(
+        directory.join(format!("2026-03-02T00-00-00-000Z_{name}.jsonl")),
+        lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+}
+
+/// The whole point of `allocate`: a project's claim on a plan is its share of
+/// *that vendor's* pool, weighted by how many plans the vendor holds — not its
+/// share of all tokens everywhere.
+#[test]
+fn allocate_splits_each_vendor_pool_and_weighs_it_by_plans_held() {
+    let directory = tempdir().unwrap();
+    let ada = directory.path().join("ada");
+    let other = directory.path().join("other");
+    fs::create_dir_all(&ada).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    let history = directory.path().join("pi-sessions");
+
+    // Ada is 60% of the Claude pool but only 25% of the OpenAI pool.
+    pi_session(&history, "a1", &ada, "claude-opus-5", 60);
+    pi_session(&history, "a2", &other, "claude-opus-5", 40);
+    pi_session(&history, "a3", &ada, "gpt-5.6-sol", 25);
+    pi_session(&history, "a4", &other, "gpt-5.6-sol", 75);
+
+    let allocation: Value = serde_json::from_slice(
+        &run(&[
+            "allocate",
+            "-p",
+            "ada",
+            "--sub",
+            "claude=2",
+            "--sub",
+            "codex=4",
+            "--price",
+            "200",
+            "--month",
+            "2026-03",
+            "--no-git",
+            "--provider",
+            "pi",
+            "--history",
+            &format!("pi={}", history.display()),
+            "--format",
+            "json",
+        ])
+        .stdout,
+    )
+    .unwrap();
+
+    let period = |family: &str| -> Value {
+        allocation["periods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["family"] == family)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(0.6, period("claude")["share"]);
+    assert_eq!(240.0, period("claude")["amount"]);
+    assert_eq!(0.25, period("openai")["share"]);
+    assert_eq!(200.0, period("openai")["amount"]);
+    assert_eq!(440.0, allocation["attributable"]);
+    assert_eq!(1200.0, allocation["billed"]);
+
+    // Pooling every token together would read 42.5%; plans held make it 36.7%.
+    let effective = allocation["effective_share"].as_f64().unwrap();
+    assert!((effective - 440.0 / 1200.0).abs() < 1e-9, "got {effective}");
+
+    // The per-model evidence is what makes the share auditable.
+    let models = allocation["models"].as_array().unwrap();
+    assert!(
+        models.iter().any(|model| model["model"] == "claude-opus-5"),
+        "expected a per-model breakdown, got {models:?}"
+    );
+}
+
+/// A month whose history has been pruned is not a month of no work, and
+/// reporting it as a zero silently bills the user for their client's usage.
+#[test]
+fn allocate_refuses_to_read_pruned_history_as_an_absence_of_work() {
+    let directory = tempdir().unwrap();
+    let ada = directory.path().join("ada");
+    fs::create_dir_all(&ada).unwrap();
+    let history = directory.path().join("pi-sessions");
+    // Claude only: the OpenAI plans have no surviving history this month.
+    pi_session(&history, "a1", &ada, "claude-opus-5", 60);
+
+    let allocation: Value = serde_json::from_slice(
+        &run(&[
+            "allocate",
+            "-p",
+            "ada",
+            "--sub",
+            "claude=2",
+            "--sub",
+            "codex=4",
+            "--month",
+            "2026-03",
+            "--no-git",
+            "--provider",
+            "pi",
+            "--history",
+            &format!("pi={}", history.display()),
+            "--format",
+            "json",
+        ])
+        .stdout,
+    )
+    .unwrap();
+
+    assert_eq!(1200.0, allocation["billed"]);
+    // The $800 of OpenAI plans leaves the denominator rather than diluting it.
+    assert_eq!(400.0, allocation["documented"]);
+    assert_eq!(1.0, allocation["effective_share"]);
+    let warnings = allocation["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("no openai history")),
+        "the gap must be named, got {warnings:?}"
+    );
+}
