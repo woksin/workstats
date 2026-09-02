@@ -1,11 +1,13 @@
 mod aggregate;
 mod ai;
+mod allocate;
 mod cache;
 mod classify;
 mod git;
 mod model;
 mod output;
 mod paths;
+mod pricing;
 mod progress;
 mod sources;
 mod timeutil;
@@ -79,6 +81,52 @@ enum Command {
     Record(Box<RecordArguments>),
     /// Check for and install a newer workstats release from GitHub
     Update(UpdateArguments),
+    /// Apportion flat-rate subscription spend to one project, as in
+    /// `workstats allocate -p Ada --sub claude=2 --sub codex=4 --month 2026-08`
+    Allocate(Box<AllocateArguments>),
+}
+
+#[derive(Debug, Args)]
+struct AllocateArguments {
+    #[arg(
+        long = "project",
+        short = 'p',
+        required = true,
+        value_name = "NAME",
+        action = clap::ArgAction::Append,
+        help = "Repository the spend is being apportioned to; repeatable"
+    )]
+    projects: Vec<String>,
+    #[arg(
+        long = "sub",
+        required = true,
+        value_name = "FAMILY=N",
+        action = clap::ArgAction::Append,
+        help = "Subscriptions held, as claude=2 or codex=4; repeatable"
+    )]
+    subscriptions: Vec<String>,
+    #[arg(
+        long,
+        default_value_t = 200.0,
+        help = "Price per subscription per month"
+    )]
+    price: f64,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = allocate::Basis::Output,
+        help = "Measured quantity the split is computed from"
+    )]
+    basis: allocate::Basis,
+    #[arg(
+        long = "gap-policy",
+        value_enum,
+        default_value_t = allocate::GapPolicy::Skip,
+        help = "How to treat a month whose history has been pruned"
+    )]
+    gap_policy: allocate::GapPolicy,
+    #[command(flatten)]
+    report: ReportArguments,
 }
 
 #[derive(Debug, Args)]
@@ -404,7 +452,7 @@ enum Presentation {
 fn main() {
     let Arguments { command, report } = Arguments::parse();
     let result = match command {
-        Some(Command::Ui(command)) => run(*command, Presentation::Explore),
+        Some(Command::Ui(command)) => run(*command, Presentation::Explore, None),
         Some(Command::Sources(command)) => print_sources(&command),
         // `--config` reads naturally on either side of the subcommand, and a
         // flag that is silently ignored on one side is the same trap as the
@@ -412,7 +460,8 @@ fn main() {
         Some(Command::Classify(command)) => classify_paths(&command, report.config.as_deref()),
         Some(Command::Record(command)) => record_event(&command),
         Some(Command::Update(command)) => run_update_command(&command),
-        None => run(report, Presentation::Print),
+        Some(Command::Allocate(command)) => run_allocation(*command),
+        None => run(report, Presentation::Print, None),
     };
     if let Err(error) = result {
         eprintln!("workstats: {error:#}");
@@ -546,7 +595,91 @@ fn grouping_dimensions(arguments: &ReportArguments) -> Result<Vec<String>> {
     Ok(dimensions)
 }
 
-fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
+/// Parses the allocation flags, pins the grouping the apportionment needs, and
+/// hands off to the normal report pipeline. `allocate` is a different view of
+/// the same measurements, not a different measurement.
+fn run_allocation(command: AllocateArguments) -> Result<()> {
+    let AllocateArguments {
+        projects,
+        subscriptions,
+        price,
+        basis,
+        gap_policy,
+        mut report,
+    } = command;
+
+    if !price.is_finite() || price <= 0.0 {
+        bail!("--price must be a positive amount");
+    }
+    let mut plans: BTreeMap<String, u32> = BTreeMap::new();
+    for entry in &subscriptions {
+        let (name, count) = entry
+            .split_once('=')
+            .with_context(|| format!("--sub expects PLAN=N, got `{entry}`"))?;
+        // A vendor family, or a client that bills on its own seat. Anything
+        // else is a typo, and accepting it would silently declare an empty
+        // pool that claims nothing.
+        let pool = pricing::Family::parse(name)
+            .map(|family| family.as_str().to_string())
+            .or_else(|| {
+                let name = name.trim().to_ascii_lowercase();
+                pricing::SEPARATE_PLANS
+                    .iter()
+                    .find(|plan| **plan == name)
+                    .map(|plan| (*plan).to_string())
+            })
+            .with_context(|| {
+                format!(
+                    "unknown subscription `{name}`; expected one of {}",
+                    pricing::Family::ALL
+                        .iter()
+                        .map(|family| family.as_str())
+                        .chain(pricing::SEPARATE_PLANS.iter().copied())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        let count: u32 = count
+            .trim()
+            .parse()
+            .with_context(|| format!("--sub count must be a whole number, got `{count}`"))?;
+        if count == 0 {
+            bail!("--sub {name}=0 declares no subscriptions; omit it instead");
+        }
+        // Repeating a plan is ambiguous — two or six? — and silently picking
+        // one is how a claim becomes wrong without anyone noticing.
+        if plans.insert(pool.clone(), count).is_some() {
+            bail!("--sub {pool} was given more than once; state the total in one flag");
+        }
+    }
+
+    // Allocation apportions per vendor per month, so those dimensions are not
+    // the caller's to choose; --month/--since/--until still pick the window.
+    if report.group_by.is_some() {
+        bail!(
+            "`allocate` sets its own grouping (repo, provider, model, month); drop --group-by and use --month, --since, or --until to pick the window"
+        );
+    }
+    report.group_by = Some("repo,provider,model,month".to_string());
+
+    run(
+        report,
+        Presentation::Print,
+        Some(allocate::AllocationOptions {
+            projects,
+            subscriptions: plans,
+            price,
+            basis,
+            gap_policy,
+        }),
+    )
+}
+
+fn run(
+    arguments: ReportArguments,
+    presentation: Presentation,
+    allocation: Option<allocate::AllocationOptions>,
+) -> Result<()> {
     // Refused before any scanning: `workstats ui --format json` can only mean
     // the user wanted one of the two, and picking silently is how --by-repo
     // used to lose an explicit --group-by.
@@ -1008,6 +1141,17 @@ fn run(arguments: ReportArguments, presentation: Presentation) -> Result<()> {
         // report the default command would have printed, and `commits` carries
         // the per-commit detail the report itself aggregates away.
         return tui::run(&report, commits);
+    }
+    if let Some(options) = allocation {
+        // A different presentation of the report that was just built, so the
+        // numbers behind a claim are the numbers `workstats` would print.
+        let allocation = allocate::build(&report.rows, &options);
+        match arguments.output_format {
+            OutputFormat::Json => allocate::print_json(&allocation)?,
+            OutputFormat::Csv => allocate::print_csv(&allocation)?,
+            OutputFormat::Table => allocate::print_table(&allocation),
+        }
+        return Ok(());
     }
     match arguments.output_format {
         OutputFormat::Json => print_json(&report)?,

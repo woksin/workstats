@@ -822,6 +822,99 @@ Gemini CLI and OpenCode token counts are best-effort and may read as zero if
 the locally installed version doesn't expose per-turn usage fields; this never
 affects the time-based metrics.
 
+## Splitting the bill
+
+You pay for the plans; the work is spread across projects. `allocate` answers
+what share of that spend one project accounts for.
+
+```console
+$ workstats allocate -p Ada --sub claude=2 --sub codex=4 --month 2026-08
+
+  ALLOCATION  Ada
+  2026-08 · 6 subscriptions @ $200/mo · $1,200 billed · basis: output tokens
+
+  month     family   subs      project         pool    share       owed
+  ────────────────────────────────────────────────────────────────────
+  2026-08   claude      2        65.5M       147.5M    44.4%       $178
+  2026-08   openai      4        45.8M       112.1M    40.8%       $326
+  ────────────────────────────────────────────────────────────────────
+  ATTRIBUTABLE                                        42.0%       $504
+```
+
+Each vendor's pool is split on its own, then weighted by how many plans you
+hold there — Ada took 44% of the Claude pool and 41% of the OpenAI one, and
+those are worth different amounts because the plan counts differ. Pooling every
+token together would have said 42.9%.
+
+Under the summary, every model that ran is listed with its project and pool
+tokens and its list-price value, because a share nobody can audit is just an
+assertion.
+
+### Pick the measure, then check it against the others
+
+`--basis` chooses what the split is computed from: `output` tokens (default),
+`value` at list rates, `wall` clock, `tokens` in total, or `human` time. Every
+run prints all five:
+
+```
+  CROSS-CHECK  same window, every basis
+   ~ human time (est)       51.6%   $      620
+     agent wall clock       43.4%   $      520
+     output tokens          42.0%   $      504  ←
+     list-price value       38.8%   $      466
+     total tokens           36.5%   $      438
+     ~ estimated, not provider-recorded
+```
+
+A number you are going to hand someone else should not depend on a metric you
+picked quietly. Where these agree, the share is solid; where they diverge, the
+divergence is the finding.
+
+Output tokens are the default because they are recorded by the provider and are
+not swamped by cache reads, which track context length and turn count rather
+than work. Human time is *not* the default and is marked estimated: it is
+inferred from prompt counts and session edges, so a run that fans out subagents
+books more apparent attention per real hour than one long session does.
+
+Models are weighed by published list rate, so a million Opus tokens and a
+million Haiku tokens are not equal claims on a plan. List value is a ceiling
+and a weighting — it is what the usage would have cost per-token, which is
+precisely what a subscription holder does not pay.
+
+### Missing history is not zero usage
+
+Retention prunes old transcripts. A month that has been pruned looks exactly
+like a month of no work, and reporting it as 0% quietly moves that spend onto
+you:
+
+```
+  2026-07   openai      4            0            0     0.0%         $0  ← excluded
+  ────────────────────────────────────────────────────────────────────
+  ATTRIBUTABLE                                        42.8%       $685
+  of $1,600 documented — $800 of $2,400 billed has no surviving history
+
+  WARNINGS
+   ! no openai history for 2026-07 (history is pruned, not idle) — $800
+     excluded from both the claim and documented spend
+```
+
+`--gap-policy` decides what happens, and never decides it silently:
+
+| Policy | Effect |
+| --- | --- |
+| `skip` (default) | Drops the gap from the claim *and* from documented spend, so the share stays honest about what it saw |
+| `zero` | Claims nothing but still counts the spend — the most conservative number available |
+| `impute` | Applies that vendor's mean share from the months it can see |
+
+### Clients that bill on their own seat
+
+A Copilot seat is not a Claude or ChatGPT plan, even when it runs their models.
+Copilot forms its own pool rather than inflating a vendor pool it was never
+billed to — which also keeps it from masking a month where the vendor's own
+history is gone. Declare it like any other plan with `--sub copilot=1`.
+
+Pools with no plan declared take no part in the split at all.
+
 ## Grouping and filtering
 
 Dimensions can be composed: `root`, `repo`, `cwd`, `provider`, `model`, `day`,

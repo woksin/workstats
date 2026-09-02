@@ -583,7 +583,7 @@ pub struct Summary {
     pub model_tokens: BTreeMap<String, u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct ReportRow {
     pub key: BTreeMap<String, String>,
     /// Internal identity used by the explorer to join a logical repository

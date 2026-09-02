@@ -1,0 +1,1047 @@
+//! Apportions flat-rate subscription spend to one project.
+//!
+//! The question this answers: you pay for N plans per vendor, you worked on
+//! several projects, how much of that spend belongs to one of them?
+//!
+//! It is a post-processing pass over a report already grouped by
+//! `repo,provider,model,month`. Nothing here re-reads transcripts or changes
+//! how anything is measured.
+//!
+//! Three commitments shape the design:
+//!
+//! - **Apportion on measured quantities.** Tokens and wall clock are recorded
+//!   by the providers. Human time is an estimate built from prompt counts and
+//!   session edges, and it drifts with orchestration style — a run that fans
+//!   out subagents books more estimated attention per real hour than a single
+//!   long session does. It is offered as a cross-check, never as the default.
+//! - **Weigh models by list rate.** A million Opus tokens and a million Haiku
+//!   tokens are not equal claims on a plan.
+//! - **Never invent coverage.** Pruned history is a hole, and a hole that
+//!   reads as a zero silently under-bills. Gaps are named and their handling
+//!   is chosen explicitly.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::Result;
+use serde::Serialize;
+
+use crate::model::ReportRow;
+use crate::output::number;
+use crate::pricing::{self, RATES_AS_OF};
+
+/// Which measured quantity drives the split.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Basis {
+    /// Tokens the models generated. The closest measured proxy for work done,
+    /// and unlike total tokens it is not swamped by cache reads.
+    Output,
+    /// List-price value of every token class, weighted by model.
+    Value,
+    /// Wall-clock time with at least one agent active.
+    Wall,
+    /// Every token class summed. Dominated by cache reads, which are an
+    /// artifact of context length and turn count rather than of work.
+    Tokens,
+    /// Estimated human involvement. Not provider-recorded; see the module note.
+    Human,
+}
+
+impl Basis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Basis::Output => "output tokens",
+            Basis::Value => "list-price value",
+            Basis::Wall => "agent wall clock",
+            Basis::Tokens => "total tokens",
+            Basis::Human => "human time (est)",
+        }
+    }
+
+    /// Whether the number is recorded by the provider rather than inferred.
+    pub fn is_measured(self) -> bool {
+        !matches!(self, Basis::Human)
+    }
+
+    pub const ALL: [Basis; 5] = [
+        Basis::Output,
+        Basis::Value,
+        Basis::Wall,
+        Basis::Tokens,
+        Basis::Human,
+    ];
+}
+
+/// What to do with a family-month that has no surviving history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapPolicy {
+    /// Drop it from the claim *and* from documented spend. The share stays
+    /// honest and the report says what it could not see.
+    Skip,
+    /// Claim nothing for it but still count the spend. Under-bills, and is
+    /// offered only because it is the most conservative number available.
+    Zero,
+    /// Apply that family's mean share across the months it can see.
+    Impute,
+}
+
+#[derive(Clone, Debug)]
+pub struct AllocationOptions {
+    pub projects: Vec<String>,
+    pub subscriptions: BTreeMap<String, u32>,
+    pub price: f64,
+    pub basis: Basis,
+    pub gap_policy: GapPolicy,
+}
+
+/// Both sides of one split, in every measure at once, so the chosen basis and
+/// the cross-check come from a single pass.
+#[derive(Clone, Copy, Debug, Default)]
+struct Measures {
+    output: f64,
+    value: f64,
+    wall: f64,
+    tokens: f64,
+    human: f64,
+}
+
+impl Measures {
+    fn get(&self, basis: Basis) -> f64 {
+        match basis {
+            Basis::Output => self.output,
+            Basis::Value => self.value,
+            Basis::Wall => self.wall,
+            Basis::Tokens => self.tokens,
+            Basis::Human => self.human,
+        }
+    }
+
+    fn add(&mut self, other: &Measures) {
+        self.output += other.output;
+        self.value += other.value;
+        self.wall += other.wall;
+        self.tokens += other.tokens;
+        self.human += other.human;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Split {
+    project: Measures,
+    pool: Measures,
+}
+
+impl Split {
+    fn add(&mut self, measures: &Measures, is_project: bool) {
+        self.pool.add(measures);
+        if is_project {
+            self.project.add(measures);
+        }
+    }
+
+    fn share(&self, basis: Basis) -> Option<f64> {
+        let pool = self.pool.get(basis);
+        (pool > 0.0).then(|| self.project.get(basis) / pool)
+    }
+}
+
+/// One month of one vendor's subscriptions.
+#[derive(Debug, Serialize)]
+pub struct PeriodRow {
+    pub month: String,
+    pub family: String,
+    pub subscriptions: u32,
+    pub project_metric: f64,
+    pub pool_metric: f64,
+    pub share: f64,
+    pub amount: f64,
+    /// Empty when the cell was measured; otherwise why it was not.
+    pub note: &'static str,
+}
+
+/// Per-model usage, which is what makes a share auditable rather than asserted.
+#[derive(Debug, Serialize)]
+pub struct ModelRow {
+    pub model: String,
+    pub family: String,
+    pub project_tokens: u64,
+    pub pool_tokens: u64,
+    pub project_output_tokens: u64,
+    pub share: f64,
+    pub project_list_value: f64,
+    pub pool_list_value: f64,
+    pub priced: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CrossCheckRow {
+    pub basis: Basis,
+    pub label: &'static str,
+    pub measured: bool,
+    pub share: f64,
+    pub amount: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Allocation {
+    pub projects: Vec<String>,
+    pub months: Vec<String>,
+    pub basis: Basis,
+    pub gap_policy: GapPolicy,
+    pub price_per_subscription: f64,
+    pub subscriptions: BTreeMap<String, u32>,
+    /// Everything the plans cost over the window.
+    pub billed: f64,
+    /// The part of that spend a measured month stands behind.
+    pub documented: f64,
+    pub attributable: f64,
+    /// `attributable / documented` — the share of *documented* spend, which is
+    /// not the same as the share of everything billed when gaps were skipped.
+    pub effective_share: f64,
+    pub periods: Vec<PeriodRow>,
+    pub models: Vec<ModelRow>,
+    pub cross_check: Vec<CrossCheckRow>,
+    pub rates_as_of: &'static str,
+    pub warnings: Vec<String>,
+}
+
+fn row_value(row: &ReportRow, model: &str) -> Measures {
+    let value = pricing::rate_for(model)
+        .map(|rate| {
+            rate.value(
+                row.input_tokens,
+                row.cache_creation_tokens,
+                row.cache_read_tokens,
+                row.output_tokens,
+            )
+        })
+        .unwrap_or(0.0);
+    Measures {
+        output: row.output_tokens as f64,
+        value,
+        wall: row.parallel_agent_seconds,
+        tokens: row.total_tokens as f64,
+        human: row.human_estimated_seconds,
+    }
+}
+
+/// Takes rows rather than a whole `Report`: allocation is a pure function of
+/// the grouped rows, and depending on nothing else keeps it directly testable.
+/// Rows are expected to be grouped by `repo,provider,model,month`.
+pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
+    let wanted: BTreeSet<String> = options
+        .projects
+        .iter()
+        .map(|project| project.trim().to_ascii_lowercase())
+        .collect();
+
+    let mut cells: BTreeMap<(String, String), Split> = BTreeMap::new();
+    let mut models: BTreeMap<(String, String), Split> = BTreeMap::new();
+    let mut model_tokens: BTreeMap<(String, String), (u64, u64, u64)> = BTreeMap::new();
+    let mut months: BTreeSet<String> = BTreeSet::new();
+    let mut unclassified: BTreeMap<String, u64> = BTreeMap::new();
+    let mut unpriced: BTreeMap<String, u64> = BTreeMap::new();
+    let mut seen_repos: BTreeSet<String> = BTreeSet::new();
+
+    for row in rows {
+        let model = row.key.get("model").map(String::as_str).unwrap_or("");
+        if model.is_empty() || model == "unknown" || model == "<synthetic>" {
+            continue;
+        }
+        let provider = row.key.get("provider").map(String::as_str).unwrap_or("");
+        let Some(pool) = pricing::pool_for(provider, model) else {
+            *unclassified.entry(model.to_string()).or_default() += row.total_tokens;
+            continue;
+        };
+        // A pool nobody declared a plan for is not part of any split. Copilot
+        // usage does not dilute the Codex pool it was never billed to.
+        if !options.subscriptions.contains_key(&pool) {
+            continue;
+        }
+        if pricing::rate_for(model).is_none() {
+            *unpriced.entry(model.to_string()).or_default() += row.total_tokens;
+        }
+
+        // Rows are grouped with `month`, so a missing key means the report was
+        // built for a single unnamed window; fold those into one bucket rather
+        // than dropping them.
+        let month = row
+            .key
+            .get("month")
+            .cloned()
+            .unwrap_or_else(|| "(window)".to_string());
+        months.insert(month.clone());
+
+        let repo = row
+            .key
+            .get("repo")
+            .map(|repo| repo.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !repo.is_empty() {
+            seen_repos.insert(repo.clone());
+        }
+        let is_project = wanted.contains(&repo);
+        let measures = row_value(row, model);
+
+        cells
+            .entry((month, pool.clone()))
+            .or_default()
+            .add(&measures, is_project);
+        models
+            .entry((pool.clone(), model.to_string()))
+            .or_default()
+            .add(&measures, is_project);
+        let entry = model_tokens.entry((pool, model.to_string())).or_default();
+        entry.1 += row.total_tokens;
+        if is_project {
+            entry.0 += row.total_tokens;
+            entry.2 += row.output_tokens;
+        }
+    }
+
+    let months: Vec<String> = months.into_iter().collect();
+    let chosen = apportion(&cells, &months, options, options.basis);
+
+    // Every cross-check runs the *same* apportionment, only the basis changes.
+    // Pooling all vendors together instead would ignore that the families hold
+    // different numbers of plans, and the row marked as the chosen basis would
+    // then disagree with the headline it is supposed to corroborate.
+    let cross_check = Basis::ALL
+        .iter()
+        .map(|basis| {
+            let outcome = apportion(&cells, &months, options, *basis);
+            CrossCheckRow {
+                basis: *basis,
+                label: basis.label(),
+                measured: basis.is_measured(),
+                share: outcome.share(),
+                amount: outcome.attributable,
+            }
+        })
+        .collect();
+
+    let Apportionment {
+        periods,
+        attributable,
+        documented,
+        billed,
+        mut warnings,
+    } = chosen;
+
+    let mut model_rows: Vec<ModelRow> = models
+        .iter()
+        .map(|((pool, model), split)| {
+            let (project_tokens, pool_tokens, project_output) = model_tokens
+                .get(&(pool.clone(), model.clone()))
+                .copied()
+                .unwrap_or_default();
+            ModelRow {
+                model: model.clone(),
+                family: pool.clone(),
+                project_tokens,
+                pool_tokens,
+                project_output_tokens: project_output,
+                share: split.share(options.basis).unwrap_or(0.0),
+                project_list_value: split.project.value,
+                pool_list_value: split.pool.value,
+                priced: pricing::rate_for(model).is_some(),
+            }
+        })
+        .collect();
+    model_rows.sort_by(|left, right| {
+        right
+            .project_list_value
+            .partial_cmp(&left.project_list_value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.project_tokens.cmp(&left.project_tokens))
+    });
+
+    // A misspelled project matches nothing and apportions $0 — which reads as
+    // "you cannot claim anything" rather than "that repository does not
+    // exist". Same silent-zero shape as pruned history, so it gets named too.
+    for project in &options.projects {
+        let name = project.trim().to_ascii_lowercase();
+        if seen_repos.contains(&name) {
+            continue;
+        }
+        let mut nearest: Vec<&String> = seen_repos.iter().collect();
+        nearest.sort_by_key(|candidate| distance(&name, candidate));
+        let suggestion: Vec<&str> = nearest
+            .iter()
+            .take(3)
+            .map(|candidate| candidate.as_str())
+            .collect();
+        warnings.push(if suggestion.is_empty() {
+            format!("`{project}` matched no activity in this window")
+        } else {
+            format!(
+                "`{project}` matched no activity in this window — did you mean {}?",
+                suggestion.join(", ")
+            )
+        });
+    }
+    if cells.is_empty() {
+        warnings.push(
+            "no activity for any declared subscription in this window; every share is zero because nothing was measured, not because nothing was used"
+                .to_string(),
+        );
+    }
+    if !unpriced.is_empty() {
+        warnings.push(format!(
+            "no published rate for {} — counted in token and wall-clock bases, excluded from list-price value",
+            name_list(&unpriced)
+        ));
+    }
+    if !unclassified.is_empty() {
+        warnings.push(format!(
+            "could not place {} in a subscription family — excluded entirely",
+            name_list(&unclassified)
+        ));
+    }
+
+    Allocation {
+        projects: options.projects.clone(),
+        months,
+        basis: options.basis,
+        gap_policy: options.gap_policy,
+        price_per_subscription: options.price,
+        subscriptions: options.subscriptions.clone(),
+        billed,
+        documented,
+        attributable,
+        effective_share: if documented > 0.0 {
+            attributable / documented
+        } else {
+            0.0
+        },
+        periods,
+        models: model_rows,
+        cross_check,
+        rates_as_of: RATES_AS_OF,
+        warnings,
+    }
+}
+
+/// One basis apportioned across every month and family.
+struct Apportionment {
+    periods: Vec<PeriodRow>,
+    attributable: f64,
+    documented: f64,
+    billed: f64,
+    warnings: Vec<String>,
+}
+
+impl Apportionment {
+    fn share(&self) -> f64 {
+        if self.documented > 0.0 {
+            self.attributable / self.documented
+        } else {
+            0.0
+        }
+    }
+}
+
+fn apportion(
+    cells: &BTreeMap<(String, String), Split>,
+    months: &[String],
+    options: &AllocationOptions,
+    basis: Basis,
+) -> Apportionment {
+    // A family's fallback share, for imputing months whose history is gone.
+    let mut covered: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+    for ((_, pool), split) in cells {
+        if let Some(share) = split.share(basis) {
+            covered.entry(pool.as_str()).or_default().push(share);
+        }
+    }
+    let imputed: BTreeMap<&str, f64> = covered
+        .iter()
+        .map(|(pool, shares)| (*pool, shares.iter().sum::<f64>() / shares.len() as f64))
+        .collect();
+
+    let mut outcome = Apportionment {
+        periods: Vec::new(),
+        attributable: 0.0,
+        documented: 0.0,
+        billed: 0.0,
+        warnings: Vec::new(),
+    };
+
+    for month in months {
+        for (pool, count) in &options.subscriptions {
+            let spend = f64::from(*count) * options.price;
+            outcome.billed += spend;
+            let split = cells
+                .get(&(month.clone(), pool.clone()))
+                .copied()
+                .unwrap_or_default();
+
+            let (share, amount, note) = match split.share(basis) {
+                Some(share) => {
+                    outcome.documented += spend;
+                    (share, share * spend, "")
+                }
+                None => {
+                    let fallback = imputed.get(pool.as_str()).copied().unwrap_or(0.0);
+                    let handling = match options.gap_policy {
+                        GapPolicy::Impute => {
+                            outcome.documented += spend;
+                            (fallback, fallback * spend, "imputed")
+                        }
+                        GapPolicy::Zero => {
+                            outcome.documented += spend;
+                            (0.0, 0.0, "no data")
+                        }
+                        GapPolicy::Skip => (0.0, 0.0, "excluded"),
+                    };
+                    outcome.warnings.push(gap_warning(
+                        month,
+                        pool,
+                        spend,
+                        options.gap_policy,
+                        fallback,
+                    ));
+                    handling
+                }
+            };
+            outcome.attributable += amount;
+            outcome.periods.push(PeriodRow {
+                month: month.clone(),
+                family: pool.clone(),
+                subscriptions: *count,
+                project_metric: split.project.get(basis),
+                pool_metric: split.pool.get(basis),
+                share,
+                amount,
+                note,
+            });
+        }
+    }
+    outcome
+}
+
+fn gap_warning(month: &str, pool: &str, spend: f64, policy: GapPolicy, fallback: f64) -> String {
+    let handling = match policy {
+        GapPolicy::Skip => format!(
+            "${} excluded from both the claim and documented spend",
+            money(spend)
+        ),
+        GapPolicy::Zero => format!(
+            "${} counted as spend but claims nothing — this under-bills",
+            money(spend)
+        ),
+        GapPolicy::Impute => format!(
+            "claimed at {:.1}%, that family's mean over the months it can see = ${}",
+            fallback * 100.0,
+            money(fallback * spend)
+        ),
+    };
+    format!("no {pool} history for {month} (history is pruned, not idle) — {handling}")
+}
+
+/// Levenshtein distance, for turning a mistyped project into a usable
+/// suggestion rather than a bare zero.
+fn distance(left: &str, right: &str) -> usize {
+    let right_chars: Vec<char> = right.chars().collect();
+    let mut previous: Vec<usize> = (0..=right_chars.len()).collect();
+    let mut current = vec![0; right_chars.len() + 1];
+    for (row, left_char) in left.chars().enumerate() {
+        current[0] = row + 1;
+        for (column, right_char) in right_chars.iter().enumerate() {
+            let substitution = previous[column] + usize::from(left_char != *right_char);
+            current[column + 1] = substitution
+                .min(previous[column + 1] + 1)
+                .min(current[column] + 1);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[right_chars.len()]
+}
+
+fn name_list(counts: &BTreeMap<String, u64>) -> String {
+    let mut entries: Vec<_> = counts.iter().collect();
+    entries.sort_by(|left, right| right.1.cmp(left.1));
+    let shown: Vec<String> = entries
+        .iter()
+        .take(4)
+        .map(|(model, tokens)| format!("{model} ({})", tokens_short(**tokens)))
+        .collect();
+    if entries.len() > 4 {
+        format!("{} and {} more", shown.join(", "), entries.len() - 4)
+    } else {
+        shown.join(", ")
+    }
+}
+
+fn money(value: f64) -> String {
+    number(value.round() as i64)
+}
+
+fn tokens_short(tokens: u64) -> String {
+    let value = tokens as f64;
+    if value >= 1e9 {
+        format!("{:.2}B", value / 1e9)
+    } else if value >= 1e6 {
+        format!("{:.1}M", value / 1e6)
+    } else if value >= 1e3 {
+        format!("{:.1}k", value / 1e3)
+    } else {
+        format!("{tokens}")
+    }
+}
+
+fn metric_short(value: f64, basis: Basis) -> String {
+    match basis {
+        Basis::Output | Basis::Tokens => tokens_short(value as u64),
+        Basis::Wall | Basis::Human => format!("{:.0}h", value / 3600.0),
+        Basis::Value => format!("${}", money(value)),
+    }
+}
+
+pub fn print_table(allocation: &Allocation) {
+    let window = match allocation.months.as_slice() {
+        [] => "no data".to_string(),
+        [only] => only.clone(),
+        [first, .., last] => format!("{first} → {last}"),
+    };
+    let total: u32 = allocation.subscriptions.values().sum();
+    println!();
+    println!("  ALLOCATION  {}", allocation.projects.join(", "));
+    println!(
+        "  {window} · {} subscription{} @ ${}/mo · ${} billed · basis: {}",
+        total,
+        if total == 1 { "" } else { "s" },
+        money(allocation.price_per_subscription),
+        money(allocation.billed),
+        allocation.basis.label()
+    );
+    println!();
+
+    println!(
+        "  {:<9} {:<8} {:>4} {:>12} {:>12} {:>8} {:>10}",
+        "month", "family", "subs", "project", "pool", "share", "owed"
+    );
+    println!("  {}", "─".repeat(68));
+    for period in &allocation.periods {
+        let note = if period.note.is_empty() {
+            String::new()
+        } else {
+            format!("  ← {}", period.note)
+        };
+        println!(
+            "  {:<9} {:<8} {:>4} {:>12} {:>12} {:>7.1}% {:>10}{note}",
+            period.month,
+            period.family,
+            period.subscriptions,
+            metric_short(period.project_metric, allocation.basis),
+            metric_short(period.pool_metric, allocation.basis),
+            period.share * 100.0,
+            format!("${}", money(period.amount)),
+        );
+    }
+    println!("  {}", "─".repeat(68));
+    println!(
+        "  {:<48} {:>7.1}% {:>10}",
+        "ATTRIBUTABLE",
+        allocation.effective_share * 100.0,
+        format!("${}", money(allocation.attributable))
+    );
+    if allocation.documented < allocation.billed {
+        println!(
+            "  of ${} documented — ${} of ${} billed has no surviving history",
+            money(allocation.documented),
+            money(allocation.billed - allocation.documented),
+            money(allocation.billed)
+        );
+    }
+
+    if !allocation.models.is_empty() {
+        println!();
+        println!("  MODELS  (rates as of {})", allocation.rates_as_of);
+        println!(
+            "  {:<26} {:<8} {:>11} {:>11} {:>8} {:>12}",
+            "model", "family", "project", "pool", "share", "list value"
+        );
+        println!("  {}", "─".repeat(82));
+        for model in &allocation.models {
+            if model.project_tokens == 0 && model.pool_tokens == 0 {
+                continue;
+            }
+            println!(
+                "  {:<26} {:<8} {:>11} {:>11} {:>7.1}% {:>12}{}",
+                truncate(&model.model, 26),
+                model.family,
+                tokens_short(model.project_tokens),
+                tokens_short(model.pool_tokens),
+                model.share * 100.0,
+                format!("${}", money(model.project_list_value)),
+                if model.priced { "" } else { "  ← unpriced" },
+            );
+        }
+    }
+
+    println!();
+    println!("  CROSS-CHECK  same window, every basis");
+    let mut ordered: Vec<&CrossCheckRow> = allocation.cross_check.iter().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .share
+            .partial_cmp(&left.share)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for row in ordered {
+        println!(
+            "   {} {:<20} {:>6.1}%   ${:>9}{}",
+            if row.measured { " " } else { "~" },
+            row.label,
+            row.share * 100.0,
+            money(row.amount),
+            if row.basis == allocation.basis {
+                "  ←"
+            } else {
+                ""
+            }
+        );
+    }
+    println!("     ~ estimated, not provider-recorded");
+
+    if !allocation.warnings.is_empty() {
+        println!();
+        println!("  WARNINGS");
+        for warning in &allocation.warnings {
+            println!("   ! {warning}");
+        }
+    }
+    println!();
+    println!(
+        "  List value is the pay-per-token price of this usage, shown as a ceiling and as the"
+    );
+    println!("  weight between models. It is not an amount owed: a subscription is what you paid.");
+    println!();
+}
+
+pub fn print_json(allocation: &Allocation) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(allocation)?);
+    Ok(())
+}
+
+pub fn print_csv(allocation: &Allocation) -> Result<()> {
+    // The per-month, per-family cells are the billable artifact; the model
+    // breakdown is evidence for them and stays in table and JSON output.
+    println!("month,family,subscriptions,project_metric,pool_metric,share,amount,note");
+    for period in &allocation.periods {
+        println!(
+            "{},{},{},{},{},{:.6},{:.2},{}",
+            period.month,
+            period.family,
+            period.subscriptions,
+            period.project_metric,
+            period.pool_metric,
+            period.share,
+            period.amount,
+            period.note
+        );
+    }
+    Ok(())
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_string()
+    } else {
+        text.chars()
+            .take(width.saturating_sub(1))
+            .collect::<String>()
+            + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(repo: &str, model: &str, month: &str, output: u64, total: u64) -> ReportRow {
+        let mut key = BTreeMap::new();
+        key.insert("repo".to_string(), repo.to_string());
+        key.insert("provider".to_string(), "claude".to_string());
+        key.insert("model".to_string(), model.to_string());
+        key.insert("month".to_string(), month.to_string());
+        ReportRow {
+            key,
+            output_tokens: output,
+            total_tokens: total,
+            parallel_agent_seconds: output as f64,
+            human_estimated_seconds: output as f64,
+            ..ReportRow::default()
+        }
+    }
+
+    fn options(basis: Basis, gap: GapPolicy) -> AllocationOptions {
+        AllocationOptions {
+            projects: vec!["Ada".to_string()],
+            subscriptions: BTreeMap::from([("claude".to_string(), 2), ("openai".to_string(), 4)]),
+            price: 200.0,
+            basis,
+            gap_policy: gap,
+        }
+    }
+
+    #[test]
+    fn share_is_the_projects_slice_of_its_own_family_pool() {
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Other", "claude-opus-5", "2026-08", 40, 40),
+                row("Ada", "gpt-5.6-sol", "2026-08", 25, 25),
+                row("Other", "gpt-5.6-sol", "2026-08", 75, 75),
+            ],
+            &options(Basis::Output, GapPolicy::Skip),
+        );
+        // Claude 60/100 of 2 subs, OpenAI 25/100 of 4 subs.
+        let claude = allocation
+            .periods
+            .iter()
+            .find(|period| period.family == "claude")
+            .expect("claude row");
+        let openai = allocation
+            .periods
+            .iter()
+            .find(|period| period.family == "openai")
+            .expect("openai row");
+        assert!((claude.share - 0.6).abs() < 1e-9);
+        assert!((claude.amount - 240.0).abs() < 1e-9);
+        assert!((openai.share - 0.25).abs() < 1e-9);
+        assert!((openai.amount - 200.0).abs() < 1e-9);
+        assert!((allocation.attributable - 440.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_pruned_family_month_is_never_silently_a_zero() {
+        // The bug this guards: a month whose history is gone looks identical to
+        // a month of genuinely no work, and reporting it as 0% quietly bills
+        // the user's own project for the shortfall.
+        let rows = [
+            row("Ada", "claude-opus-5", "2026-07", 50, 50),
+            row("Other", "claude-opus-5", "2026-07", 50, 50),
+            row("Ada", "claude-opus-5", "2026-08", 50, 50),
+            row("Other", "claude-opus-5", "2026-08", 50, 50),
+            // No OpenAI rows at all: both months are holes for that family.
+            row("Ada", "gpt-5.6-sol", "2026-08", 40, 40),
+            row("Other", "gpt-5.6-sol", "2026-08", 60, 60),
+        ];
+
+        let skipped = build(&rows, &options(Basis::Output, GapPolicy::Skip));
+        // July OpenAI is a hole: $800 leaves both the claim and the denominator.
+        assert!(skipped.documented < skipped.billed);
+        assert!((skipped.billed - skipped.documented - 800.0).abs() < 1e-9);
+        assert!(!skipped.warnings.is_empty());
+
+        let zeroed = build(&rows, &options(Basis::Output, GapPolicy::Zero));
+        // Same claim, larger denominator — strictly the pessimistic reading.
+        assert!((zeroed.attributable - skipped.attributable).abs() < 1e-9);
+        assert!(zeroed.effective_share < skipped.effective_share);
+
+        let imputed = build(&rows, &options(Basis::Output, GapPolicy::Impute));
+        // August OpenAI ran at 40%, so July is claimed at 40% of $800.
+        assert!((imputed.attributable - skipped.attributable - 320.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn models_are_weighed_by_rate_not_by_raw_token_count() {
+        // Equal token counts on a cheap and an expensive model must not imply
+        // an equal claim on the plan.
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 1_000_000, 1_000_000),
+                row("Other", "claude-haiku-4-5", "2026-08", 1_000_000, 1_000_000),
+            ],
+            &options(Basis::Value, GapPolicy::Skip),
+        );
+        let claude = allocation
+            .periods
+            .iter()
+            .find(|period| period.family == "claude")
+            .expect("claude row");
+        // Opus output is $25/MTok against Haiku's $5 — 25/30 of the pool.
+        assert!(
+            (claude.share - 25.0 / 30.0).abs() < 1e-9,
+            "got {}",
+            claude.share
+        );
+    }
+
+    #[test]
+    fn cross_check_reports_every_basis_over_the_same_window() {
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 200),
+                row("Other", "claude-opus-5", "2026-08", 40, 800),
+            ],
+            &options(Basis::Output, GapPolicy::Skip),
+        );
+        assert_eq!(Basis::ALL.len(), allocation.cross_check.len());
+        let by_output = allocation
+            .cross_check
+            .iter()
+            .find(|row| row.basis == Basis::Output)
+            .expect("output basis");
+        let by_tokens = allocation
+            .cross_check
+            .iter()
+            .find(|row| row.basis == Basis::Tokens)
+            .expect("tokens basis");
+        assert!((by_output.share - 0.6).abs() < 1e-9);
+        // Cache-heavy totals tell a different story, which is the entire point
+        // of showing them side by side.
+        assert!((by_tokens.share - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_cross_check_row_for_the_chosen_basis_equals_the_headline() {
+        // Regression: the cross-check used to pool every vendor together while
+        // the headline weighed each family by how many plans it holds, so the
+        // row marked as the chosen basis contradicted the total it was meant
+        // to corroborate. Unequal plan counts are what expose it.
+        let rows = [
+            row("Ada", "claude-opus-5", "2026-08", 60, 60),
+            row("Other", "claude-opus-5", "2026-08", 40, 40),
+            row("Ada", "gpt-5.6-sol", "2026-08", 25, 25),
+            row("Other", "gpt-5.6-sol", "2026-08", 75, 75),
+        ];
+        for basis in Basis::ALL {
+            let allocation = build(&rows, &options(basis, GapPolicy::Skip));
+            let marked = allocation
+                .cross_check
+                .iter()
+                .find(|row| row.basis == basis)
+                .expect("chosen basis appears in its own cross-check");
+            assert!(
+                (marked.share - allocation.effective_share).abs() < 1e-9,
+                "{basis:?}: cross-check {} vs headline {}",
+                marked.share,
+                allocation.effective_share
+            );
+            assert!(
+                (marked.amount - allocation.attributable).abs() < 1e-9,
+                "{basis:?}: cross-check ${} vs headline ${}",
+                marked.amount,
+                allocation.attributable
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_counts_weigh_the_families_against_each_other() {
+        // Claude is 60% of its pool on 2 plans, OpenAI 25% on 4. Pooling the
+        // tokens would say 42.5%; weighing by plans held says 36.7%.
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Other", "claude-opus-5", "2026-08", 40, 40),
+                row("Ada", "gpt-5.6-sol", "2026-08", 25, 25),
+                row("Other", "gpt-5.6-sol", "2026-08", 75, 75),
+            ],
+            &options(Basis::Output, GapPolicy::Skip),
+        );
+        // (0.6 * $400 + 0.25 * $800) / $1200
+        assert!(
+            (allocation.effective_share - 440.0 / 1200.0).abs() < 1e-9,
+            "got {}",
+            allocation.effective_share
+        );
+    }
+
+    #[test]
+    fn a_family_without_a_subscription_is_not_part_of_any_pool() {
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 50, 50),
+                row("Other", "claude-opus-5", "2026-08", 50, 50),
+                row("Ada", "gemini-3-pro", "2026-08", 999, 999),
+            ],
+            &options(Basis::Output, GapPolicy::Skip),
+        );
+        assert!(
+            !allocation
+                .models
+                .iter()
+                .any(|model| model.family == "google"),
+            "Gemini has no plan declared and must not appear"
+        );
+        assert_eq!(2, allocation.periods.len());
+    }
+
+    #[test]
+    fn a_project_that_matched_nothing_says_so_and_suggests_the_near_miss() {
+        // A typo apportions $0, which reads as "nothing to claim" rather than
+        // "no such repository" — the same silent zero as pruned history.
+        let mut options = options(Basis::Output, GapPolicy::Skip);
+        options.projects = vec!["Adaa".to_string()];
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Chronicle", "claude-opus-5", "2026-08", 40, 40),
+            ],
+            &options,
+        );
+        assert_eq!(0.0, allocation.attributable);
+        let warning = allocation
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("Adaa"))
+            .expect("an unmatched project must be named");
+        assert!(
+            warning.contains("did you mean ada"),
+            "the nearest real repository should be offered, got {warning}"
+        );
+    }
+
+    #[test]
+    fn a_matched_project_is_never_reported_as_a_near_miss() {
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Chronicle", "claude-opus-5", "2026-08", 40, 40),
+            ],
+            &options(Basis::Output, GapPolicy::Skip),
+        );
+        assert!(
+            !allocation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("did you mean")),
+            "got {:?}",
+            allocation.warnings
+        );
+    }
+
+    #[test]
+    fn an_empty_window_says_nothing_was_measured_rather_than_implying_no_usage() {
+        let allocation = build(&[], &options(Basis::Output, GapPolicy::Skip));
+        assert_eq!(0.0, allocation.attributable);
+        assert!(
+            allocation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("nothing was measured")),
+            "got {:?}",
+            allocation.warnings
+        );
+    }
+
+    #[test]
+    fn project_matching_ignores_case_and_padding() {
+        let mut options = options(Basis::Output, GapPolicy::Skip);
+        options.projects = vec!["  ada  ".to_string()];
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 70, 70),
+                row("Other", "claude-opus-5", "2026-08", 30, 30),
+            ],
+            &options,
+        );
+        let claude = &allocation.periods[0];
+        assert!((claude.share - 0.7).abs() < 1e-9);
+    }
+}
