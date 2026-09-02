@@ -100,17 +100,31 @@ struct AllocateArguments {
     #[arg(
         long = "sub",
         required = true,
-        value_name = "FAMILY=N",
+        value_name = "PLAN=N[@PRICE]",
         action = clap::ArgAction::Append,
-        help = "Subscriptions held, as claude=2 or codex=4; repeatable"
+        help = "Subscriptions held, as claude=2 or codex=3@1992 to price one vendor separately; repeatable"
     )]
     subscriptions: Vec<String>,
     #[arg(
         long,
         default_value_t = 200.0,
-        help = "Price per subscription per month"
+        help = "Advertised price per subscription per month, before tax"
     )]
     price: f64,
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        value_name = "PERCENT",
+        help = "Consumption tax added at checkout, e.g. 25 for Norwegian MVA"
+    )]
+    vat: f64,
+    #[arg(
+        long,
+        default_value = "USD",
+        value_name = "CODE",
+        help = "Currency --price is stated in; labels output and converts nothing"
+    )]
+    currency: String,
     #[arg(
         long,
         value_enum,
@@ -603,19 +617,50 @@ fn run_allocation(command: AllocateArguments) -> Result<()> {
         projects,
         subscriptions,
         price,
+        vat,
+        currency,
         basis,
         gap_policy,
         mut report,
     } = command;
 
-    if !price.is_finite() || price <= 0.0 {
+    let price_default = price;
+    if !price_default.is_finite() || price_default <= 0.0 {
         bail!("--price must be a positive amount");
     }
-    let mut plans: BTreeMap<String, u32> = BTreeMap::new();
+    if !vat.is_finite() || !(0.0..=100.0).contains(&vat) {
+        bail!("--vat must be a percentage between 0 and 100");
+    }
+    // Three letters, so a currency can be printed beside an amount without the
+    // reader having to guess. No rate is applied and nothing is converted.
+    let currency = currency.trim().to_ascii_uppercase();
+    if currency.len() != 3
+        || !currency
+            .chars()
+            .all(|character| character.is_ascii_alphabetic())
+    {
+        bail!("--currency expects a three-letter ISO code, such as USD or NOK");
+    }
+    let mut plans: BTreeMap<String, allocate::Plan> = BTreeMap::new();
     for entry in &subscriptions {
-        let (name, count) = entry
+        let (name, rest) = entry
             .split_once('=')
             .with_context(|| format!("--sub expects PLAN=N, got `{entry}`"))?;
+        // `claude=2@1992` prices one vendor apart from the rest. Two vendors
+        // billing a buyer in different currencies is the normal case outside
+        // the US, and a single --price cannot say it.
+        let (count, price) = match rest.split_once('@') {
+            Some((count, price)) => {
+                let price: f64 = price.trim().parse().with_context(|| {
+                    format!("--sub price after '@' must be a number, got `{price}`")
+                })?;
+                if !price.is_finite() || price <= 0.0 {
+                    bail!("--sub {name} price must be a positive amount");
+                }
+                (count, Some(price))
+            }
+            None => (rest, None),
+        };
         // A vendor family, or a client that bills on its own seat. Anything
         // else is a typo, and accepting it would silently declare an empty
         // pool that claims nothing.
@@ -648,7 +693,16 @@ fn run_allocation(command: AllocateArguments) -> Result<()> {
         }
         // Repeating a plan is ambiguous — two or six? — and silently picking
         // one is how a claim becomes wrong without anyone noticing.
-        if plans.insert(pool.clone(), count).is_some() {
+        if plans
+            .insert(
+                pool.clone(),
+                allocate::Plan {
+                    count,
+                    price: price.unwrap_or(price_default),
+                },
+            )
+            .is_some()
+        {
             bail!("--sub {pool} was given more than once; state the total in one flag");
         }
     }
@@ -668,7 +722,8 @@ fn run_allocation(command: AllocateArguments) -> Result<()> {
         Some(allocate::AllocationOptions {
             projects,
             subscriptions: plans,
-            price,
+            vat_percent: vat,
+            currency,
             basis,
             gap_policy,
         }),
