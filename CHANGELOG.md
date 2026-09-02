@@ -14,6 +14,26 @@ tag are the generated list of pull requests.
 
 ### Added
 
+- `workstats allocate` gained currency and tax handling. `--vat` adds the
+  consumption tax checkout adds, because the advertised price and the amount
+  that left the account differ wherever one applies, and the difference is real
+  money that belongs in the split. `--currency` states which currency `--price`
+  is in and formats amounts accordingly.
+
+  No exchange rate is applied and nothing is converted. workstats makes no
+  network calls outside `workstats update`, and a rate compiled into a binary
+  goes stale silently — the worst failure mode for a number destined for an
+  invoice. State what you were charged.
+
+- `--sub PLAN=N@PRICE` prices one vendor separately from the rest. Two vendors
+  billing the same buyer at different amounts is the normal case outside the
+  US: one converts dollars through a card, the other sets a local price. A
+  single global price could not express it, leaving the arithmetic to be
+  finished by hand. The tax-inclusive unit price now appears on each row, so a
+  mixed-vendor claim is auditable line by line.
+
+### Added
+
 - `workstats allocate` apportions flat-rate subscription spend to one project.
   Given the plans you hold (`--sub claude=2 --sub codex=4`) it reports what
   share of that spend a project accounts for, split per vendor and per month,

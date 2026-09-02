@@ -906,6 +906,37 @@ you:
 | `zero` | Claims nothing but still counts the spend — the most conservative number available |
 | `impute` | Applies that vendor's mean share from the months it can see |
 
+### Currency, tax, and two vendors who charge differently
+
+`--price` is the advertised price before tax; `--vat` adds what checkout adds;
+`--currency` says which currency you are stating, and converts nothing.
+
+Vendors outside your own country rarely cost the same amount. Anthropic prices
+in dollars everywhere and your card converts them; OpenAI sets a local price.
+`--sub PLAN=N@PRICE` prices one vendor apart from the rest:
+
+```console
+$ workstats allocate -p Ada --sub claude=2@1866 --sub codex=3@1992 \
+    --currency NOK --vat 25 --month 2026-08
+
+  2026-08 · 5 subscriptions · 12,135 kr billed incl. 25% tax · basis: output tokens
+
+  month     family   subs    plan/mo      project         pool    share        owed
+  ─────────────────────────────────────────────────────────────────────────────────
+  2026-08   claude      2   2,333 kr        65.5M       147.5M    44.4%    2,072 kr
+  2026-08   openai      3   2,490 kr        45.8M       112.1M    40.8%    3,048 kr
+  ─────────────────────────────────────────────────────────────────────────────────
+  ATTRIBUTABLE                                                    42.2%    5,121 kr
+```
+
+The tax-inclusive unit price sits on each row, so a mixed-vendor claim can be
+checked line by line against a bank statement.
+
+No exchange rate is ever applied. workstats makes no network calls outside
+`workstats update`, and a rate compiled into a binary goes stale without saying
+so — the last thing you want behind a number you are about to invoice. State
+the amount you were actually charged and the arithmetic stays yours.
+
 ### Clients that bill on their own seat
 
 A Copilot seat is not a Claude or ChatGPT plan, even when it runs their models.

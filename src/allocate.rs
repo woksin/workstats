@@ -86,11 +86,41 @@ pub enum GapPolicy {
     Impute,
 }
 
+/// One vendor's plans: how many, and what one costs per month before tax.
+///
+/// Prices are per pool because a Norwegian buyer pays Anthropic in converted
+/// dollars and OpenAI in a fixed krone price the vendor sets. A single global
+/// price cannot express that, and doing the arithmetic by hand is exactly what
+/// this command exists to avoid.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Plan {
+    pub count: u32,
+    /// Advertised, before tax, in the run's currency.
+    pub price: f64,
+}
+
+impl Plan {
+    /// What these plans cost for one month, tax included.
+    fn spend(&self, vat_percent: f64) -> f64 {
+        f64::from(self.count) * self.price * (1.0 + vat_percent / 100.0)
+    }
+
+    fn price_with_tax(&self, vat_percent: f64) -> f64 {
+        self.price * (1.0 + vat_percent / 100.0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AllocationOptions {
     pub projects: Vec<String>,
-    pub subscriptions: BTreeMap<String, u32>,
-    pub price: f64,
+    pub subscriptions: BTreeMap<String, Plan>,
+    /// Consumption tax added at checkout, as a percentage. Vendors advertise
+    /// ex-tax prices, so what left the account is usually more than `price`.
+    pub vat_percent: f64,
+    /// ISO code for `price`. Labelling only — no rate is applied and nothing is
+    /// converted, because workstats makes no network calls and a hardcoded
+    /// exchange rate would go stale without saying so.
+    pub currency: String,
     pub basis: Basis,
     pub gap_policy: GapPolicy,
 }
@@ -152,6 +182,8 @@ pub struct PeriodRow {
     pub month: String,
     pub family: String,
     pub subscriptions: u32,
+    /// What one of these plans cost that month, tax included.
+    pub plan_price: f64,
     pub project_metric: f64,
     pub pool_metric: f64,
     pub share: f64,
@@ -189,8 +221,9 @@ pub struct Allocation {
     pub months: Vec<String>,
     pub basis: Basis,
     pub gap_policy: GapPolicy,
-    pub price_per_subscription: f64,
-    pub subscriptions: BTreeMap<String, u32>,
+    pub vat_percent: f64,
+    pub currency: String,
+    pub subscriptions: BTreeMap<String, Plan>,
     /// Everything the plans cost over the window.
     pub billed: f64,
     /// The part of that spend a measured month stands behind.
@@ -405,7 +438,8 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
         months,
         basis: options.basis,
         gap_policy: options.gap_policy,
-        price_per_subscription: options.price,
+        vat_percent: options.vat_percent,
+        currency: options.currency.clone(),
         subscriptions: options.subscriptions.clone(),
         billed,
         documented,
@@ -469,8 +503,8 @@ fn apportion(
     };
 
     for month in months {
-        for (pool, count) in &options.subscriptions {
-            let spend = f64::from(*count) * options.price;
+        for (pool, plan) in &options.subscriptions {
+            let spend = plan.spend(options.vat_percent);
             outcome.billed += spend;
             let split = cells
                 .get(&(month.clone(), pool.clone()))
@@ -501,6 +535,7 @@ fn apportion(
                         spend,
                         options.gap_policy,
                         fallback,
+                        &options.currency,
                     ));
                     handling
                 }
@@ -509,7 +544,8 @@ fn apportion(
             outcome.periods.push(PeriodRow {
                 month: month.clone(),
                 family: pool.clone(),
-                subscriptions: *count,
+                subscriptions: plan.count,
+                plan_price: plan.price_with_tax(options.vat_percent),
                 project_metric: split.project.get(basis),
                 pool_metric: split.pool.get(basis),
                 share,
@@ -521,20 +557,27 @@ fn apportion(
     outcome
 }
 
-fn gap_warning(month: &str, pool: &str, spend: f64, policy: GapPolicy, fallback: f64) -> String {
+fn gap_warning(
+    month: &str,
+    pool: &str,
+    spend: f64,
+    policy: GapPolicy,
+    fallback: f64,
+    currency: &str,
+) -> String {
     let handling = match policy {
         GapPolicy::Skip => format!(
-            "${} excluded from both the claim and documented spend",
-            money(spend)
+            "{} excluded from both the claim and documented spend",
+            money(spend, currency)
         ),
         GapPolicy::Zero => format!(
-            "${} counted as spend but claims nothing — this under-bills",
-            money(spend)
+            "{} counted as spend but claims nothing — this under-bills",
+            money(spend, currency)
         ),
         GapPolicy::Impute => format!(
-            "claimed at {:.1}%, that family's mean over the months it can see = ${}",
+            "claimed at {:.1}%, that family's mean over the months it can see = {}",
             fallback * 100.0,
-            money(fallback * spend)
+            money(fallback * spend, currency)
         ),
     };
     format!("no {pool} history for {month} (history is pruned, not idle) — {handling}")
@@ -574,8 +617,18 @@ fn name_list(counts: &BTreeMap<String, u64>) -> String {
     }
 }
 
-fn money(value: f64) -> String {
-    number(value.round() as i64)
+/// Renders an amount in `currency`. Symbols where they are unambiguous, the
+/// ISO code otherwise — an invoice figure should never leave the reader
+/// guessing which currency it is in.
+fn money(value: f64, currency: &str) -> String {
+    let amount = number(value.round() as i64);
+    match currency.to_ascii_uppercase().as_str() {
+        "USD" => format!("${amount}"),
+        "EUR" => format!("\u{20ac}{amount}"),
+        "GBP" => format!("\u{a3}{amount}"),
+        "NOK" | "SEK" | "DKK" | "ISK" => format!("{amount} kr"),
+        other => format!("{amount} {other}"),
+    }
 }
 
 fn tokens_short(tokens: u64) -> String {
@@ -591,11 +644,11 @@ fn tokens_short(tokens: u64) -> String {
     }
 }
 
-fn metric_short(value: f64, basis: Basis) -> String {
+fn metric_short(value: f64, basis: Basis, currency: &str) -> String {
     match basis {
         Basis::Output | Basis::Tokens => tokens_short(value as u64),
         Basis::Wall | Basis::Human => format!("{:.0}h", value / 3600.0),
-        Basis::Value => format!("${}", money(value)),
+        Basis::Value => money(value, currency),
     }
 }
 
@@ -605,24 +658,32 @@ pub fn print_table(allocation: &Allocation) {
         [only] => only.clone(),
         [first, .., last] => format!("{first} → {last}"),
     };
-    let total: u32 = allocation.subscriptions.values().sum();
+    let total: u32 = allocation
+        .subscriptions
+        .values()
+        .map(|plan| plan.count)
+        .sum();
     println!();
     println!("  ALLOCATION  {}", allocation.projects.join(", "));
+    let tax = if allocation.vat_percent > 0.0 {
+        format!(" incl. {}% tax", trim_percent(allocation.vat_percent))
+    } else {
+        String::new()
+    };
     println!(
-        "  {window} · {} subscription{} @ ${}/mo · ${} billed · basis: {}",
+        "  {window} · {} subscription{} · {} billed{tax} · basis: {}",
         total,
         if total == 1 { "" } else { "s" },
-        money(allocation.price_per_subscription),
-        money(allocation.billed),
+        money(allocation.billed, &allocation.currency),
         allocation.basis.label()
     );
     println!();
 
     println!(
-        "  {:<9} {:<8} {:>4} {:>12} {:>12} {:>8} {:>10}",
-        "month", "family", "subs", "project", "pool", "share", "owed"
+        "  {:<9} {:<8} {:>4} {:>10} {:>12} {:>12} {:>8} {:>11}",
+        "month", "family", "subs", "plan/mo", "project", "pool", "share", "owed"
     );
-    println!("  {}", "─".repeat(68));
+    println!("  {}", "─".repeat(81));
     for period in &allocation.periods {
         let note = if period.note.is_empty() {
             String::new()
@@ -630,29 +691,37 @@ pub fn print_table(allocation: &Allocation) {
             format!("  ← {}", period.note)
         };
         println!(
-            "  {:<9} {:<8} {:>4} {:>12} {:>12} {:>7.1}% {:>10}{note}",
+            "  {:<9} {:<8} {:>4} {:>10} {:>12} {:>12} {:>7.1}% {:>11}{note}",
             period.month,
             period.family,
             period.subscriptions,
-            metric_short(period.project_metric, allocation.basis),
-            metric_short(period.pool_metric, allocation.basis),
+            money(period.plan_price, &allocation.currency),
+            metric_short(
+                period.project_metric,
+                allocation.basis,
+                &allocation.currency
+            ),
+            metric_short(period.pool_metric, allocation.basis, &allocation.currency),
             period.share * 100.0,
-            format!("${}", money(period.amount)),
+            money(period.amount, &allocation.currency),
         );
     }
-    println!("  {}", "─".repeat(68));
+    println!("  {}", "─".repeat(81));
     println!(
-        "  {:<48} {:>7.1}% {:>10}",
+        "  {:<60} {:>7.1}% {:>11}",
         "ATTRIBUTABLE",
         allocation.effective_share * 100.0,
-        format!("${}", money(allocation.attributable))
+        money(allocation.attributable, &allocation.currency)
     );
     if allocation.documented < allocation.billed {
         println!(
-            "  of ${} documented — ${} of ${} billed has no surviving history",
-            money(allocation.documented),
-            money(allocation.billed - allocation.documented),
-            money(allocation.billed)
+            "  of {} documented — {} of {} billed has no surviving history",
+            money(allocation.documented, &allocation.currency),
+            money(
+                allocation.billed - allocation.documented,
+                &allocation.currency
+            ),
+            money(allocation.billed, &allocation.currency)
         );
     }
 
@@ -675,7 +744,7 @@ pub fn print_table(allocation: &Allocation) {
                 tokens_short(model.project_tokens),
                 tokens_short(model.pool_tokens),
                 model.share * 100.0,
-                format!("${}", money(model.project_list_value)),
+                money(model.project_list_value, &allocation.currency),
                 if model.priced { "" } else { "  ← unpriced" },
             );
         }
@@ -692,11 +761,11 @@ pub fn print_table(allocation: &Allocation) {
     });
     for row in ordered {
         println!(
-            "   {} {:<20} {:>6.1}%   ${:>9}{}",
+            "   {} {:<20} {:>6.1}%   {:>11}{}",
             if row.measured { " " } else { "~" },
             row.label,
             row.share * 100.0,
-            money(row.amount),
+            money(row.amount, &allocation.currency),
             if row.basis == allocation.basis {
                 "  ←"
             } else {
@@ -746,6 +815,15 @@ pub fn print_csv(allocation: &Allocation) -> Result<()> {
     Ok(())
 }
 
+/// `25` rather than `25.0`, while `8.5` stays `8.5`.
+fn trim_percent(value: f64) -> String {
+    if value.fract().abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value}")
+    }
+}
+
 fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
         text.to_string()
@@ -780,8 +858,24 @@ mod tests {
     fn options(basis: Basis, gap: GapPolicy) -> AllocationOptions {
         AllocationOptions {
             projects: vec!["Ada".to_string()],
-            subscriptions: BTreeMap::from([("claude".to_string(), 2), ("openai".to_string(), 4)]),
-            price: 200.0,
+            subscriptions: BTreeMap::from([
+                (
+                    "claude".to_string(),
+                    Plan {
+                        count: 2,
+                        price: 200.0,
+                    },
+                ),
+                (
+                    "openai".to_string(),
+                    Plan {
+                        count: 4,
+                        price: 200.0,
+                    },
+                ),
+            ]),
+            vat_percent: 0.0,
+            currency: "USD".to_string(),
             basis,
             gap_policy: gap,
         }
@@ -1028,6 +1122,135 @@ mod tests {
             "got {:?}",
             allocation.warnings
         );
+    }
+
+    #[test]
+    fn tax_is_apportioned_because_it_is_money_that_actually_left_the_account() {
+        let rows = [
+            row("Ada", "claude-opus-5", "2026-08", 60, 60),
+            row("Other", "claude-opus-5", "2026-08", 40, 40),
+        ];
+        let mut options = options(Basis::Output, GapPolicy::Skip);
+        options.subscriptions = BTreeMap::from([(
+            "claude".to_string(),
+            Plan {
+                count: 2,
+                price: 200.0,
+            },
+        )]);
+
+        let untaxed = build(&rows, &options);
+        options.vat_percent = 25.0;
+        let taxed = build(&rows, &options);
+
+        // The share is a usage ratio and cannot move when only the price does.
+        assert_eq!(untaxed.effective_share, taxed.effective_share);
+        // 2 plans at 200 + 25% = 500; 60% of that is 300.
+        assert!((untaxed.attributable - 240.0).abs() < 1e-9);
+        assert!((taxed.attributable - 300.0).abs() < 1e-9);
+        assert!((taxed.billed - 500.0).abs() < 1e-9);
+        // The tax-inclusive unit price rides on the row, so a mixed-vendor
+        // run stays auditable line by line.
+        assert!((taxed.periods[0].plan_price - 250.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn each_vendor_is_priced_on_its_own_bill() {
+        // Outside the US the two vendors rarely cost the same: one converts
+        // dollars through your card, the other sets a local price. A single
+        // global price forces that arithmetic back onto the user by hand.
+        let mut options = options(Basis::Output, GapPolicy::Skip);
+        options.subscriptions = BTreeMap::from([
+            (
+                "claude".to_string(),
+                Plan {
+                    count: 2,
+                    price: 1866.0,
+                },
+            ),
+            (
+                "openai".to_string(),
+                Plan {
+                    count: 3,
+                    price: 1992.0,
+                },
+            ),
+        ]);
+        options.vat_percent = 25.0;
+        options.currency = "NOK".to_string();
+
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Other", "claude-opus-5", "2026-08", 40, 40),
+                row("Ada", "gpt-5.6-sol", "2026-08", 25, 25),
+                row("Other", "gpt-5.6-sol", "2026-08", 75, 75),
+            ],
+            &options,
+        );
+
+        // 2 x 1866 x 1.25 = 4665, and 3 x 1992 x 1.25 = 7470.
+        assert!((allocation.billed - 12_135.0).abs() < 1e-6);
+        let claude = allocation
+            .periods
+            .iter()
+            .find(|period| period.family == "claude")
+            .expect("claude row");
+        let openai = allocation
+            .periods
+            .iter()
+            .find(|period| period.family == "openai")
+            .expect("openai row");
+        assert!((claude.plan_price - 2332.5).abs() < 1e-6);
+        assert!((openai.plan_price - 2490.0).abs() < 1e-6);
+        // 60% of 4665 plus 25% of 7470.
+        assert!((allocation.attributable - (0.6 * 4665.0 + 0.25 * 7470.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_vendor_without_its_own_price_falls_back_to_the_run_default() {
+        // Mixing `claude=2` and `codex=3@1992` must not leave the unpriced
+        // vendor at zero.
+        let mut options = options(Basis::Output, GapPolicy::Skip);
+        options.subscriptions = BTreeMap::from([
+            (
+                "claude".to_string(),
+                Plan {
+                    count: 2,
+                    price: 200.0,
+                },
+            ),
+            (
+                "openai".to_string(),
+                Plan {
+                    count: 3,
+                    price: 1992.0,
+                },
+            ),
+        ]);
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 60, 60),
+                row("Other", "claude-opus-5", "2026-08", 40, 40),
+            ],
+            &options,
+        );
+        let claude = allocation
+            .periods
+            .iter()
+            .find(|period| period.family == "claude")
+            .expect("claude row");
+        assert!((claude.plan_price - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn amounts_carry_their_currency_rather_than_an_assumed_dollar() {
+        // A figure destined for an invoice must never leave the reader
+        // guessing which currency it is in.
+        assert_eq!("$1,250", money(1250.0, "USD"));
+        assert_eq!("1,250 kr", money(1250.0, "NOK"));
+        assert_eq!("1,250 CHF", money(1250.0, "CHF"));
+        assert_eq!("1,250 kr", money(1250.0, "nok"));
     }
 
     #[test]
