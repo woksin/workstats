@@ -2,14 +2,19 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::ops::AddAssign;
+use std::path::Path;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
 
 use crate::classify::active_registry;
+use crate::cli::CALENDAR_DIMENSIONS;
+use crate::compare::{Comparison, ShareChange, Unit};
+use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
 use crate::model::{
     CompositionEntry, Diagnostics, HumanTimeExplanation, MAX_STORED_MESSAGES, Report, ReportRow,
 };
+use crate::paths::home_dir;
 
 pub fn print_json(report: &Report) -> Result<()> {
     let stdout = io::stdout();
@@ -382,6 +387,10 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
     println!();
 
+    if let Some(comparison) = &report.comparison {
+        print_comparison(comparison);
+    }
+
     if summary.session_count != 0 {
         let concurrency = if summary.agent_wall_seconds == 0.0 {
             0.0
@@ -583,7 +592,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             counted((report.rows.len() - top) as u64, "more row", "more rows")
         );
     }
-    if let Some(calendar) = ["day", "month"]
+    if let Some(calendar) = CALENDAR_DIMENSIONS
         .into_iter()
         .find(|name| report.group_by.iter().any(|dimension| dimension == name))
         && !rows.is_empty()
@@ -679,17 +688,32 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             attribution.unresolved_checkouts
         );
     }
-    println!(
-        "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
-        compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
-        compact_number(report.methodology.review_credit_seconds / 60.0)
-    );
-    println!(
-        "Session edges add bounded setup/review time; autonomous AI output does not imply continuous human presence."
-    );
-    println!(
-        "AI wall removes overlap within each row; rows can overlap each other. Agent work sums parallel sessions."
-    );
+    for line in footer_notes(report, diagnostics) {
+        println!("{line}");
+    }
+    // Without these a mistyped --history or --events path produces a clean
+    // looking report with silently missing data.
+    for line in warning_lines(diagnostics, None) {
+        println!("{line}");
+    }
+}
+
+/// The closing notes of the report, one string per line: how the estimate was
+/// made, what it does not see, and what the run skipped or could not link.
+///
+/// Shared by the table and by the Markdown and HTML documents, so a caveat
+/// cannot be reworded in one and forgotten in the others.
+fn footer_notes(report: &Report, diagnostics: &Diagnostics) -> Vec<String> {
+    let summary = &report.summary;
+    let mut notes = vec![
+        format!(
+            "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
+            compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
+            compact_number(report.methodology.review_credit_seconds / 60.0)
+        ),
+        "Session edges add bounded setup/review time; autonomous AI output does not imply continuous human presence.".to_string(),
+        "AI wall removes overlap within each row; rows can overlap each other. Agent work sums parallel sessions.".to_string(),
+    ];
     // Printed whenever the run asked for either pass, even if neither found
     // anything: a reader who turned the flag on needs to know what the report
     // would have done with a match, and a zero is an answer to that question.
@@ -699,24 +723,21 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         || !report.inputs.agent_authors.is_empty()
         || report.inputs.co_authors
     {
-        println!(
-            "Agent-authored commits are output, never attendance: they add no human time, no work blocks, and no active work days. A Co-authored-by trailer describes a commit you already wrote — it never adds one."
-        );
+        notes.push("Agent-authored commits are output, never attendance: they add no human time, no work blocks, and no active work days. A Co-authored-by trailer describes a commit you already wrote — it never adds one.".to_string());
     }
     if report.inputs.repo_filter.is_some() || report.inputs.repo_exact_filter.is_some() {
-        println!(
-            "Scope note: work blocks are recomputed from the selected repositories, so filtered totals can differ from an all-repo row."
-        );
+        notes.push("Scope note: work blocks are recomputed from the selected repositories, so filtered totals can differ from an all-repo row.".to_string());
     }
-    println!(
-        "Local retained history only. Missing/pruned transcripts and work on other machines are not visible."
-    );
+    if let Some(note) = config_defaults_note(&report.inputs.config_defaults) {
+        notes.push(note);
+    }
+    notes.push("Local retained history only. Missing/pruned transcripts and work on other machines are not visible.".to_string());
     if diagnostics.malformed_lines != 0
         || diagnostics.unreadable_files != 0
         || diagnostics.git_errors != 0
         || diagnostics.approximate_cwds != 0
     {
-        println!(
+        notes.push(format!(
             "Diagnostics: {}, {}, {}, {}.",
             counted(
                 diagnostics.malformed_lines,
@@ -734,7 +755,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                 "approximate working directory",
                 "approximate working directories"
             ),
-        );
+        ));
     }
     if diagnostics.content_rejections != 0 {
         // "directories" above and "record" here are the same rule: the noun
@@ -744,16 +765,16 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         } else {
             ("records", "were")
         };
-        println!(
+        notes.push(format!(
             "Privacy: {} {records} carrying prompt or response text {verb} skipped, as designed.",
             number(diagnostics.content_rejections)
-        );
+        ));
     }
     if let Some(note) = repository_conflict_note(diagnostics.repository_conflicts) {
-        println!("{note}");
+        notes.push(note);
     }
     if diagnostics.unresolved_repository_cwds != 0 {
-        println!(
+        notes.push(format!(
             "Repository attribution: {} could not be linked{}; use --explain-repository-attribution.",
             counted(
                 diagnostics.unresolved_repository_cwds,
@@ -768,16 +789,634 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                     diagnostics.repository_history_ambiguities
                 )
             }
+        ));
+    }
+    notes
+}
+
+/// The warnings the table prints, each already prefixed and made safe to draw,
+/// with the footer that says how many were left out.
+///
+/// `home` is given for the documents, which are made to be shared: a diagnostic
+/// often quotes a path, and the directory the user's name and client projects
+/// sit under is not the reader's to learn. The terminal shows its own user's
+/// paths untouched.
+fn warning_lines(diagnostics: &Diagnostics, home: Option<&Path>) -> Vec<String> {
+    let mut lines: Vec<String> = diagnostics
+        .messages
+        .iter()
+        .take(MAX_PRINTED_MESSAGES)
+        .map(|message| match home {
+            Some(home) => format!("Warning: {}", safe_message(&redact_home(message, home))),
+            None => format!("Warning: {}", safe_message(message)),
+        })
+        .collect();
+    lines.extend(hidden_messages_note(diagnostics.warning_count));
+    lines
+}
+
+/// The report as a `Document`, for the Markdown and HTML renderers.
+///
+/// It mirrors the sections `print_table` prints, in the same order and under
+/// the same headings, and takes every figure from the same fields through the
+/// same formatters — `hours`, `number`, `counted`, `compact_tokens` — so a
+/// number pasted into a PR is the number the terminal showed. Two deliberate
+/// differences: a row label is not clipped to 38 columns, because a document
+/// has no column to protect, and the explanation ledgers are absent, which
+/// `run` refuses up front rather than dropping them here.
+fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) -> Document {
+    let summary = &report.summary;
+    let home = home_dir();
+    let mut blocks = vec![
+        Block::Paragraph("Human involvement across local projects".to_string()),
+        Block::Section("Summary".to_string()),
+    ];
+
+    let mut facts = vec![
+        (
+            "Estimated human work".to_string(),
+            hours(summary.human_estimated_seconds),
+        ),
+        (
+            "Active work days".to_string(),
+            number(summary.human_active_days),
+        ),
+        (
+            "Average / active day".to_string(),
+            hours(summary.average_human_seconds_per_active_day),
+        ),
+        (
+            "Work blocks".to_string(),
+            format!(
+                "{} ({} + {} + {})",
+                number(summary.work_block_count),
+                counted(
+                    summary.foreground_session_edge_signal_count as u64,
+                    "foreground session edge",
+                    "foreground session edges"
+                ),
+                counted(summary.prompt_signal_count as u64, "prompt", "prompts"),
+                counted(summary.commit_signal_count as u64, "commit", "commits")
+            ),
+        ),
+        ("Git commits".to_string(), number(summary.commit_count)),
+        (
+            "Git lines".to_string(),
+            format!(
+                "+{} / -{}",
+                number(summary.additions),
+                number(summary.deletions)
+            ),
+        ),
+    ];
+    if summary.ignored_additions != 0 || summary.ignored_deletions != 0 {
+        facts.push((
+            "Ignored Git lines".to_string(),
+            format!(
+                "+{} / -{}",
+                number(summary.ignored_additions),
+                number(summary.ignored_deletions)
+            ),
+        ));
+    }
+    if summary.agent_commit_count != 0 {
+        facts.push((
+            "Agent-authored".to_string(),
+            format!(
+                "{}, +{} / -{} (output only — no human time)",
+                counted(summary.agent_commit_count as u64, "commit", "commits"),
+                number(summary.agent_additions),
+                number(summary.agent_deletions)
+            ),
+        ));
+    }
+    if summary.ai_assisted_commit_count != 0 || summary.autofix_assisted_commit_count != 0 {
+        let autofix = if summary.autofix_assisted_commit_count == 0 {
+            String::new()
+        } else {
+            format!(
+                " (+ {} Copilot Autofix)",
+                number(summary.autofix_assisted_commit_count)
+            )
+        };
+        facts.push((
+            "Co-authored by AI".to_string(),
+            format!(
+                "{} of the {} above{autofix}",
+                number(summary.ai_assisted_commit_count),
+                counted(summary.commit_count as u64, "commit", "commits")
+            ),
+        ));
+    }
+    if let Some(first) = &report.observed.first_seen {
+        let last = report.observed.last_seen.as_deref().unwrap_or(first);
+        facts.push((
+            "Observed".to_string(),
+            format!("{} → {}", local_date(first), local_date(last)),
+        ));
+    }
+    blocks.push(Block::Facts(facts));
+
+    if let Some(comparison) = &report.comparison {
+        push_comparison(&mut blocks, comparison);
+    }
+
+    if summary.session_count != 0 {
+        let concurrency = if summary.agent_wall_seconds == 0.0 {
+            0.0
+        } else {
+            summary.parallel_agent_seconds / summary.agent_wall_seconds
+        };
+        blocks.push(Block::Section(
+            "AI activity (context only — these are not human hours)".to_string(),
+        ));
+        let mut facts = vec![
+            (
+                "Agent wall clock".to_string(),
+                format!(
+                    "{} (any agent active, overlap removed)",
+                    hours(summary.agent_wall_seconds)
+                ),
+            ),
+            (
+                "Parallel agent work".to_string(),
+                format!(
+                    "{} ({concurrency:.1}× concurrency)",
+                    hours(summary.parallel_agent_seconds)
+                ),
+            ),
+            (
+                "Sessions".to_string(),
+                format!(
+                    "{} ({} foreground, {})",
+                    number(summary.session_count),
+                    number(summary.foreground_session_count),
+                    counted(
+                        summary.subagent_session_count as u64,
+                        "subagent",
+                        "subagents"
+                    )
+                ),
+            ),
+        ];
+        if summary.total_tokens != 0 {
+            facts.push((
+                "Tokens".to_string(),
+                format!(
+                    "{} ({} in, {} out, {} cached)",
+                    compact_tokens(summary.total_tokens),
+                    compact_tokens(summary.input_tokens),
+                    compact_tokens(summary.output_tokens),
+                    compact_tokens(summary.cache_read_tokens + summary.cache_creation_tokens)
+                ),
+            ));
+        }
+        let comparable_sessions =
+            summary.foreground_sessions_with_commits + summary.foreground_sessions_without_commits;
+        if comparable_sessions != 0 {
+            let without = if summary.foreground_sessions_without_commits == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; {} left no commit — reading, review, or uncommitted work",
+                    number(summary.foreground_sessions_without_commits)
+                )
+            };
+            facts.push((
+                "Committed output".to_string(),
+                format!(
+                    "{} of {} in repos with visible commits{without}",
+                    number(summary.foreground_sessions_with_commits),
+                    counted(
+                        comparable_sessions as u64,
+                        "foreground session",
+                        "foreground sessions"
+                    )
+                ),
+            ));
+        }
+        blocks.push(Block::Facts(facts));
+        if raw {
+            push_raw_lists(&mut blocks, summary);
+        }
+    }
+
+    if !summary.composition.is_empty() {
+        blocks.push(Block::Section(
+            "Work composition (changed Git lines by file area)".to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Area"),
+                Column::number("Files"),
+                Column::number("Added"),
+                Column::number("Removed"),
+                Column::number("Share"),
+            ],
+            summary
+                .composition
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.category.clone(),
+                        number(entry.files),
+                        format!("+{}", number(entry.additions)),
+                        format!("-{}", number(entry.deletions)),
+                        percent(entry.share_of_changed_lines),
+                    ]
+                })
+                .collect(),
+        )));
+        if let Some(ratio) = test_to_source_ratio(&summary.composition) {
+            blocks.push(Block::Paragraph(format!(
+                "Test lines per source line: {ratio:.2}"
+            )));
+        }
+    }
+
+    if !summary.change_shapes.is_empty() {
+        blocks.push(Block::Section(
+            "Change shapes (from diff composition only — commit messages are never read)"
+                .to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Shape"),
+                Column::number("Commits"),
+                Column::number("Share"),
+            ],
+            summary
+                .change_shapes
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.shape.to_string(),
+                        number(entry.commits),
+                        percent(entry.share_of_classified_commits),
+                    ]
+                })
+                .collect(),
+        )));
+    }
+
+    let show_tokens = report.rows.iter().any(|row| row.total_tokens != 0);
+    blocks.push(Block::Section(format!(
+        "By {} (human involvement first; AI wall clock shown as context)",
+        report.group_by.join(" × ")
+    )));
+    let mut columns = vec![
+        Column::text("Work area"),
+        Column::number("Human"),
+        Column::number("Days"),
+        Column::number("Avg/day"),
+        Column::number("Commits"),
+        Column::number("AI wall"),
+        Column::number("Agent work"),
+    ];
+    if show_tokens {
+        columns.push(Column::number("Tokens"));
+    }
+    let rows = if top == 0 {
+        &report.rows[..]
+    } else {
+        &report.rows[..report.rows.len().min(top)]
+    };
+    blocks.push(Block::Table(Table::new(
+        columns,
+        rows.iter()
+            .map(|row| {
+                let mut cells = vec![
+                    document_label(row, &report.group_by, &home),
+                    hours(row.human_estimated_seconds),
+                    number(row.human_active_days),
+                    hours(row.average_human_seconds_per_active_day),
+                    number(row.commit_count),
+                    hours(row.ai_wall_seconds),
+                    hours(row.parallel_agent_seconds),
+                ];
+                if show_tokens {
+                    cells.push(compact_tokens(row.total_tokens));
+                }
+                cells
+            })
+            .collect(),
+    )));
+    if top != 0 && report.rows.len() > top {
+        blocks.push(Block::Paragraph(format!(
+            "… {}; use --top 0",
+            counted((report.rows.len() - top) as u64, "more row", "more rows")
+        )));
+    }
+    if let Some(calendar) = CALENDAR_DIMENSIONS
+        .into_iter()
+        .find(|name| report.group_by.iter().any(|dimension| dimension == name))
+        && !rows.is_empty()
+    {
+        let scope = if rows.len() < report.rows.len() {
+            format!(
+                "the {} above only, oldest → newest",
+                counted(rows.len() as u64, "row", "rows")
+            )
+        } else {
+            "oldest → newest".to_string()
+        };
+        blocks.push(Block::Paragraph(format!(
+            "Human-work trend {} ({scope}; the table lists rows newest first)",
+            spark(&trend_totals(rows, calendar))
+        )));
+    }
+
+    let agent_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.agent_commit_count != 0)
+        .collect();
+    if !agent_rows.is_empty() {
+        blocks.push(Block::Section(
+            "Agent-authored Git output (landed code you did not type — no human time, no work blocks)"
+                .to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Work area"),
+                Column::number("Commits"),
+                Column::number("Added"),
+                Column::number("Removed"),
+            ],
+            agent_rows
+                .iter()
+                .map(|row| {
+                    vec![
+                        document_label(row, &report.group_by, &home),
+                        number(row.agent_commit_count),
+                        format!("+{}", number(row.agent_additions)),
+                        format!("-{}", number(row.agent_deletions)),
+                    ]
+                })
+                .collect(),
+        )));
+        let shown: usize = agent_rows.iter().map(|row| row.agent_commit_count).sum();
+        if let Some(hidden) = summary
+            .agent_commit_count
+            .checked_sub(shown)
+            .filter(|hidden| *hidden != 0)
+        {
+            blocks.push(Block::Paragraph(format!(
+                "… {hidden} more in rows not shown; use --top 0"
+            )));
+        }
+    }
+
+    blocks.push(Block::Section("Notes".to_string()));
+    blocks.push(Block::List(
+        footer_notes(report, diagnostics)
+            .iter()
+            .map(|note| redact_home(note, &home))
+            .collect(),
+    ));
+    let warnings = warning_lines(diagnostics, Some(&home));
+    if !warnings.is_empty() {
+        blocks.push(Block::Section("Warnings".to_string()));
+        blocks.push(Block::List(warnings));
+    }
+
+    Document {
+        title: "WORKSTATS".to_string(),
+        blocks,
+    }
+}
+
+/// The `--raw` provider and model lists, as the tables the table view draws as
+/// indented columns.
+fn push_raw_lists(blocks: &mut Vec<Block>, summary: &crate::model::Summary) {
+    if !summary.provider_seconds.is_empty() {
+        blocks.push(Block::Section(
+            "Parallel agent work by provider (may overlap)".to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![Column::text("Provider"), Column::number("Agent work")],
+            summary
+                .provider_seconds
+                .iter()
+                .map(|(provider, seconds)| vec![provider.clone(), hours(*seconds)])
+                .collect(),
+        )));
+    }
+    if !summary.model_seconds.is_empty() {
+        blocks.push(Block::Section(
+            "Parallel agent work by model (all providers together)".to_string(),
+        ));
+        let (models, omitted) = ranked_models(&summary.model_seconds, f64::total_cmp);
+        blocks.push(Block::Table(Table::new(
+            vec![Column::text("Model"), Column::number("Agent work")],
+            models
+                .into_iter()
+                .map(|(model, seconds)| vec![model, hours(seconds)])
+                .collect(),
+        )));
+        push_omitted_models(blocks, omitted);
+    }
+    if summary.total_tokens != 0 {
+        if !summary.provider_tokens.is_empty() {
+            blocks.push(Block::Section("Tokens by provider".to_string()));
+            blocks.push(Block::Table(Table::new(
+                vec![Column::text("Provider"), Column::number("Tokens")],
+                summary
+                    .provider_tokens
+                    .iter()
+                    .map(|(provider, tokens)| vec![provider.clone(), compact_tokens(*tokens)])
+                    .collect(),
+            )));
+        }
+        if !summary.model_tokens.is_empty() {
+            blocks.push(Block::Section(
+                "Tokens by model (all providers together)".to_string(),
+            ));
+            let (models, omitted) = ranked_models(&summary.model_tokens, u64::cmp);
+            blocks.push(Block::Table(Table::new(
+                vec![Column::text("Model"), Column::number("Tokens")],
+                models
+                    .into_iter()
+                    .map(|(model, tokens)| vec![model, compact_tokens(tokens)])
+                    .collect(),
+            )));
+            push_omitted_models(blocks, omitted);
+        }
+    }
+}
+
+fn push_omitted_models(blocks: &mut Vec<Block>, omitted: usize) {
+    if omitted != 0 {
+        blocks.push(Block::Paragraph(format!(
+            "… {}; use --format json for all of them.",
+            counted(omitted as u64, "more model", "more models")
+        )));
+    }
+}
+
+/// What the comparison block says in place of a bare "previous": the window's
+/// name and, when it was chosen by `previous`, that it was.
+fn comparison_windows(comparison: &Comparison) -> (String, String) {
+    let previous = if comparison.basis == "previous" {
+        format!("{} (the window before)", comparison.previous.label)
+    } else {
+        comparison.previous.label.clone()
+    };
+    (comparison.current.label.clone(), previous)
+}
+
+/// A figure in the unit it is measured in.
+fn compared_value(unit: Unit, value: f64) -> String {
+    match unit {
+        Unit::Seconds => hours(value),
+        Unit::Count => number(value.round().max(0.0) as u64),
+        Unit::Ratio => format!("{value:.1}×"),
+    }
+}
+
+/// `+2h 05m (+21%)`, `-3 (-50%)`, `+4 (n/a)`, or `no change`. The percentage is
+/// `n/a` when the earlier window was zero, because a change from nothing has
+/// no percentage, and an amount that rounds to nothing is no change at all
+/// rather than a signed zero.
+fn compared_change(unit: Unit, change: f64, percent: Option<f64>) -> String {
+    let rounded = match unit {
+        Unit::Seconds | Unit::Count => change.round(),
+        Unit::Ratio => (change * 10.0).round() / 10.0,
+    };
+    if rounded == 0.0 {
+        return "no change".to_string();
+    }
+    let sign = if rounded < 0.0 { '-' } else { '+' };
+    let percent = percent.map_or_else(|| "n/a".to_string(), |value| format!("{value:+.0}%"));
+    format!("{sign}{} ({percent})", compared_value(unit, rounded.abs()))
+}
+
+fn compared_share(share: Option<f64>) -> String {
+    share.map_or_else(|| "n/a".to_string(), percent)
+}
+
+fn compared_points(share: &ShareChange) -> String {
+    match share.change_points {
+        None => "n/a".to_string(),
+        Some(points) if points.round() == 0.0 => "no change".to_string(),
+        Some(points) => format!("{points:+.0} pp"),
+    }
+}
+
+/// The measure, current, previous and change cells of each compared figure.
+fn comparison_rows(comparison: &Comparison) -> Vec<Vec<String>> {
+    comparison
+        .lines()
+        .into_iter()
+        .map(|line| {
+            vec![
+                line.label.to_string(),
+                compared_value(line.unit, line.current),
+                compared_value(line.unit, line.previous),
+                compared_change(line.unit, line.change.change, line.change.percent),
+            ]
+        })
+        .collect()
+}
+
+fn comparison_share_rows(comparison: &Comparison) -> Vec<Vec<String>> {
+    comparison
+        .share_lines()
+        .into_iter()
+        .map(|line| {
+            vec![
+                line.label,
+                compared_share(line.share.current),
+                compared_share(line.share.previous),
+                compared_points(&line.share),
+            ]
+        })
+        .collect()
+}
+
+/// The `--compare` block of the table view: the headline figures of both
+/// windows side by side with the change, then the work-area shares. It sits
+/// straight after the summary it extends, so the first screen answers "how does
+/// this compare" before the grouped rows start.
+fn print_comparison(comparison: &Comparison) {
+    let (current, previous) = comparison_windows(comparison);
+    println!("Comparison  (changes are estimates — not stopwatch times)");
+    println!("  Current   {current}");
+    println!("  Previous  {previous}");
+    println!();
+    let table = |header: &str, rows: Vec<Vec<String>>| {
+        println!(
+            "  {header:<26} {:>11} {:>11}  Change",
+            "Current", "Previous"
         );
+        println!("  {}", "─".repeat(75));
+        for row in rows {
+            println!("  {:<26} {:>11} {:>11}  {}", row[0], row[1], row[2], row[3]);
+        }
+    };
+    table("Measure", comparison_rows(comparison));
+    let shares = comparison_share_rows(comparison);
+    if !shares.is_empty() {
+        println!();
+        table("Share", shares);
     }
-    // Without these a mistyped --history or --events path produces a clean
-    // looking report with silently missing data.
-    for message in diagnostics.messages.iter().take(MAX_PRINTED_MESSAGES) {
-        println!("Warning: {}", safe_message(message));
+    println!();
+    // The note is a paragraph, and the table view has no column to wrap it at.
+    let mut line = String::new();
+    for word in comparison.note.split_whitespace() {
+        if !line.is_empty() && line.len() + word.len() >= 88 {
+            println!("  {line}");
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
     }
-    if let Some(note) = hidden_messages_note(diagnostics.warning_count) {
-        println!("{note}");
+    println!("  {line}");
+    println!();
+}
+
+/// The same block for Markdown and HTML, from the same rows.
+fn push_comparison(blocks: &mut Vec<Block>, comparison: &Comparison) {
+    let (current, previous) = comparison_windows(comparison);
+    blocks.push(Block::Section("Comparison".to_string()));
+    blocks.push(Block::Paragraph(format!(
+        "Current: {current}. Previous: {previous}."
+    )));
+    let columns = |first: &str| {
+        vec![
+            Column::text(first),
+            Column::number("Current"),
+            Column::number("Previous"),
+            Column::number("Change"),
+        ]
+    };
+    blocks.push(Block::Table(Table::new(
+        columns("Measure"),
+        comparison_rows(comparison),
+    )));
+    let shares = comparison_share_rows(comparison);
+    if !shares.is_empty() {
+        blocks.push(Block::Table(Table::new(columns("Share"), shares)));
     }
+    blocks.push(Block::Paragraph(comparison.note.to_string()));
+}
+
+/// `--format markdown`: the report as GitHub-flavoured Markdown, for a PR, an
+/// issue, or a wiki page.
+pub fn print_markdown(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
+    print!(
+        "{}",
+        render_markdown(&report_document(report, diagnostics, top, raw))
+    );
+}
+
+/// `--format html`: the report as one self-contained static page.
+pub fn print_html(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
+    print!(
+        "{}",
+        render_html(&report_document(report, diagnostics, top, raw))
+    );
 }
 
 /// One line for every Copilot session whose stored repository slug disagreed
@@ -818,6 +1457,60 @@ fn hidden_messages_note(raised: u64) -> Option<String> {
 
 /// Human seconds per calendar period, oldest first, from the rows the table
 /// printed rather than from every row in the report.
+/// `Config defaults: providers=claude,codex; group_by=repo,month`, or nothing
+/// when the config supplied no value this run used. A report that reads
+/// differently from the flags on the command line should say why.
+pub(crate) fn config_defaults_note(defaults: &BTreeMap<String, String>) -> Option<String> {
+    (!defaults.is_empty()).then(|| {
+        format!(
+            "Config defaults: {}",
+            defaults
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })
+}
+
+/// Replaces the user's home directory with `~`. Only at a path boundary, so
+/// `/home/ada` does not eat the start of `/home/adam` or of `/mnt/home/ada`.
+pub(crate) fn redact_home(text: &str, home: &Path) -> String {
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches(['/', '\\']);
+    // A home of `/` or nothing would turn every path into `~...`.
+    if home.is_empty() {
+        return text.to_string();
+    }
+    let name_start =
+        |character: char| character.is_alphanumeric() || matches!(character, '_' | '-' | '.');
+    // A full stop after the path is the end of a sentence, not of a name.
+    let name_end = |character: char| character.is_alphanumeric() || matches!(character, '_' | '-');
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut before: Option<char> = None;
+    while let Some(position) = rest.find(home) {
+        let (head, tail) = rest.split_at(position);
+        let after = &tail[home.len()..];
+        let previous = head.chars().next_back().or(before);
+        let at_start = previous.is_none_or(|character| !name_start(character));
+        let at_end = after
+            .chars()
+            .next()
+            .is_none_or(|character| !name_end(character));
+        redacted.push_str(head);
+        if at_start && at_end {
+            redacted.push('~');
+        } else {
+            redacted.push_str(home);
+        }
+        before = home.chars().next_back();
+        rest = after;
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
 fn trend_totals(rows: &[ReportRow], calendar: &str) -> Vec<f64> {
     let mut totals: BTreeMap<&str, f64> = BTreeMap::new();
     for row in rows {
@@ -877,7 +1570,7 @@ const REPLACEMENT: char = '·';
 ///
 /// Each replacement is one character wide, so a caller that has already counted
 /// a column's width still gets the number of cells it counted.
-fn safe_text(value: &str) -> String {
+pub(crate) fn safe_text(value: &str) -> String {
     value
         .chars()
         .map(|character| {
@@ -1030,6 +1723,16 @@ fn clipped_label(row: &ReportRow, dimensions: &[String]) -> String {
 }
 
 fn label(row: &ReportRow, dimensions: &[String]) -> String {
+    row_label(row, dimensions, None)
+}
+
+/// A row label for a document: `cwd` and `root` are paths, and like every other
+/// path in a document they must not carry the reader-unknown home directory.
+fn document_label(row: &ReportRow, dimensions: &[String], home: &Path) -> String {
+    row_label(row, dimensions, Some(home))
+}
+
+fn row_label(row: &ReportRow, dimensions: &[String], home: Option<&Path>) -> String {
     dimensions
         .iter()
         .map(|name| {
@@ -1037,6 +1740,10 @@ fn label(row: &ReportRow, dimensions: &[String]) -> String {
             match name.as_str() {
                 "month" => named_month(&value).unwrap_or(value),
                 "model" => display_model(&value),
+                "cwd" | "root" => match home {
+                    Some(home) => redact_home(&value, home),
+                    None => value,
+                },
                 _ => value,
             }
         })
@@ -1210,6 +1917,7 @@ fn spark(values: &[f64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::escape_markdown;
     use crate::model::{Inputs, Methodology, Observed, Summary};
 
     #[test]
@@ -1437,14 +2145,17 @@ mod tests {
                 included_providers: Vec::new(),
                 excluded_providers: Vec::new(),
                 author: String::new(),
+                authors: Vec::new(),
                 agent_authors: Vec::new(),
                 co_authors: false,
                 repo_filter: None,
                 repo_exact_filter: None,
                 human_idle: String::new(),
                 review_credit: String::new(),
+                config_defaults: BTreeMap::new(),
                 cache: None,
             },
+            comparison: None,
         }
     }
 
@@ -1727,6 +2438,205 @@ mod tests {
         // `--top 2` hides the tall March row, so its bar goes too.
         assert_eq!(vec![30.0, 60.0], trend_totals(&rows[..2], "month"));
         assert_eq!("▄█", spark(&trend_totals(&rows[..2], "month")));
+    }
+
+    fn hostile_report() -> Report {
+        let mut report = report_with(vec!["repo".to_string()]);
+        let mut row = row_with(Vec::new());
+        row.key
+            .insert("repo".to_string(), "<script>&\"x\"|y".to_string());
+        row.agent_commit_count = 2;
+        report.summary.agent_commit_count = 2;
+        report.rows.push(row);
+        report
+            .diagnostics
+            .messages
+            .push("bad <b>path</b>\n| x".to_string());
+        report.diagnostics.warning_count = 1;
+        report
+    }
+
+    #[test]
+    fn a_hostile_repository_name_is_escaped_in_the_html_document() {
+        let report = hostile_report();
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(html.contains("&lt;script&gt;&amp;&quot;x&quot;|y"));
+        assert!(html.contains("Warning: bad &lt;b&gt;path&lt;/b&gt;·| x"));
+    }
+
+    #[test]
+    fn a_hostile_repository_name_cannot_break_a_markdown_table() {
+        let report = hostile_report();
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        // Once in the work table and once in the agent-authored section.
+        assert_eq!(
+            2,
+            markdown.matches("| \\<script\\>\\&\"x\"\\|y |").count(),
+            "{markdown}"
+        );
+        // The newline in the warning became a character, not a new line.
+        assert!(markdown.contains("- Warning: bad \\<b\\>path\\</b\\>·\\| x\n"));
+    }
+
+    #[test]
+    fn the_document_has_the_sections_the_table_has() {
+        let mut report = hostile_report();
+        report.summary.session_count = 1;
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        for heading in [
+            "## Summary",
+            "## AI activity (context only — these are not human hours)",
+            "## By repo (human involvement first; AI wall clock shown as context)",
+            "## Agent-authored Git output",
+            "## Notes",
+            "## Warnings",
+        ] {
+            assert!(markdown.contains(heading), "missing {heading}\n{markdown}");
+        }
+        // The notes are the same sentences the table prints.
+        for note in footer_notes(&report, &report.diagnostics) {
+            assert!(markdown.contains(&escape_markdown(&note)), "missing {note}");
+        }
+    }
+
+    /// The table and the document decide whether a trend belongs from the same
+    /// list, so a grouping that draws one in the terminal draws it in a PR.
+    #[test]
+    fn the_document_draws_the_trend_for_every_calendar_grouping() {
+        for calendar in CALENDAR_DIMENSIONS {
+            let mut report = report_with(vec![calendar.to_string()]);
+            let mut row = row_with(Vec::new());
+            row.key.insert(calendar.to_string(), "2026-05".to_string());
+            row.human_estimated_seconds = 60.0;
+            report.rows.push(row);
+            let markdown =
+                render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+            assert!(
+                markdown.contains("Human-work trend"),
+                "{calendar}\n{markdown}"
+            );
+        }
+        let report = report_with(vec!["repo".to_string()]);
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!markdown.contains("Human-work trend"));
+    }
+
+    #[test]
+    fn config_defaults_are_listed_in_the_notes_when_any_applied() {
+        let mut report = report_with(vec!["repo".to_string()]);
+        assert!(
+            !footer_notes(&report, &report.diagnostics)
+                .iter()
+                .any(|note| note.starts_with("Config defaults"))
+        );
+        report.inputs.config_defaults = BTreeMap::from([
+            ("providers".to_string(), "claude,codex".to_string()),
+            ("group_by".to_string(), "repo,month".to_string()),
+        ]);
+        let notes = footer_notes(&report, &report.diagnostics);
+        assert!(
+            notes.contains(
+                &"Config defaults: group_by=repo,month; providers=claude,codex".to_string()
+            ),
+            "{notes:?}"
+        );
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(
+            markdown.contains(&escape_markdown(
+                "Config defaults: group_by=repo,month; providers=claude,codex"
+            )),
+            "{markdown}"
+        );
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(html.contains("Config defaults: group_by=repo,month; providers=claude,codex"));
+    }
+
+    #[test]
+    fn the_home_directory_is_redacted_at_path_boundaries_only() {
+        let home = Path::new("/home/ada");
+        assert_eq!(
+            "cannot read ~/client/app/x.jsonl: denied, ~.",
+            redact_home(
+                "cannot read /home/ada/client/app/x.jsonl: denied, /home/ada.",
+                home
+            )
+        );
+        assert_eq!("~", redact_home("/home/ada", home));
+        assert_eq!(
+            "/home/adam/x /mnt/home/ada/x /home/ada-b",
+            redact_home("/home/adam/x /mnt/home/ada/x /home/ada-b", home)
+        );
+        assert_eq!("/srv/x", redact_home("/srv/x", Path::new("/")));
+        assert_eq!("/srv/x", redact_home("/srv/x", Path::new("")));
+    }
+
+    #[test]
+    fn the_documents_redact_the_home_directory_in_warnings_but_the_table_does_not() {
+        let mut report = hostile_report();
+        let home = home_dir();
+        let path = format!("{}/client-project/history.jsonl", home.display());
+        report.diagnostics.messages = vec![format!("could not read {path}")];
+        report.inputs.config_defaults = BTreeMap::from([("dir".to_string(), path.clone())]);
+        let document = report_document(&report, &report.diagnostics, 0, false);
+        for (text, escape) in [
+            (render_markdown(&document), true),
+            (render_html(&document), false),
+        ] {
+            let expect = |expected: &str| {
+                if escape {
+                    escape_markdown(expected)
+                } else {
+                    expected.to_string()
+                }
+            };
+            assert!(
+                text.contains(&expect("could not read ~/client-project/history.jsonl")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&expect("dir=~/client-project/history.jsonl")),
+                "{text}"
+            );
+            assert!(!text.contains(&*home.to_string_lossy()), "{text}");
+        }
+        assert!(
+            warning_lines(&report.diagnostics, None)[0].contains(&path),
+            "the terminal shows its own user's paths"
+        );
+    }
+
+    #[test]
+    fn the_documents_redact_the_home_directory_in_path_row_labels_but_the_table_does_not() {
+        let home = home_dir();
+        let path = format!("{}/client-project/src", home.display());
+        let mut report = report_with(vec!["cwd".to_string(), "root".to_string()]);
+        let mut row = row_with(Vec::new());
+        row.key.insert("cwd".to_string(), path.clone());
+        row.key
+            .insert("root".to_string(), home.display().to_string());
+        row.agent_commit_count = 1;
+        report.summary.agent_commit_count = 1;
+        report.rows.push(row);
+        let document = report_document(&report, &report.diagnostics, 0, false);
+        for text in [render_markdown(&document), render_html(&document)] {
+            assert!(text.contains("~/client-project/src"), "{text}");
+            assert!(!text.contains(&*home.to_string_lossy()), "{text}");
+        }
+        assert!(label(&report.rows[0], &report.group_by).contains(&path));
+    }
+
+    #[test]
+    fn top_limits_the_document_rows_and_says_so() {
+        let mut report = hostile_report();
+        report.rows.push(row_with(Vec::new()));
+        report.rows.push(row_with(Vec::new()));
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 1, false));
+        assert!(
+            markdown.contains("… 2 more rows; use --top 0"),
+            "{markdown}"
+        );
     }
 
     fn calendar_row(month: &str, human_estimated_seconds: f64) -> ReportRow {

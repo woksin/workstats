@@ -639,7 +639,12 @@ pub struct Inputs {
     pub history_sources: BTreeMap<String, Vec<String>>,
     pub included_providers: Vec<String>,
     pub excluded_providers: Vec<String>,
+    /// The author patterns joined with `", "`, kept so consumers written
+    /// against the single-author report keep working; `authors` is the
+    /// structured form.
     pub author: String,
+    /// Every `--author` pattern the human pass ran with, in the order given.
+    pub authors: Vec<String>,
     /// The `--author` patterns the second, agent-identity pass ran with; empty
     /// when the run did not ask for one. Recorded because the patterns are
     /// overridable, so a report is only reproducible if it says which ones it
@@ -651,6 +656,10 @@ pub struct Inputs {
     pub repo_exact_filter: Option<String>,
     pub human_idle: String,
     pub review_credit: String,
+    /// The settings that came from the config file's `defaults` block because
+    /// neither the flag nor its environment variable was given, as key to the
+    /// value used. Empty when nothing was taken from the config.
+    pub config_defaults: BTreeMap<String, String>,
     pub cache: Option<String>,
 }
 
@@ -667,6 +676,10 @@ pub struct Report {
     pub rows: Vec<ReportRow>,
     pub diagnostics: Diagnostics,
     pub inputs: Inputs,
+    /// Present only under `--compare`; everything above is then the selected
+    /// window's report exactly as it would be without the flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<crate::compare::Comparison>,
 }
 
 #[cfg(test)]

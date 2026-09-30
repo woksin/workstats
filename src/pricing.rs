@@ -12,11 +12,40 @@
 //! and data-residency multipliers are deliberately ignored, because a
 //! subscription-backed CLI session does not use them.
 
+use std::collections::BTreeMap;
 use std::fmt;
+
+use anyhow::{Context, Result, bail};
+use chrono::NaiveDate;
+use serde::Deserialize;
 
 /// When the rate table below was last checked against the vendors' price
 /// pages. Surfaced in output so a stale table is visible rather than silent.
 pub const RATES_AS_OF: &str = "2026-09-02";
+
+/// How old the table may get before output warns about it. Vendors reprice and
+/// release models every few months, and a value-weighted split computed from
+/// last year's prices looks exactly as authoritative as one computed from
+/// this month's; a quarter is long enough not to nag and short enough to catch
+/// a table that has been missed by a release.
+pub const STALE_AFTER_DAYS: i64 = 90;
+
+/// A warning when the built-in table is older than [`STALE_AFTER_DAYS`] on
+/// `today`, or `None` while it is fresh.
+///
+/// `today` is passed in rather than read here so the clock stays in one place
+/// and the threshold can be tested on either side without waiting for it.
+pub fn stale_rates_warning(today: NaiveDate) -> Option<String> {
+    let as_of = NaiveDate::parse_from_str(RATES_AS_OF, "%Y-%m-%d").ok()?;
+    let age = today.signed_duration_since(as_of).num_days();
+    // A table dated in the future (a skewed clock) is not evidence of staleness.
+    (age > STALE_AFTER_DAYS).then(|| {
+        format!(
+            "built-in list rates are dated {RATES_AS_OF} ({age} days old, past the {STALE_AFTER_DAYS}-day limit) and vendors may have repriced since; \
+             set current prices under \"model_rates\" in the config file, or upgrade workstats for a refreshed table"
+        )
+    })
+}
 
 /// Which subscription pool a model's usage draws down.
 ///
@@ -278,6 +307,188 @@ const RATES: &[(&str, Family, Rate)] = &[
     ),
 ];
 
+/// One user-supplied rate, as written in the config file.
+///
+/// Every field is optional here so that a missing one is reported by
+/// [`RateOverrides::from_config`] *with the model key*; serde alone would say
+/// "missing field" and discard the whole config.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRateConfig {
+    /// USD per million tokens, like the built-in table.
+    pub input: Option<f64>,
+    pub cache_write: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub output: Option<f64>,
+    /// Which subscription pool the model draws on (`claude`, `openai`,
+    /// `google`, or an alias such as `codex`). Optional: it falls back to the
+    /// built-in table, then to the vendor prefix.
+    pub family: Option<String>,
+}
+
+/// Where a model's rate came from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RateSource {
+    Override,
+    BuiltIn,
+}
+
+impl RateSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RateSource::Override => "override",
+            RateSource::BuiltIn => "built-in",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedRate<'a> {
+    pub rate: Rate,
+    pub source: RateSource,
+    /// The override key that matched, as the user wrote it.
+    pub pattern: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
+struct RateOverride {
+    pattern: String,
+    prefix: String,
+    family: Option<Family>,
+    rate: Rate,
+}
+
+/// User rates that take precedence over the built-in table.
+///
+/// Matching is the built-in table's: the key is a model-name *prefix*,
+/// compared after lowercasing and treating `.` as `-`, and the longest matching
+/// key wins. There is no wildcard syntax because the prefix rule already
+/// covers dated snapshots, and a second matching language would need its own
+/// precedence rules. Any matching override beats any built-in entry, however
+/// long the built-in prefix is: the user wrote it to be believed.
+#[derive(Clone, Debug, Default)]
+pub struct RateOverrides {
+    entries: Vec<RateOverride>,
+}
+
+impl RateOverrides {
+    /// Reads the raw `model_rates` value, one entry at a time, so that a
+    /// misspelt field or a wrong type is refused as `model_rates.<key>: ...`
+    /// instead of serde discarding the whole config file.
+    pub fn from_value(value: &serde_json::Value) -> Result<Self> {
+        let Some(entries) = value.as_object() else {
+            bail!("model_rates must be an object keyed by model name");
+        };
+        if entries.len() > 256 {
+            bail!("at most 256 model rates are supported");
+        }
+        let mut config = BTreeMap::new();
+        for (key, entry) in entries {
+            let parsed: ModelRateConfig = serde_json::from_value(entry.clone())
+                .with_context(|| format!("invalid model_rates.{key}"))?;
+            config.insert(key.clone(), parsed);
+        }
+        Self::from_config(&config)
+    }
+
+    /// Validates the `model_rates` config map. Errors name the offending key.
+    pub fn from_config(config: &BTreeMap<String, ModelRateConfig>) -> Result<Self> {
+        if config.len() > 256 {
+            bail!("at most 256 model rates are supported");
+        }
+        let mut entries: Vec<RateOverride> = Vec::new();
+        for (key, value) in config {
+            let pattern = key.trim();
+            if pattern.is_empty()
+                || pattern.len() > 128
+                || pattern.chars().any(|character| character.is_control())
+            {
+                bail!(
+                    "model rate key {key:?} must be a model name of 1 to 128 printable characters"
+                );
+            }
+            let prefix = canonical(pattern);
+            if let Some(other) = entries.iter().find(|entry| entry.prefix == prefix) {
+                bail!(
+                    "model rates {:?} and {key:?} match the same models",
+                    other.pattern
+                );
+            }
+            let amount = |name: &str, value: Option<f64>| -> Result<f64> {
+                let Some(value) = value else {
+                    bail!("model rate {key:?} is missing \"{name}\"");
+                };
+                if !value.is_finite() || value < 0.0 {
+                    bail!(
+                        "model rate {key:?}: \"{name}\" must be a non-negative number of USD per million tokens, got {value}"
+                    );
+                }
+                Ok(value)
+            };
+            let rate = Rate::new(
+                amount("input", value.input)?,
+                amount("cache_write", value.cache_write)?,
+                amount("cache_read", value.cache_read)?,
+                amount("output", value.output)?,
+            );
+            let family = match value.family.as_deref() {
+                None => None,
+                Some(text) => Some(Family::parse(text).with_context(|| {
+                    format!(
+                        "model rate {key:?} has unknown family {text:?}; expected one of {}",
+                        Family::ALL.map(Family::as_str).join(", ")
+                    )
+                })?),
+            };
+            entries.push(RateOverride {
+                pattern: pattern.to_string(),
+                prefix,
+                family,
+                rate,
+            });
+        }
+        Ok(Self { entries })
+    }
+
+    fn matching(&self, model: &str) -> Option<&RateOverride> {
+        let name = canonical(model);
+        self.entries
+            .iter()
+            .filter(|entry| name.starts_with(&entry.prefix))
+            .max_by_key(|entry| entry.prefix.len())
+    }
+
+    /// The rate for a model: an override if one matches, else the built-in
+    /// table, else `None` (unpriced).
+    pub fn resolve(&self, model: &str) -> Option<ResolvedRate<'_>> {
+        if let Some(entry) = self.matching(model) {
+            return Some(ResolvedRate {
+                rate: entry.rate,
+                source: RateSource::Override,
+                pattern: Some(entry.pattern.as_str()),
+            });
+        }
+        rate_for(model).map(|rate| ResolvedRate {
+            rate,
+            source: RateSource::BuiltIn,
+            pattern: None,
+        })
+    }
+
+    /// Like [`pool_for`], but an override's declared family wins over the
+    /// built-in table and the vendor-prefix guess. That is what lets a model
+    /// the tool has never heard of land in a pool instead of being excluded.
+    pub fn pool_for(&self, provider: &str, model: &str) -> Option<String> {
+        if let Some(plan) = separate_plan(provider) {
+            return Some(plan.to_string());
+        }
+        if let Some(family) = self.matching(model).and_then(|entry| entry.family) {
+            return Some(family.as_str().to_string());
+        }
+        pool_for(provider, model)
+    }
+}
+
 /// Normalises the punctuation drift between how a vendor names a model and how
 /// each CLI records it (`claude-sonnet-4.6` vs `claude-sonnet-4-6`).
 fn canonical(model: &str) -> String {
@@ -403,5 +614,170 @@ mod tests {
         // 1M input + 1M cache write + 1M cache read + 1M output.
         let total = rate.value(1_000_000, 1_000_000, 1_000_000, 1_000_000);
         assert!((total - 36.75).abs() < 1e-9, "got {total}");
+    }
+
+    fn date(text: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn the_table_date_is_a_real_date() {
+        // The staleness check silently passes if the constant stops parsing.
+        assert!(NaiveDate::parse_from_str(RATES_AS_OF, "%Y-%m-%d").is_ok());
+    }
+
+    #[test]
+    fn rates_go_stale_only_after_the_threshold() {
+        let as_of = date(RATES_AS_OF);
+        let on = |days: i64| as_of + chrono::Duration::days(days);
+        assert_eq!(None, stale_rates_warning(on(0)));
+        assert_eq!(None, stale_rates_warning(on(STALE_AFTER_DAYS)));
+        let warning = stale_rates_warning(on(STALE_AFTER_DAYS + 1)).expect("stale");
+        assert!(warning.contains(RATES_AS_OF), "{warning}");
+        assert!(warning.contains("91 days old"), "{warning}");
+        assert!(warning.contains("model_rates"), "{warning}");
+        // A clock set before the table was written is not staleness.
+        assert_eq!(None, stale_rates_warning(on(-400)));
+    }
+
+    fn overrides(json: &str) -> Result<RateOverrides> {
+        let config: BTreeMap<String, ModelRateConfig> = serde_json::from_str(json).unwrap();
+        RateOverrides::from_config(&config)
+    }
+
+    fn error(json: &str) -> String {
+        format!("{:#}", overrides(json).unwrap_err())
+    }
+
+    #[test]
+    fn an_override_beats_the_built_in_table_and_can_add_unknown_models() {
+        let rates = overrides(
+            r#"{
+                "claude-opus-5": {"input": 1, "cache_write": 2, "cache_read": 3, "output": 4},
+                "acme-coder": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 9,
+                               "family": "codex"}
+            }"#,
+        )
+        .unwrap();
+        let opus = rates.resolve("claude-opus-5-20260101").unwrap();
+        assert_eq!(RateSource::Override, opus.source);
+        assert_eq!(Some("claude-opus-5"), opus.pattern);
+        assert_eq!(4.0, opus.rate.output);
+        // Not overridden: still the built-in rate.
+        let haiku = rates.resolve("claude-haiku-4-5").unwrap();
+        assert_eq!(RateSource::BuiltIn, haiku.source);
+        assert_eq!(5.0, haiku.rate.output);
+        // Unknown to the table, priced and pooled by the override alone.
+        assert_eq!(None, rate_for("acme-coder-2"));
+        assert_eq!(9.0, rates.resolve("acme-coder-2").unwrap().rate.output);
+        assert_eq!(
+            Some("openai".to_string()),
+            rates.pool_for("pi", "acme-coder-2")
+        );
+        assert_eq!(None, rates.resolve("llama-4"));
+    }
+
+    #[test]
+    fn overrides_match_like_the_table_longest_prefix_and_punctuation_blind() {
+        let rates = overrides(
+            r#"{
+                "gpt-5.5": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 10},
+                "gpt-5.5-pro": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 99}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(99.0, rates.resolve("gpt-5-5-pro").unwrap().rate.output);
+        assert_eq!(
+            10.0,
+            rates.resolve("GPT-5.5-2026-01-01").unwrap().rate.output
+        );
+        // A shorter override still beats a longer built-in prefix.
+        assert_eq!(10.0, rates.resolve("gpt-5.5").unwrap().rate.output);
+    }
+
+    #[test]
+    fn an_override_without_a_family_keeps_the_built_in_pool() {
+        let rates = overrides(
+            r#"{"claude-opus-5": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 1}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Some("claude".to_string()),
+            rates.pool_for("pi", "claude-opus-5")
+        );
+        // A client with its own seat still bills separately.
+        assert_eq!(
+            Some("copilot".to_string()),
+            rates.pool_for("copilot", "claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn bad_override_entries_are_refused_naming_the_key() {
+        let negative =
+            error(r#"{"x-model": {"input": 1, "cache_write": 1, "cache_read": 1, "output": -2}}"#);
+        assert!(
+            negative.contains("x-model") && negative.contains("output"),
+            "{negative}"
+        );
+        let family = error(
+            r#"{"x-model": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 2, "family": "bedrock"}}"#,
+        );
+        assert!(
+            family.contains("x-model") && family.contains("bedrock"),
+            "{family}"
+        );
+        assert!(family.contains("claude, openai, google"), "{family}");
+        let missing = error(r#"{"x-model": {"input": 1, "output": 2}}"#);
+        assert!(
+            missing.contains("x-model") && missing.contains("cache_write"),
+            "{missing}"
+        );
+        let blank =
+            error(r#"{"  ": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 2}}"#);
+        assert!(blank.contains("model rate key"), "{blank}");
+        let duplicate = error(
+            r#"{"gpt-5.5": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 2},
+                "gpt-5-5": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 2}}"#,
+        );
+        assert!(
+            duplicate.contains("gpt-5.5") && duplicate.contains("gpt-5-5"),
+            "{duplicate}"
+        );
+        // A typo'd field is refused by serde rather than silently ignored.
+        assert!(
+            serde_json::from_str::<BTreeMap<String, ModelRateConfig>>(r#"{"x": {"inptu": 1}}"#)
+                .is_err()
+        );
+    }
+
+    /// Read from the raw config value, a bad entry is a hard error that names
+    /// its key, whether serde or the validation found it.
+    #[test]
+    fn a_raw_entry_that_does_not_parse_is_refused_naming_its_key() {
+        let raw = |json: &str| {
+            format!(
+                "{:#}",
+                RateOverrides::from_value(&serde_json::from_str(json).unwrap()).unwrap_err()
+            )
+        };
+        let misspelt =
+            raw(r#"{"acme": {"inptu": 1, "cache_write": 1, "cache_read": 1, "output": 2}}"#);
+        assert!(
+            misspelt.contains("model_rates.acme") && misspelt.contains("inptu"),
+            "{misspelt}"
+        );
+        let wrong_type =
+            raw(r#"{"acme": {"input": "fast", "cache_write": 1, "cache_read": 1, "output": 2}}"#);
+        assert!(wrong_type.contains("model_rates.acme"), "{wrong_type}");
+        assert!(raw(r#"["acme"]"#).contains("model_rates must be an object"));
+        assert!(raw(r#"{"acme": 3}"#).contains("model_rates.acme"));
+        let valid = serde_json::json!({"acme": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 2}});
+        assert!(
+            RateOverrides::from_value(&valid)
+                .unwrap()
+                .resolve("acme-1")
+                .is_some()
+        );
     }
 }

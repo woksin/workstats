@@ -1,0 +1,6 @@
+{"sessionId":"gemini-fixture","projectHash":"hash","startTime":"2026-01-01T11:00:00Z","kind":"main"}
+{"id":"m1","type":"user","timestamp":"2026-01-01T11:00:01Z","content":[{"text":"Explain the build"}]}
+{"id":"m2","type":"gemini","timestamp":"2026-01-01T11:00:20Z","model":"gemini-fixture-model","content":"The build runs cargo.","tokens":{"input":100,"output":40,"cached":30,"thoughts":5,"tool":0,"total":140}}
+{"id":"m3","type":"info","timestamp":"2026-01-01T11:00:21Z","content":"Update available"}
+{"id":"m4","type":"user","timestamp":"2026-01-01T11:04:00Z","content":[{"text":"And the tests?"}]}
+{"id":"m5","type":"gemini","timestamp":"2026-01-01T11:04:10Z","model":"gemini-fixture-model","content":"They run with cargo test.","tokens":{"input":150,"output":20,"cached":0,"thoughts":0,"tool":0,"total":170}}

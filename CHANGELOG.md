@@ -14,6 +14,60 @@ tag are the generated list of pull requests.
 
 ### Added
 
+- ISO 8601 week periods. `--period week` and `--group-by week` cut a report
+  into Monday-to-Sunday weeks labelled `2026-W09`, and `--week` narrows the
+  window to one (`--week 2026-W09`, `--week last`, `--week current`), the way
+  `--month` and `--year` already do. Weeks follow the ISO week-numbering year,
+  so 29 December 2025 is in `2026-W01`, and a week that does not exist
+  (`2025-W53`) is an error. Weeks are cut on the local calendar, `workstats ui`
+  cycles to them with `p`, and a month or year window keeps its partial edge
+  weeks rather than padding them.
+
+- `--format markdown` and `--format html`. Markdown prints GitHub-flavoured
+  tables with the same sections and figures as the table view, escaping the
+  characters Markdown acts on in repository names and paths. HTML prints one
+  self-contained static page: inline CSS only, no scripts, fonts, images or
+  links, a `Content-Security-Policy` of `default-src 'none'`, every value
+  escaped, and light and dark themes from the reader's setting. Markdown also
+  keeps `@scope/pkg` and `#123` from becoming mentions and issue links when
+  pasted into a PR, and both formats replace the home directory with `~` in
+  notes, warnings and `cwd`/`root` row labels. Both work for
+  `workstats` and `workstats allocate`, print no update notice, and are refused
+  with `--explain-human-time`, like CSV.
+
+- A `defaults` block in the config file for the flags you retype on every run:
+  `dir`, `depth`, `format`, `providers`, `group_by`, `gap_cap`, `human_idle` and
+  `review_credit`. Precedence is flag, then environment variable, then config,
+  then the built-in default, so a flag typed with its built-in value still wins.
+  An unknown key or invalid value stops the run naming it, and `--format json`
+  lists what was taken from the config under `inputs.config_defaults`, and the
+  table, Markdown, HTML and `allocate` outputs note which defaults applied, and
+  `allocate --format json` carries them as `config_defaults`. A
+  calendar `group_by` yields to an explicit `--period`, and `model_rates`
+  entries are validated one by one, so a misspelt field is an error naming the
+  entry rather than the whole config being ignored with a warning.
+
+- `--compare previous|YYYY-MM|YYYY-Www|YYYY` reports the selected window beside
+  an earlier one. `previous` is the window of the same kind and length just
+  before it; the others name a baseline outright, and it may not overlap the
+  selected window. The comparison is headline-level (the human estimate, active
+  days, prompts, sessions, commits and changed lines, agent-authored output,
+  agent wall clock and parallel work, and each file area's share), each
+  figure with its change, and a figure that was zero in the baseline shows `n/a`
+  rather than a percentage. In `--format json` it is an added `comparison`
+  object. `--compare` refuses CSV, `workstats ui` and `workstats allocate`,
+  because their shapes cannot carry a second window. The selected window's
+  report, including the Git checkouts it reads, is the one it would print
+  without `--compare`, and so is the baseline's: each window is built by the
+  same code path a run of that window alone uses, one after the other. The
+  one addition is a single warning when the baseline raised warnings the
+  selected window did not show, counted from the warnings whose text is kept
+  (the first 100 of each run).
+
+- The documentation moved out of the README into `docs/`: install, usage,
+  configuration, how the estimate works, `allocate`, privacy, and development.
+  The README is now the entry point and links to each.
+
 - `workstats allocate` no longer requires `--project`. Naming one asks what it
   is owed; omitting it asks where the whole spend went, and answers with every
   project ranked by amount, one column per plan held. The rows reconcile
@@ -37,8 +91,6 @@ tag are the generated list of pull requests.
   single global price could not express it, leaving the arithmetic to be
   finished by hand. The tax-inclusive unit price now appears on each row, so a
   mixed-vendor claim is auditable line by line.
-
-### Added
 
 - `workstats allocate` apportions flat-rate subscription spend to one project.
   Given the plans you hold (`--sub claude=2 --sub codex=4`) it reports what
@@ -65,33 +117,6 @@ tag are the generated list of pull requests.
   vendor's mean share. And a client that bills on its own seat — Copilot —
   forms its own pool instead of diluting the vendor pool it was never billed
   to.
-
-### Fixed
-
-- Repository rows now represent logical projects rather than checkout folder
-  names. Linked Git worktrees are combined through their common Git directory,
-  and separately named clones of the same fetch remote are combined through a
-  locally normalized remote identity. Deleted delegated Pi worktrees are
-  recovered from the parent transcript's bounded session header, but only when
-  the child's own path no longer has a Git identity; no message content is
-  read. Orphaned worktree pointers also recover their common Git directory.
-  Live identities are retained in the transcript index so deleted foreground
-  worktrees remain attributable on later runs; ambiguous directory reuse is
-  left unresolved. Configurable `project_aliases` can combine distinct remotes
-  or every repository below a path into one named product, while
-  `--explain-repository-attribution` provides a path-free evidence ledger.
-  Sessions, tokens, human involvement, and unique commits therefore land in one
-  row; `--group-by cwd` remains available when checkout-level detail is wanted.
-  Commit and file deduplication remains scoped to each natural repository, so
-  distinct alias members that share a SHA or relative path stay distinct. No
-  remote is contacted.
-- `--review-credit` can no longer exceed `--human-idle`, which could make
-  separately clustered human-time blocks overlap and count the overlap twice.
-- Unfiltered reports now scan the locally available Git checkout associated
-  with each retained AI session, even when it is outside `--dir`. Repository
-  filters no longer change whether that session's authored commits are found.
-
-### Added
 
 - `--explain-human-time` prints an auditable signal and work-block ledger in
   table output and adds the same structured calculation to JSON. It records
@@ -233,6 +258,29 @@ tag are the generated list of pull requests.
   fully qualified name is the form to use: Homebrew 5.1.15 and newer will not
   load a formula from a third-party tap until it is trusted, and naming the tap
   in full trusts that one formula rather than everything in it.
+- `--author` is repeatable, and the config file takes an `authors` list (or a
+  single string, for one identity; any other type is an error naming `authors`), for
+  anyone who commits under more than one identity — a work address, a personal
+  one, an old name. Git ORs them into one developer, so a report no longer
+  undercounts you because a single pattern could only name one of them. The
+  first source that names any wins and sources do not combine: `--author`
+  flags, then `WORKSTATS_AUTHOR`, then the config file's `authors`, then the
+  global Git identity (`user.email`, else `user.name`). JSON output gains `inputs.authors`, listing each identity;
+  `inputs.author` joins them with `, `.
+- `workstats allocate` warns when its built-in list rates are more than 90 days
+  old, because vendors reprice and a weighting drawn from a stale table quietly
+  misstates the `value` basis. Prices can now be corrected, or supplied for a
+  model the table has never heard of, under `model_rates` in the config file.
+  Keys are model-name prefixes matched the way the built-in table matches them,
+  and any override beats the built-in entry. Output marks the rates that came
+  from an override, and the stale-rate warning is left out when every priced
+  model in the run used one, since nothing built-in was relied on.
+- A provider whose history files were read but yielded no usable activity is
+  now reported by name as possibly having changed format. A record that still
+  parses as JSON but no longer carries the fields a parser looks for used to be
+  dropped without a trace, so an upstream format change made a provider quietly
+  report zero. Empty files, and providers where any file still yields, never
+  trigger it.
 
 ### Changed
 
@@ -267,8 +315,42 @@ tag are the generated list of pull requests.
   as a JSON syntax error that was never there.
 - The transcript index is rebuilt once on the first run after upgrading,
   because what it stores and how a cached time range is derived both changed.
+- The transcript cache is now keyed on the workstats version as well, so an
+  upgrade never serves a parse produced by older code. Entries from a previous
+  release are rebuilt on first use rather than depending on a hand-bumped
+  parser version.
+- The README now states that submodules and clones nested inside a checkout are
+  not scanned as repositories of their own; point `--dir` at the nested
+  repository to include it.
 
 ### Fixed
+
+- The `allocate` error for a stray `--group-by` named only `--month`, `--since`
+  and `--until` as ways to pick the window. It now names every window flag:
+  `--month`, `--year`, `--week`, or `--since`/`--until`.
+
+- Repository rows now represent logical projects rather than checkout folder
+  names. Linked Git worktrees are combined through their common Git directory,
+  and separately named clones of the same fetch remote are combined through a
+  locally normalized remote identity. Deleted delegated Pi worktrees are
+  recovered from the parent transcript's bounded session header, but only when
+  the child's own path no longer has a Git identity; no message content is
+  read. Orphaned worktree pointers also recover their common Git directory.
+  Live identities are retained in the transcript index so deleted foreground
+  worktrees remain attributable on later runs; ambiguous directory reuse is
+  left unresolved. Configurable `project_aliases` can combine distinct remotes
+  or every repository below a path into one named product, while
+  `--explain-repository-attribution` provides a path-free evidence ledger.
+  Sessions, tokens, human involvement, and unique commits therefore land in one
+  row; `--group-by cwd` remains available when checkout-level detail is wanted.
+  Commit and file deduplication remains scoped to each natural repository, so
+  distinct alias members that share a SHA or relative path stay distinct. No
+  remote is contacted.
+- `--review-credit` can no longer exceed `--human-idle`, which could make
+  separately clustered human-time blocks overlap and count the overlap twice.
+- Unfiltered reports now scan the locally available Git checkout associated
+  with each retained AI session, even when it is outside `--dir`. Repository
+  filters no longer change whether that session's authored commits are found.
 
 - **The explorer's column headings read as headings again.** Every one of them
   carried its sort key as a bare leading digit — `1 Repository`, `2 Source
@@ -467,6 +549,16 @@ tag are the generated list of pull requests.
   Bedrock-style ids run past the width of the name column, which was padded to a
   minimum rather than clipped to a maximum; names are now shortened from the
   left, keeping the version on the end that tells two builds of one model apart.
+- Git history is now read from every local branch, plus `HEAD` for a detached
+  checkout, rather than only the branch that happens to be checked out. Work
+  done on other branches was missing from reports until it was merged. A commit
+  reachable from several branches is still counted once, and remote-tracking
+  branches are not read, so a `git fetch` never changes a report.
+- The report window is decided by when a commit was authored, not when it was
+  last committed. Git's own `--since`/`--until` use the committer date, so a
+  commit written in March and then rebased or amended in May fell out of a
+  March report. workstats now hands Git a lower bound widened by 30 days to keep
+  the history walk short and applies the exact window itself on the author date.
 
 ## 1.0.0 — 2026-08-18
 

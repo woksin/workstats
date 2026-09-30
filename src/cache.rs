@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
@@ -12,12 +13,30 @@ use crate::paths::RepositoryHistoryEntry;
 /// Bumped whenever a parser changes what it stores or how a range is derived, so that
 /// entries written by an older build are recomputed instead of answered from. Version 4
 /// retains Pi parent-CWD repository hints for deleted temporary worktrees.
+///
+/// This is the manual half of the validity key. Forgetting to bump it serves stale
+/// parses, which is why `parser_stamp` also mixes in the crate version: a release
+/// invalidates every older entry whether or not anyone remembered.
 const PARSER_VERSION: i64 = 4;
+
+/// What a cache entry must carry to be answered from: `PARSER_VERSION` joined to the
+/// crate version that wrote it.
+///
+/// Mixing in `CARGO_PKG_VERSION` makes invalidation automatic at every release. The cost
+/// is one re-parse after each upgrade, which is cheap next to serving a parse that an
+/// older build got wrong. The value always contains a dot-separated version, so SQLite
+/// never mistakes it for a number and stores it as text even in a column an older build
+/// declared `INTEGER`.
+fn parser_stamp() -> &'static str {
+    static STAMP: LazyLock<String> =
+        LazyLock::new(|| format!("{PARSER_VERSION}+{}", env!("CARGO_PKG_VERSION")));
+    &STAMP
+}
 
 type CacheRow = (
     i64,
     i64,
-    i64,
+    String,
     String,
     Option<i64>,
     Option<i64>,
@@ -59,7 +78,7 @@ impl TranscriptCache {
                 provider TEXT NOT NULL,
                 source_size INTEGER NOT NULL,
                 modified_ns INTEGER NOT NULL,
-                parser_version INTEGER NOT NULL,
+                parser_version TEXT NOT NULL,
                 context_fingerprint TEXT NOT NULL,
                 min_micros INTEGER,
                 max_micros INTEGER,
@@ -167,7 +186,10 @@ impl TranscriptCache {
         let row: Option<CacheRow> = self
             .connection
             .query_row(
-                "SELECT source_size, modified_ns, parser_version, context_fingerprint,
+                // Cast because a cache written before the crate version joined the key
+                // holds an integer here, and reading that as text would be an error
+                // rather than the plain miss it should be.
+                "SELECT source_size, modified_ns, CAST(parser_version AS TEXT), context_fingerprint,
                         min_micros, max_micros, payload, role_payload
                    FROM transcript_cache
                   WHERE path = ?1 AND provider = ?2",
@@ -201,7 +223,7 @@ impl TranscriptCache {
         };
         if size != stamp.size
             || modified_ns != stamp.modified_ns
-            || parser_version != PARSER_VERSION
+            || parser_version != parser_stamp()
             || context != context_fingerprint
         {
             return Ok(CacheLookup::Miss);
@@ -241,6 +263,10 @@ impl TranscriptCache {
         let mut roles = ParsedFile {
             sessions: parsed.sessions.clone(),
             diagnostics: parsed.diagnostics.clone(),
+            // Both survive pruning: the drift check reads them from a pruned hit, whose
+            // timestamps are gone by design.
+            records_read: parsed.records_read,
+            unrecognized: parsed.unrecognized,
         };
         for session in &mut roles.sessions {
             session.points.clear();
@@ -269,7 +295,7 @@ impl TranscriptCache {
                 provider,
                 stamp.size,
                 stamp.modified_ns,
-                PARSER_VERSION,
+                parser_stamp(),
                 context_fingerprint,
                 minimum.map(|value| value.timestamp_micros()),
                 maximum.map(|value| value.timestamp_micros()),
@@ -338,6 +364,7 @@ mod tests {
                 version: None,
             }],
             diagnostics: Diagnostics::default(),
+            ..ParsedFile::default()
         }
     }
 
@@ -463,6 +490,95 @@ mod tests {
         assert_eq!(2, history.len());
         assert_eq!("remote:host/one", history[0].natural_id);
         assert_eq!("remote:host/two", history[1].natural_id);
+    }
+
+    #[test]
+    fn an_entry_from_another_crate_version_is_recomputed() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("session.jsonl");
+        fs::write(&source, "{}\n").unwrap();
+        let cache_path = directory.path().join("index.sqlite3");
+        let stamp = file_stamp(&source).unwrap();
+        let mut cache = TranscriptCache::open(&cache_path, false).unwrap();
+        cache
+            .put(&source, "codex", "context", stamp, &parsed(&source))
+            .unwrap();
+        assert!(matches!(
+            cache
+                .lookup(&source, "codex", "context", stamp, None, None)
+                .unwrap(),
+            CacheLookup::Hit(_)
+        ));
+
+        // The same parser version, written by a build that was released earlier.
+        let other = format!("{PARSER_VERSION}+0.0.0-older");
+        assert_ne!(other, parser_stamp());
+        cache
+            .connection
+            .execute("UPDATE transcript_cache SET parser_version = ?1", [other])
+            .unwrap();
+        assert!(matches!(
+            cache
+                .lookup(&source, "codex", "context", stamp, None, None)
+                .unwrap(),
+            CacheLookup::Miss
+        ));
+    }
+
+    #[test]
+    fn a_cache_written_before_the_crate_version_joined_the_key_is_recomputed() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("session.jsonl");
+        fs::write(&source, "{}\n").unwrap();
+        let cache_path = directory.path().join("index.sqlite3");
+        let stamp = file_stamp(&source).unwrap();
+        // The schema an older build created: an integer `parser_version`.
+        let old = Connection::open(&cache_path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE transcript_cache (
+                path TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                source_size INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                parser_version INTEGER NOT NULL,
+                context_fingerprint TEXT NOT NULL,
+                min_micros INTEGER,
+                max_micros INTEGER,
+                payload BLOB NOT NULL,
+                role_payload BLOB,
+                PRIMARY KEY(path, provider)
+            );",
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO transcript_cache VALUES (?1, 'codex', ?2, ?3, ?4, 'context', NULL, NULL, x'7b7d', NULL)",
+            params![
+                canonical(&source),
+                stamp.size,
+                stamp.modified_ns,
+                PARSER_VERSION
+            ],
+        )
+        .unwrap();
+        drop(old);
+
+        let mut cache = TranscriptCache::open(&cache_path, false).unwrap();
+        assert!(matches!(
+            cache
+                .lookup(&source, "codex", "context", stamp, None, None)
+                .unwrap(),
+            CacheLookup::Miss
+        ));
+        // Recomputing replaces the old row in place rather than failing on it.
+        cache
+            .put(&source, "codex", "context", stamp, &parsed(&source))
+            .unwrap();
+        assert!(matches!(
+            cache
+                .lookup(&source, "codex", "context", stamp, None, None)
+                .unwrap(),
+            CacheLookup::Hit(_)
+        ));
     }
 
     #[test]

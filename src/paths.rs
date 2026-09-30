@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::classify::{CategoryMode, CategoryRegistry, CategoryRules};
 use crate::model::{Diagnostics, RawSession, Session};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SourceRule {
     replacement: String,
     compiled: Regex,
@@ -62,6 +62,14 @@ pub struct Config {
     pub source_roots: Vec<ConfigRule>,
     #[serde(default)]
     pub check_updates: Option<bool>,
+    /// Git author patterns for the developer's identities, used when neither
+    /// `--author` nor `WORKSTATS_AUTHOR` is given. Each is a `git log
+    /// --author` basic regular expression, exactly as on the command line, and
+    /// they are OR-ed. A single string is accepted for a single identity.
+    /// Kept as raw JSON so a value of any other type is a hard error naming
+    /// `authors` rather than the whole config being ignored with a warning.
+    #[serde(default)]
+    pub authors: Option<serde_json::Value>,
     /// File-area rules, keyed by category name. A name the built-ins do not
     /// know creates a new category.
     #[serde(default)]
@@ -73,6 +81,21 @@ pub struct Config {
     /// The map key is the stable grouping id; `label` is display-only.
     #[serde(default)]
     pub project_aliases: BTreeMap<String, ProjectAliasConfig>,
+    /// Per-model list rates that override the built-in table used by
+    /// `allocate`. The key is a model-name prefix; see `pricing::RateOverrides`.
+    /// Kept as raw JSON and checked entry by entry when compiled: typed here, a
+    /// misspelt field or a wrong type would make serde reject the whole file,
+    /// and everything else in it (authors, defaults, aliases) would be lost
+    /// with only a warning.
+    #[serde(default)]
+    pub model_rates: Option<serde_json::Value>,
+    /// Everyday flags (`dir`, `depth`, `format`, `providers`, `group_by`,
+    /// `gap_cap`, `human_idle`, `review_credit`) that apply when the flag and
+    /// its environment variable are absent. Kept as raw JSON so a bad key or
+    /// value is a hard error naming it, like `project_aliases`, rather than
+    /// the whole config being ignored with a warning.
+    #[serde(default)]
+    pub defaults: Option<serde_json::Value>,
 }
 
 impl Config {
@@ -85,6 +108,41 @@ impl Config {
     pub fn compiled_project_aliases(&self, home: &Path) -> Result<ProjectAliases> {
         ProjectAliases::compile(&self.project_aliases, home)
             .context("invalid \"project_aliases\" configuration")
+    }
+
+    pub fn configured_authors(&self) -> Result<Vec<String>> {
+        let Some(value) = &self.authors else {
+            return Ok(Vec::new());
+        };
+        let invalid = || {
+            anyhow::anyhow!(
+                "invalid \"authors\" configuration: expected a string or a list of strings, got {value}"
+            )
+        };
+        match value {
+            serde_json::Value::Null => Ok(Vec::new()),
+            serde_json::Value::String(author) => Ok(vec![author.clone()]),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string).ok_or_else(invalid))
+                .collect(),
+            _ => Err(invalid()),
+        }
+    }
+
+    pub fn config_defaults(&self, home: &Path) -> Result<crate::cli::ConfigDefaults> {
+        match &self.defaults {
+            Some(value) => crate::cli::ConfigDefaults::parse(value, home),
+            None => Ok(crate::cli::ConfigDefaults::default()),
+        }
+    }
+
+    pub fn compiled_model_rates(&self) -> Result<crate::pricing::RateOverrides> {
+        match &self.model_rates {
+            Some(value) => crate::pricing::RateOverrides::from_value(value)
+                .context("invalid \"model_rates\" configuration"),
+            None => Ok(crate::pricing::RateOverrides::default()),
+        }
     }
 }
 
@@ -1022,7 +1080,7 @@ pub fn lossy_pi_cwd(session_dir: &Path) -> String {
     format!("/{}", inner.replace('-', "/"))
 }
 
-fn expand_path(value: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_path(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
         return home.to_path_buf();
     }
@@ -1443,6 +1501,32 @@ mod tests {
             ..Config::default()
         };
         assert!(config.category_registry().is_err());
+    }
+
+    #[test]
+    fn authors_accept_a_string_or_a_list_and_refuse_anything_else_by_name() {
+        let authors = |json: &str| {
+            let config: Config = serde_json::from_str(json).unwrap();
+            config.configured_authors()
+        };
+        assert_eq!(
+            vec!["me@example.com"],
+            authors(r#"{"authors": "me@example.com"}"#).unwrap()
+        );
+        assert_eq!(
+            vec!["a@example.com", "b@example.com"],
+            authors(r#"{"authors": ["a@example.com", "b@example.com"]}"#).unwrap()
+        );
+        assert!(authors("{}").unwrap().is_empty());
+        assert!(authors(r#"{"authors": null}"#).unwrap().is_empty());
+        for bad in [
+            r#"{"authors": 7}"#,
+            r#"{"authors": {"me": true}}"#,
+            r#"{"authors": ["a@example.com", 7]}"#,
+        ] {
+            let error = format!("{:#}", authors(bad).unwrap_err());
+            assert!(error.contains("\"authors\""), "{bad}: {error}");
+        }
     }
 
     #[test]

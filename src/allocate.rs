@@ -23,11 +23,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
+use chrono::NaiveDate;
 use serde::Serialize;
 
+use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
 use crate::model::ReportRow;
 use crate::output::number;
-use crate::pricing::{self, RATES_AS_OF};
+use crate::output::{config_defaults_note, redact_home};
+use crate::paths::home_dir;
+use crate::pricing::{self, RATES_AS_OF, RateOverrides, RateSource};
 
 /// Which measured quantity drives the split.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum, Serialize)]
@@ -127,6 +131,13 @@ pub struct AllocationOptions {
     pub currency: String,
     pub basis: Basis,
     pub gap_policy: GapPolicy,
+    /// User rates from `model_rates` in the config file. They outrank the
+    /// built-in table, and the output says when any of them was applied.
+    pub rate_overrides: RateOverrides,
+    /// The current date, for judging how stale the built-in table is. Injected
+    /// rather than read here so the threshold is testable and `build` stays a
+    /// pure function of its inputs.
+    pub today: NaiveDate,
 }
 
 /// Both sides of one split, in every measure at once, so the chosen basis and
@@ -208,6 +219,8 @@ pub struct ModelRow {
     pub project_list_value: f64,
     pub pool_list_value: f64,
     pub priced: bool,
+    /// `override`, `built-in`, or `none` when the model is unpriced.
+    pub rate_source: &'static str,
 }
 
 /// One project's slice of the whole spend, for the no-claim breakdown.
@@ -250,6 +263,12 @@ pub struct Allocation {
     pub effective_share: f64,
     #[serde(skip)]
     pub top: usize,
+    /// Config `defaults` this run's report used (flag name to value), set by
+    /// the caller, which knows the config. They are in the JSON, and in the
+    /// one-line note of the table, Markdown and HTML, because they change what
+    /// the allocation covers; CSV has no place for them and omits them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_defaults: BTreeMap<String, String>,
     pub periods: Vec<PeriodRow>,
     /// Every project's slice of the spend. Present only when no project was
     /// named, because that is the question being asked.
@@ -258,13 +277,18 @@ pub struct Allocation {
     pub models: Vec<ModelRow>,
     pub cross_check: Vec<CrossCheckRow>,
     pub rates_as_of: &'static str,
+    /// The `model_rates` keys that priced or pooled a model in this run. Empty
+    /// means every number came from the built-in table.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rate_overrides: Vec<String>,
     pub warnings: Vec<String>,
 }
 
-fn row_value(row: &ReportRow, model: &str) -> Measures {
-    let value = pricing::rate_for(model)
-        .map(|rate| {
-            rate.value(
+fn row_value(row: &ReportRow, model: &str, overrides: &RateOverrides) -> Measures {
+    let value = overrides
+        .resolve(model)
+        .map(|resolved| {
+            resolved.rate.value(
                 row.input_tokens,
                 row.cache_creation_tokens,
                 row.cache_read_tokens,
@@ -300,6 +324,10 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
     let mut seen_repos: BTreeSet<String> = BTreeSet::new();
     let mut by_repo: BTreeMap<String, BTreeMap<String, Measures>> = BTreeMap::new();
     let mut repo_tokens: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut overrides_used: BTreeSet<String> = BTreeSet::new();
+    // Staleness only matters for numbers that came from the built-in table; a
+    // run priced entirely by the user's own rates has nothing out of date.
+    let mut built_in_used = false;
 
     for row in rows {
         let model = row.key.get("model").map(String::as_str).unwrap_or("");
@@ -307,7 +335,7 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
             continue;
         }
         let provider = row.key.get("provider").map(String::as_str).unwrap_or("");
-        let Some(pool) = pricing::pool_for(provider, model) else {
+        let Some(pool) = options.rate_overrides.pool_for(provider, model) else {
             *unclassified.entry(model.to_string()).or_default() += row.total_tokens;
             continue;
         };
@@ -316,8 +344,14 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
         if !options.subscriptions.contains_key(&pool) {
             continue;
         }
-        if pricing::rate_for(model).is_none() {
-            *unpriced.entry(model.to_string()).or_default() += row.total_tokens;
+        match options.rate_overrides.resolve(model) {
+            None => *unpriced.entry(model.to_string()).or_default() += row.total_tokens,
+            Some(resolved) => match resolved.source {
+                RateSource::BuiltIn => built_in_used = true,
+                RateSource::Override => {
+                    overrides_used.extend(resolved.pattern.map(str::to_string));
+                }
+            },
         }
 
         // Rows are grouped with `month`, so a missing key means the report was
@@ -339,7 +373,7 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
             seen_repos.insert(repo.clone());
         }
         let is_project = wanted.contains(&repo);
-        let measures = row_value(row, model);
+        let measures = row_value(row, model, &options.rate_overrides);
 
         let label = row
             .key
@@ -417,7 +451,11 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
                 share: split.share(options.basis).unwrap_or(0.0),
                 project_list_value: split.project.value,
                 pool_list_value: split.pool.value,
-                priced: pricing::rate_for(model).is_some(),
+                priced: options.rate_overrides.resolve(model).is_some(),
+                rate_source: options
+                    .rate_overrides
+                    .resolve(model)
+                    .map_or("none", |resolved| resolved.source.as_str()),
             }
         })
         .collect();
@@ -519,6 +557,9 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
             name_list(&unpriced)
         ));
     }
+    if built_in_used && let Some(warning) = pricing::stale_rates_warning(options.today) {
+        warnings.push(warning);
+    }
     if !unclassified.is_empty() {
         warnings.push(format!(
             "could not place {} in a subscription family — excluded entirely",
@@ -543,11 +584,13 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
             0.0
         },
         top: options.top,
+        config_defaults: BTreeMap::new(),
         periods,
         breakdown,
         models: model_rows,
         cross_check,
         rates_as_of: RATES_AS_OF,
+        rate_overrides: overrides_used.into_iter().collect(),
         warnings,
     }
 }
@@ -739,6 +782,20 @@ fn tokens_short(tokens: u64) -> String {
     }
 }
 
+/// Where the list rates came from, so a reader can tell which numbers are the
+/// published table's and which are the user's.
+fn rates_note(allocation: &Allocation) -> String {
+    if allocation.rate_overrides.is_empty() {
+        format!("rates as of {}", allocation.rates_as_of)
+    } else {
+        format!(
+            "rates as of {}; overridden by model_rates: {}",
+            allocation.rates_as_of,
+            allocation.rate_overrides.join(", ")
+        )
+    }
+}
+
 fn metric_short(value: f64, basis: Basis, currency: &str) -> String {
     match basis {
         Basis::Output | Basis::Tokens => tokens_short(value as u64),
@@ -779,6 +836,9 @@ pub fn print_table(allocation: &Allocation) {
         money(allocation.billed, &allocation.currency),
         allocation.basis.label()
     );
+    if let Some(note) = config_defaults_note(&allocation.config_defaults) {
+        println!("  {note}");
+    }
     println!();
 
     if !allocation.breakdown.is_empty() {
@@ -833,7 +893,7 @@ pub fn print_table(allocation: &Allocation) {
 
     if !allocation.models.is_empty() {
         println!();
-        println!("  MODELS  (rates as of {})", allocation.rates_as_of);
+        println!("  MODELS  ({})", rates_note(allocation));
         println!(
             "  {:<26} {:<8} {:>11} {:>11} {:>8} {:>12}",
             "model", "family", "project", "pool", "share", "list value"
@@ -851,7 +911,11 @@ pub fn print_table(allocation: &Allocation) {
                 tokens_short(model.pool_tokens),
                 model.share * 100.0,
                 money(model.project_list_value, &allocation.currency),
-                if model.priced { "" } else { "  ← unpriced" },
+                match model.rate_source {
+                    "override" => "  ← override",
+                    "none" => "  ← unpriced",
+                    _ => "",
+                },
             );
         }
     }
@@ -959,6 +1023,12 @@ fn print_breakdown(allocation: &Allocation) {
         100.0
     ));
     println!("{totals}");
+    // The models table is not shown here, so this is the only place the
+    // breakdown says whose rates the list-price numbers rest on.
+    if !allocation.rate_overrides.is_empty() {
+        println!();
+        println!("  Rates: {}", rates_note(allocation));
+    }
 
     if !allocation.warnings.is_empty() {
         println!();
@@ -968,6 +1038,291 @@ fn print_breakdown(allocation: &Allocation) {
         }
     }
     println!();
+}
+
+/// The allocation as a `Document` for the Markdown and HTML renderers.
+///
+/// Mirrors `print_table` and `print_breakdown` section for section and formats
+/// every figure with the same helpers (`money`, `metric_short`,
+/// `tokens_short`), so an amount pasted into an invoice note is the amount the
+/// terminal printed. Names are not truncated: a document has no column to keep
+/// aligned.
+fn allocation_document(allocation: &Allocation) -> Document {
+    let window = match allocation.months.as_slice() {
+        [] => "no data".to_string(),
+        [only] => only.clone(),
+        [first, .., last] => format!("{first} → {last}"),
+    };
+    let total: u32 = allocation
+        .subscriptions
+        .values()
+        .map(|plan| plan.count)
+        .sum();
+    let tax = if allocation.vat_percent > 0.0 {
+        format!(" incl. {}% tax", trim_percent(allocation.vat_percent))
+    } else {
+        String::new()
+    };
+    let currency = allocation.currency.as_str();
+    let mut blocks = vec![
+        Block::Paragraph(format!(
+            "Project: {}",
+            if allocation.projects.is_empty() {
+                "every project".to_string()
+            } else {
+                allocation.projects.join(", ")
+            }
+        )),
+        Block::Paragraph(format!(
+            "{window} · {} subscription{} · {} billed{tax} · basis: {}",
+            total,
+            if total == 1 { "" } else { "s" },
+            money(allocation.billed, currency),
+            allocation.basis.label()
+        )),
+    ];
+    if let Some(note) = config_defaults_note(&allocation.config_defaults) {
+        blocks.push(Block::Paragraph(redact_home(&note, &home_dir())));
+    }
+
+    if allocation.breakdown.is_empty() {
+        push_period_blocks(&mut blocks, allocation);
+    } else {
+        push_breakdown_blocks(&mut blocks, allocation);
+    }
+
+    if !allocation.warnings.is_empty() {
+        blocks.push(Block::Section("Warnings".to_string()));
+        blocks.push(Block::List(allocation.warnings.clone()));
+    }
+    if allocation.breakdown.is_empty() {
+        blocks.push(Block::Paragraph(
+            "List value is the pay-per-token price of this usage, shown as a ceiling and as the weight between models. It is not an amount owed: a subscription is what you paid.".to_string(),
+        ));
+    }
+
+    Document {
+        title: "Allocation".to_string(),
+        blocks,
+    }
+}
+
+fn push_period_blocks(blocks: &mut Vec<Block>, allocation: &Allocation) {
+    let currency = allocation.currency.as_str();
+    blocks.push(Block::Section("Subscription spend by month".to_string()));
+    let mut periods = Table::new(
+        vec![
+            Column::text("Month"),
+            Column::text("Family"),
+            Column::number("Subs"),
+            Column::number("Plan/mo"),
+            Column::number("Project"),
+            Column::number("Pool"),
+            Column::number("Share"),
+            Column::number("Owed"),
+            Column::text("Note"),
+        ],
+        allocation
+            .periods
+            .iter()
+            .map(|period| {
+                vec![
+                    period.month.clone(),
+                    period.family.clone(),
+                    period.subscriptions.to_string(),
+                    money(period.plan_price, currency),
+                    metric_short(period.project_metric, allocation.basis, currency),
+                    metric_short(period.pool_metric, allocation.basis, currency),
+                    format!("{:.1}%", period.share * 100.0),
+                    money(period.amount, currency),
+                    period.note.to_string(),
+                ]
+            })
+            .collect(),
+    );
+    periods.total = Some(vec![
+        "Attributable".to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        format!("{:.1}%", allocation.effective_share * 100.0),
+        money(allocation.attributable, currency),
+        String::new(),
+    ]);
+    blocks.push(Block::Table(periods));
+    if allocation.documented < allocation.billed {
+        blocks.push(Block::Paragraph(format!(
+            "of {} documented — {} of {} billed has no surviving history",
+            money(allocation.documented, currency),
+            money(allocation.billed - allocation.documented, currency),
+            money(allocation.billed, currency)
+        )));
+    }
+
+    let models: Vec<Vec<String>> = allocation
+        .models
+        .iter()
+        .filter(|model| model.project_tokens != 0 || model.pool_tokens != 0)
+        .map(|model| {
+            vec![
+                model.model.clone(),
+                model.family.clone(),
+                tokens_short(model.project_tokens),
+                tokens_short(model.pool_tokens),
+                format!("{:.1}%", model.share * 100.0),
+                money(model.project_list_value, currency),
+                match model.rate_source {
+                    "override" => "override",
+                    "none" => "unpriced",
+                    _ => "",
+                }
+                .to_string(),
+            ]
+        })
+        .collect();
+    if !allocation.models.is_empty() {
+        blocks.push(Block::Section(format!(
+            "Models ({})",
+            rates_note(allocation)
+        )));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Model"),
+                Column::text("Family"),
+                Column::number("Project"),
+                Column::number("Pool"),
+                Column::number("Share"),
+                Column::number("List value"),
+                Column::text("Rate"),
+            ],
+            models,
+        )));
+    }
+
+    blocks.push(Block::Section(
+        "Cross-check (same window, every basis)".to_string(),
+    ));
+    let mut ordered: Vec<&CrossCheckRow> = allocation.cross_check.iter().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .share
+            .partial_cmp(&left.share)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    blocks.push(Block::Table(Table::new(
+        vec![
+            Column::text("Basis"),
+            Column::number("Share"),
+            Column::number("Amount"),
+            Column::text("Note"),
+        ],
+        ordered
+            .into_iter()
+            .map(|row| {
+                let mut notes = Vec::new();
+                if !row.measured {
+                    notes.push("estimated, not provider-recorded");
+                }
+                if row.basis == allocation.basis {
+                    notes.push("selected basis");
+                }
+                vec![
+                    row.label.to_string(),
+                    format!("{:.1}%", row.share * 100.0),
+                    money(row.amount, currency),
+                    notes.join("; "),
+                ]
+            })
+            .collect(),
+    )));
+}
+
+fn push_breakdown_blocks(blocks: &mut Vec<Block>, allocation: &Allocation) {
+    let currency = allocation.currency.as_str();
+    let pools: Vec<&String> = allocation.subscriptions.keys().collect();
+    let mut columns = vec![Column::text("Project")];
+    columns.extend(pools.iter().map(|pool| Column::number(pool.as_str())));
+    columns.extend([
+        Column::number("Total"),
+        Column::number("%"),
+        Column::number("Output tokens"),
+        Column::number("Tokens"),
+    ]);
+
+    let shown = if allocation.top == 0 {
+        allocation.breakdown.len()
+    } else {
+        allocation.top.min(allocation.breakdown.len())
+    };
+    let mut rows: Vec<Vec<String>> =
+        allocation.breakdown[..shown]
+            .iter()
+            .map(|project| {
+                let mut cells = vec![project.project.clone()];
+                cells.extend(pools.iter().map(|pool| {
+                    money(project.amounts.get(*pool).copied().unwrap_or(0.0), currency)
+                }));
+                cells.extend([
+                    money(project.total, currency),
+                    format!("{:.1}%", project.share_of_billed * 100.0),
+                    tokens_short(project.output_tokens),
+                    tokens_short(project.total_tokens),
+                ]);
+                cells
+            })
+            .collect();
+    if shown < allocation.breakdown.len() {
+        let rest = &allocation.breakdown[shown..];
+        let total: f64 = rest.iter().map(|project| project.total).sum();
+        let mut cells = vec![format!("({} smaller projects)", rest.len())];
+        cells.extend(pools.iter().map(|_| String::new()));
+        cells.extend([
+            money(total, currency),
+            format!("{:.1}%", total / allocation.billed * 100.0),
+            String::new(),
+            String::new(),
+        ]);
+        rows.push(cells);
+    }
+    let mut totals = vec!["Total".to_string()];
+    totals.extend(pools.iter().map(|pool| {
+        let sum: f64 = allocation
+            .breakdown
+            .iter()
+            .map(|project| project.amounts.get(*pool).copied().unwrap_or(0.0))
+            .sum();
+        money(sum, currency)
+    }));
+    totals.extend([
+        money(allocation.billed, currency),
+        format!("{:.1}%", 100.0),
+        String::new(),
+        String::new(),
+    ]);
+    let mut table = Table::new(columns, rows);
+    table.total = Some(totals);
+    blocks.push(Block::Section("Projects".to_string()));
+    blocks.push(Block::Table(table));
+    // The models table is not shown here, so this is the only place the
+    // breakdown says whose rates the list-price numbers rest on.
+    if !allocation.rate_overrides.is_empty() {
+        blocks.push(Block::Paragraph(format!(
+            "Rates: {}",
+            rates_note(allocation)
+        )));
+    }
+}
+
+/// `--format markdown` for `allocate`.
+pub fn print_markdown(allocation: &Allocation) {
+    print!("{}", render_markdown(&allocation_document(allocation)));
+}
+
+/// `--format html` for `allocate`.
+pub fn print_html(allocation: &Allocation) {
+    print!("{}", render_html(&allocation_document(allocation)));
 }
 
 pub fn print_json(allocation: &Allocation) -> Result<()> {
@@ -1059,6 +1414,8 @@ mod tests {
             currency: "USD".to_string(),
             basis,
             gap_policy: gap,
+            rate_overrides: RateOverrides::default(),
+            today: NaiveDate::from_ymd_opt(2026, 9, 30).unwrap(),
         }
     }
 
@@ -1143,6 +1500,117 @@ mod tests {
             (claude.share - 25.0 / 30.0).abs() < 1e-9,
             "got {}",
             claude.share
+        );
+    }
+
+    fn override_options(json: &str, today: NaiveDate) -> AllocationOptions {
+        let config = serde_json::from_str(json).unwrap();
+        AllocationOptions {
+            rate_overrides: RateOverrides::from_config(&config).unwrap(),
+            today,
+            ..options(Basis::Value, GapPolicy::Skip)
+        }
+    }
+
+    fn stale_warning(allocation: &Allocation) -> Option<&String> {
+        allocation
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("built-in list rates"))
+    }
+
+    #[test]
+    fn stale_built_in_rates_warn_and_fresh_ones_do_not() {
+        let rows = [row("Ada", "claude-opus-5", "2026-08", 10, 10)];
+        let mut fresh = options(Basis::Value, GapPolicy::Skip);
+        fresh.today = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        assert!(stale_warning(&build(&rows, &fresh)).is_none());
+
+        let mut old = fresh.clone();
+        old.today = NaiveDate::from_ymd_opt(2027, 3, 1).unwrap();
+        let allocation = build(&rows, &old);
+        let warning = stale_warning(&allocation).expect("stale warning");
+        assert!(warning.contains(RATES_AS_OF), "{warning}");
+        assert!(warning.contains("days old"), "{warning}");
+        assert!(warning.contains("model_rates"), "{warning}");
+    }
+
+    #[test]
+    fn a_run_priced_entirely_by_overrides_has_nothing_stale_to_warn_about() {
+        let old = NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        let json =
+            r#"{"claude-opus-5": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 1}}"#;
+        let allocation = build(
+            &[row("Ada", "claude-opus-5", "2026-08", 10, 10)],
+            &override_options(json, old),
+        );
+        assert!(stale_warning(&allocation).is_none());
+        assert_eq!(vec!["claude-opus-5".to_string()], allocation.rate_overrides);
+
+        // One model still on the built-in table brings the warning back.
+        let mixed = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 10, 10),
+                row("Ada", "claude-haiku-4-5", "2026-08", 10, 10),
+            ],
+            &override_options(json, old),
+        );
+        assert!(stale_warning(&mixed).is_some());
+    }
+
+    #[test]
+    fn overrides_reweigh_models_and_price_the_ones_the_table_lacks() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        // Built-in: Opus output $25 vs Haiku $5. The override makes them equal
+        // and adds a model the table has never heard of.
+        let json = r#"{
+            "claude-opus-5": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 5},
+            "acme-coder": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 5,
+                           "family": "claude"}
+        }"#;
+        let allocation = build(
+            &[
+                row("Ada", "claude-opus-5", "2026-08", 1_000_000, 1_000_000),
+                row("Other", "claude-haiku-4-5", "2026-08", 1_000_000, 1_000_000),
+                row("Other", "acme-coder-1", "2026-08", 1_000_000, 1_000_000),
+            ],
+            &override_options(json, today),
+        );
+        let claude = allocation
+            .periods
+            .iter()
+            .find(|period| period.family == "claude")
+            .expect("claude row");
+        assert!(
+            (claude.share - 1.0 / 3.0).abs() < 1e-9,
+            "got {}",
+            claude.share
+        );
+        let acme = allocation
+            .models
+            .iter()
+            .find(|model| model.model == "acme-coder-1")
+            .expect("acme row");
+        assert!(acme.priced);
+        assert_eq!("override", acme.rate_source);
+        assert_eq!(
+            "built-in",
+            allocation
+                .models
+                .iter()
+                .find(|model| model.model == "claude-haiku-4-5")
+                .unwrap()
+                .rate_source
+        );
+        assert!(
+            !allocation
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no published rate"))
+        );
+        assert_eq!(
+            vec!["acme-coder".to_string(), "claude-opus-5".to_string()],
+            allocation.rate_overrides
         );
     }
 

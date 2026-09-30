@@ -1179,6 +1179,11 @@ fn agent_authored_commits_are_reported_as_output_and_never_as_human_time() {
 /// `output` output tokens, so an allocation fixture can be described in the
 /// terms allocation actually splits on.
 fn pi_session(history: &Path, name: &str, cwd: &Path, model: &str, output: u64) {
+    pi_session_on(history, name, cwd, model, output, "2026-03-02");
+}
+
+/// The same session on another day, for tests that need history in two windows.
+fn pi_session_on(history: &Path, name: &str, cwd: &Path, model: &str, output: u64, day: &str) {
     let directory = history.join(format!("--{name}--"));
     fs::create_dir_all(&directory).unwrap();
     let usage = serde_json::json!({
@@ -1188,18 +1193,18 @@ fn pi_session(history: &Path, name: &str, cwd: &Path, model: &str, output: u64) 
     });
     let lines = [
         serde_json::json!({"type": "session", "version": 3, "id": name,
-            "timestamp": "2026-03-02T00:00:00.000Z", "cwd": cwd}),
+            "timestamp": format!("{day}T00:00:00.000Z"), "cwd": cwd}),
         serde_json::json!({"type": "message", "id": "a", "parentId": null,
-            "timestamp": "2026-03-02T00:00:10.000Z",
+            "timestamp": format!("{day}T00:00:10.000Z"),
             "message": {"role": "user", "content": [{"type": "text", "text": "go"}]}}),
         serde_json::json!({"type": "message", "id": "b", "parentId": "a",
-            "timestamp": "2026-03-02T00:01:10.000Z",
+            "timestamp": format!("{day}T00:01:10.000Z"),
             "message": {"role": "assistant", "model": model, "provider": "anthropic",
                 "stopReason": "stop", "usage": usage,
                 "content": [{"type": "text", "text": "done"}]}}),
     ];
     fs::write(
-        directory.join(format!("2026-03-02T00-00-00-000Z_{name}.jsonl")),
+        directory.join(format!("{day}T00-00-00-000Z_{name}.jsonl")),
         lines
             .iter()
             .map(std::string::ToString::to_string)
@@ -1325,4 +1330,1724 @@ fn allocate_refuses_to_read_pruned_history_as_an_absence_of_work() {
             .any(|warning| warning.as_str().unwrap().contains("no openai history")),
         "the gap must be named, got {warnings:?}"
     );
+}
+
+/// A report over `path` with `arguments` appended, parsed. The shared flags
+/// keep every Git test away from AI history, the cache and the terminal.
+fn git_report(path: &str, arguments: &[&str]) -> Value {
+    report_with_env(path, arguments, &[])
+}
+
+fn report_with_env(path: &str, arguments: &[&str], environment: &[(&str, &str)]) -> Value {
+    let mut command = Command::new(binary());
+    command
+        .args([
+            "--dir",
+            path,
+            "--no-ai",
+            "--no-cache",
+            "--no-progress",
+            "--format",
+            "json",
+        ])
+        .args(arguments)
+        .env_remove("WORKSTATS_AUTHOR")
+        .envs(environment.iter().copied());
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// A repository whose first branch is called `main`, whatever the machine's
+/// `init.defaultBranch` says.
+fn repository_on_main(temporary: &Path, name: &str) -> String {
+    let project = temporary.join(name);
+    fs::create_dir_all(&project).unwrap();
+    let path = project.to_str().unwrap().to_string();
+    assert!(git(&["init", "-q", "-b", "main", &path]).status.success());
+    path
+}
+
+#[test]
+fn commits_on_other_local_branches_are_counted_once() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "branches");
+    const ME: &str = "Fixture <fixture@example.com>";
+
+    commit_as(&path, "src/lib.rs", "one\n", ME, &["on main"]);
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "-b", "side"])
+            .status
+            .success()
+    );
+    commit_as(&path, "src/side.rs", "two\nthree\n", ME, &["on side"]);
+    // Back on `main`: HEAD no longer reaches the side branch's commit.
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "main"])
+            .status
+            .success()
+    );
+    let head_only = git(&["-C", &path, "rev-list", "--count", "HEAD"]);
+    assert_eq!("1", String::from_utf8_lossy(&head_only.stdout).trim());
+
+    let report = git_report(&path, &["--author", "fixture@example.com"]);
+    assert_eq!(2, report["summary"]["commit_count"]);
+    assert_eq!(3, report["summary"]["additions"]);
+
+    // A detached HEAD on a commit no branch names still counts, and a commit
+    // reachable from both HEAD and a branch is not counted twice.
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "--detach", "side"])
+            .status
+            .success()
+    );
+    commit_as(&path, "src/loose.rs", "four\n", ME, &["detached"]);
+    let report = git_report(&path, &["--author", "fixture@example.com"]);
+    assert_eq!(3, report["summary"]["commit_count"]);
+}
+
+/// Git is asked for `--numstat` only for the commits inside the window. A
+/// wrapper around the real Git, named through `WORKSTATS_GIT`, records what
+/// reaches the diff phase on its standard input.
+#[cfg(unix)]
+#[test]
+fn only_in_window_commits_are_diffed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "history");
+    commit_on(&path, "src/jan.rs", "1\n", "2026-01-10");
+    commit_on(&path, "src/feb.rs", "1\n2\n", "2026-02-10");
+    commit_on(&path, "src/mar.rs", "1\n2\n3\n", "2026-03-10");
+    // A later commit and a rebase-style one: authored in February, committed in
+    // April. It belongs to February, so it must be diffed for February.
+    fs::write(Path::new(&path).join("src/rebased.rs"), "1\n").unwrap();
+    assert!(git(&["-C", &path, "add", "."]).status.success());
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &path,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "rebased",
+            "--author=Fixture <fixture@example.com>",
+        ])
+        .env("GIT_AUTHOR_DATE", "2026-02-20T12:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-04-01T12:00:00Z")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let shas = |extra: &[&str]| -> Vec<String> {
+        let mut arguments = vec!["-C", path.as_str(), "log", "--all", "--format=%H %s"];
+        arguments.extend(extra);
+        String::from_utf8(git(&arguments).stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let all = shas(&[]);
+    let sha_of = |subject: &str| {
+        all.iter()
+            .find_map(|line| line.strip_suffix(&format!(" {subject}")))
+            .unwrap()
+            .to_string()
+    };
+
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let log = temporary.path().join("stdin.log");
+    let wrapper = temporary.path().join("git-wrapper");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *--stdin*) tee -a \"{log}\" | exec \"{real}\" \"$@\" ;;\n  *) exec \"{real}\" \"$@\" ;;\nesac\n",
+            log = log.display(),
+            real = real.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let february = report_with_env(
+        &path,
+        &["--author", "fixture@example.com", "--month", "2026-02"],
+        &[("WORKSTATS_GIT", wrapper.to_str().unwrap())],
+    );
+    // Feb and the rebased commit, counted with their lines.
+    assert_eq!(2, february["summary"]["commit_count"]);
+    assert_eq!(3, february["summary"]["additions"]);
+
+    let diffed: std::collections::BTreeSet<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        std::collections::BTreeSet::from([sha_of("src/feb.rs"), sha_of("rebased")]),
+        diffed,
+        "only the commits authored in February may reach the diff phase"
+    );
+    // The January and March commits were listed and never diffed.
+    for other in ["src/jan.rs", "src/mar.rs"] {
+        assert!(!diffed.contains(&sha_of(other)), "{other}");
+    }
+}
+
+#[test]
+fn merge_commits_are_not_counted_and_their_branches_commits_are() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "merged");
+    commit_on(&path, "src/base.rs", "1\n", "2026-03-01");
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "-b", "side"])
+            .status
+            .success()
+    );
+    commit_on(&path, "src/side.rs", "1\n2\n", "2026-03-02");
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "main"])
+            .status
+            .success()
+    );
+    commit_on(&path, "src/main.rs", "1\n2\n3\n", "2026-03-03");
+    let merge = Command::new("git")
+        .args([
+            "-C",
+            &path,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "merge side",
+            "side",
+        ])
+        .env("GIT_AUTHOR_DATE", "2026-03-04T12:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-03-04T12:00:00Z")
+        .output()
+        .unwrap();
+    assert!(merge.status.success());
+
+    let report = git_report(
+        &path,
+        &["--author", "fixture@example.com", "--month", "2026-03"],
+    );
+    assert_eq!(3, report["summary"]["commit_count"]);
+    assert_eq!(6, report["summary"]["additions"]);
+}
+
+#[test]
+fn the_window_is_the_author_date_not_the_committer_date() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "dates");
+    const ME: &str = "Fixture <fixture@example.com>";
+
+    // (file, author date, committer date)
+    let commits = [
+        // Authored before the window, committed inside it: a rebase or a
+        // cherry-pick. Not March work.
+        ("before.rs", "2026-02-10T10:00:00Z", "2026-03-15T10:00:00Z"),
+        // Authored and committed inside the window.
+        ("both.rs", "2026-03-12T10:00:00Z", "2026-03-12T10:00:00Z"),
+        // Authored inside the window, amended after it: still March work.
+        ("amended.rs", "2026-03-10T10:00:00Z", "2026-05-20T10:00:00Z"),
+    ];
+    for (file, authored, committed) in commits {
+        fs::write(Path::new(&path).join(file), "line\n").unwrap();
+        assert!(git(&["-C", &path, "add", "."]).status.success());
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &path,
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-q",
+                "-m",
+                file,
+                &format!("--author={ME}"),
+            ])
+            .env("GIT_AUTHOR_DATE", authored)
+            .env("GIT_COMMITTER_DATE", committed)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let march = git_report(
+        &path,
+        &["--author", "fixture@example.com", "--month", "2026-03"],
+    );
+    assert_eq!(
+        2, march["summary"]["commit_count"],
+        "the amended commit belongs to March and the rebased one does not"
+    );
+    assert_eq!(2, march["summary"]["additions"]);
+
+    // The same two bounds spelled as a range behave the same way.
+    let range = git_report(
+        &path,
+        &[
+            "--author",
+            "fixture@example.com",
+            "--since",
+            "2026-03-01",
+            "--until",
+            "2026-03-31",
+        ],
+    );
+    assert_eq!(2, range["summary"]["commit_count"]);
+
+    let everything = git_report(&path, &["--author", "fixture@example.com"]);
+    assert_eq!(3, everything["summary"]["commit_count"]);
+}
+
+/// Dates a whole day clear of any Monday boundary, so the expected ISO weeks
+/// hold in whatever timezone the suite runs in: 27 December 2025 is in the last
+/// week of 2025, 1 and 2 January 2026 are in the first week of 2026.
+#[test]
+fn period_week_groups_by_iso_week_across_a_year_boundary() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "weeks");
+    for (file, authored) in [
+        ("december.rs", "2025-12-27T12:00:00Z"),
+        ("january-a.rs", "2026-01-01T12:00:00Z"),
+        ("january-b.rs", "2026-01-02T12:00:00Z"),
+    ] {
+        fs::write(Path::new(&path).join(file), "line\n").unwrap();
+        assert!(git(&["-C", &path, "add", "."]).status.success());
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &path,
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-q",
+                "-m",
+                file,
+            ])
+            .env("GIT_AUTHOR_DATE", authored)
+            .env("GIT_COMMITTER_DATE", authored)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let author = ["--author", "fixture@example.com"];
+
+    let weekly = git_report(&path, &[author.as_slice(), &["--period", "week"]].concat());
+    let weeks: Vec<(&str, u64)> = weekly["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["key"]["week"].as_str().unwrap(),
+                row["commit_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    // Newest first, like every calendar grouping.
+    assert_eq!(vec![("2026-W01", 2), ("2025-W52", 1)], weeks);
+
+    let first_week = git_report(
+        &path,
+        &[author.as_slice(), &["--week", "2026-W01"]].concat(),
+    );
+    assert_eq!(2, first_week["summary"]["commit_count"]);
+    let last_week = git_report(
+        &path,
+        &[author.as_slice(), &["--week", "2025-W52"]].concat(),
+    );
+    assert_eq!(1, last_week["summary"]["commit_count"]);
+
+    // The same window, asked for with --group-by, renders in the table and CSV.
+    let csv = run(&[
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--group-by",
+        "week",
+        "--format",
+        "csv",
+    ]);
+    assert!(csv.status.success());
+    let csv = String::from_utf8_lossy(&csv.stdout);
+    assert!(
+        csv.lines()
+            .next()
+            .unwrap()
+            .split(',')
+            .any(|name| name == "week")
+    );
+    assert!(csv.contains("2026-W01"), "{csv}");
+    assert!(csv.contains("2025-W52"), "{csv}");
+
+    let table = run(&[
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--period",
+        "week",
+    ]);
+    assert!(table.status.success());
+    assert!(String::from_utf8_lossy(&table.stdout).contains("2026-W01"));
+
+    // A week that does not exist is refused, and so is mixing calendars.
+    let missing = run(&["--no-ai", "--no-git", "--week", "2025-W53"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--week"));
+    let mixed = run(&["--no-ai", "--no-git", "--group-by", "week,month"]);
+    assert_eq!(Some(2), mixed.status.code());
+    let conflicting = run(&[
+        "--no-ai", "--no-git", "--week", "2026-W01", "--month", "2026-01",
+    ]);
+    assert_eq!(Some(2), conflicting.status.code());
+}
+
+#[test]
+fn several_author_identities_are_one_developer() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "identities");
+    commit_as(&path, "a.rs", "1\n", "A <a@example.com>", &["a"]);
+    commit_as(&path, "b.rs", "1\n", "B <b@example.com>", &["b"]);
+    commit_as(&path, "c.rs", "1\n", "C <c@example.com>", &["c"]);
+    let count = |report: &Value| report["summary"]["commit_count"].as_u64().unwrap();
+
+    let flags = git_report(&path, &["-a", "a@example.com", "--author", "b@example.com"]);
+    assert_eq!(2, count(&flags));
+    assert_eq!(
+        vec!["a@example.com", "b@example.com"],
+        flags["inputs"]["authors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!("a@example.com, b@example.com", flags["inputs"]["author"]);
+
+    // Config < environment < flags.
+    let config = temporary.path().join("config.json");
+    fs::write(
+        &config,
+        r#"{"authors": ["a@example.com", "c@example.com"]}"#,
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let from_config = git_report(&path, &["--config", config]);
+    assert_eq!(2, count(&from_config));
+    assert_eq!(
+        "a@example.com, c@example.com",
+        from_config["inputs"]["author"]
+    );
+
+    let from_environment = report_with_env(
+        &path,
+        &["--config", config],
+        &[("WORKSTATS_AUTHOR", "b@example.com")],
+    );
+    assert_eq!(1, count(&from_environment));
+    assert_eq!(
+        1,
+        from_environment["inputs"]["authors"]
+            .as_array()
+            .unwrap()
+            .len()
+    );
+
+    let from_flag = report_with_env(
+        &path,
+        &["--config", config, "--author", "c@example.com"],
+        &[("WORKSTATS_AUTHOR", "b@example.com")],
+    );
+    assert_eq!(1, count(&from_flag));
+    assert_eq!("c@example.com", from_flag["inputs"]["author"]);
+}
+
+/// A string used to make serde discard the whole config with a warning.
+#[test]
+fn a_single_author_string_in_the_config_is_accepted_and_other_types_are_refused() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "identities");
+    commit_as(&path, "a.rs", "1\n", "A <a@example.com>", &["a"]);
+    commit_as(&path, "b.rs", "1\n", "B <b@example.com>", &["b"]);
+    let config = temporary.path().join("config.json");
+    let config_path = config.to_str().unwrap();
+
+    fs::write(&config, r#"{"authors": "a@example.com"}"#).unwrap();
+    let report = git_report(&path, &["--config", config_path]);
+    assert_eq!(1, report["summary"]["commit_count"]);
+    assert_eq!("a@example.com", report["inputs"]["author"]);
+    assert_eq!(0, report["diagnostics"]["warning_count"]);
+
+    fs::write(&config, r#"{"authors": 7, "defaults": {"format": "json"}}"#).unwrap();
+    let output = run(&[
+        "--dir",
+        &path,
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--config",
+        config_path,
+    ]);
+    assert_eq!(Some(2), output.status.code());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"authors\""), "{stderr}");
+    assert!(!stderr.contains("config ignored"), "{stderr}");
+}
+
+fn allocate_with_config(directory: &Path, config: &str, format: &str) -> Output {
+    let ada = directory.join("ada");
+    let other = directory.join("other");
+    fs::create_dir_all(&ada).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    let history = directory.join("pi-sessions");
+    // A model the built-in table has never heard of, ten times the tokens.
+    pi_session(&history, "a1", &ada, "acme-coder-1", 10);
+    pi_session(&history, "a2", &other, "claude-opus-5", 90);
+    let config_file = directory.join("config.json");
+    fs::write(&config_file, config).unwrap();
+    run(&[
+        "allocate",
+        "-p",
+        "ada",
+        "--sub",
+        "claude=1",
+        "--basis",
+        "value",
+        "--month",
+        "2026-03",
+        "--no-git",
+        "--provider",
+        "pi",
+        "--history",
+        &format!("pi={}", history.display()),
+        "--config",
+        config_file.to_str().unwrap(),
+        "--format",
+        format,
+    ])
+}
+
+/// A model the table lacks is "unpriced" and drops out of the value basis;
+/// a `model_rates` entry prices it, and the output says whose rate was used.
+#[test]
+fn allocate_prices_unknown_models_from_config_rate_overrides() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"model_rates": {"acme-coder": {
+        "input": 0, "cache_write": 0, "cache_read": 0, "output": 25, "family": "claude"}}}"#;
+    let output = allocate_with_config(directory.path(), config, "json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let allocation: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Ada's 10 output tokens at $25 against 90 of Opus at $25: a 10% claim
+    // (give or take the one input token the fixture adds). Unpriced, Ada would
+    // have had no value at all.
+    let share = allocation["effective_share"].as_f64().unwrap();
+    assert!((share - 0.1).abs() < 1e-3, "got {share}");
+    assert_eq!(
+        serde_json::json!(["acme-coder"]),
+        allocation["rate_overrides"]
+    );
+    let acme = allocation["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["model"] == "acme-coder-1")
+        .unwrap();
+    assert_eq!("override", acme["rate_source"]);
+    assert_eq!(true, acme["priced"]);
+
+    let table = allocate_with_config(directory.path(), config, "table");
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(
+        text.contains("overridden by model_rates: acme-coder"),
+        "the override must be visible beside the rates-as-of line, got {text}"
+    );
+}
+
+#[test]
+fn allocate_json_carries_the_config_defaults_its_report_used() {
+    let directory = tempdir().unwrap();
+    let with = allocate_with_config(
+        directory.path(),
+        r#"{"defaults": {"human_idle": "45m"}}"#,
+        "json",
+    );
+    let with = json_stdout(&with);
+    assert_eq!(
+        serde_json::json!({"human_idle": "45m"}),
+        with["config_defaults"]
+    );
+
+    let without = allocate_with_config(directory.path(), "{}", "json");
+    assert!(json_stdout(&without).get("config_defaults").is_none());
+}
+
+/// One misspelt field used to make serde discard the whole config with a
+/// warning, silently losing the rest of it (authors, defaults, aliases).
+#[test]
+fn a_misspelt_model_rates_field_is_a_hard_error_naming_the_key() {
+    let directory = tempdir().unwrap();
+    for (config, expected) in [
+        (
+            r#"{"authors": ["me@example.com"], "model_rates": {"acme-coder": {
+                "inptu": 1, "cache_write": 1, "cache_read": 1, "output": 2}}}"#,
+            "model_rates.acme-coder",
+        ),
+        (
+            r#"{"defaults": {"format": "json"}, "model_rates": {"acme-coder": {
+                "input": "fast", "cache_write": 1, "cache_read": 1, "output": 2}}}"#,
+            "model_rates.acme-coder",
+        ),
+        (r#"{"model_rates": ["acme-coder"]}"#, "model_rates"),
+    ] {
+        let output = run_with_defaults(directory.path(), config, &[]);
+        assert_eq!(Some(2), output.status.code(), "{config}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{config}: {stderr}");
+        assert!(!stderr.contains("ignoring config"), "{config}: {stderr}");
+    }
+    let output = run_with_defaults(
+        directory.path(),
+        r#"{"model_rates": {"acme-coder": {"inptu": 1}}}"#,
+        &[],
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inptu"));
+}
+
+/// A bad override is refused by name rather than silently priced at nonsense.
+#[test]
+fn allocate_refuses_invalid_rate_overrides_naming_the_key() {
+    let directory = tempdir().unwrap();
+    let output = allocate_with_config(
+        directory.path(),
+        r#"{"model_rates": {"acme-coder": {
+            "input": 1, "cache_write": 1, "cache_read": 1, "output": -3}}}"#,
+        "json",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("model_rates")
+            && stderr.contains("acme-coder")
+            && stderr.contains("output"),
+        "got {stderr}"
+    );
+
+    let output = allocate_with_config(
+        directory.path(),
+        r#"{"model_rates": {"acme-coder": {
+            "input": 1, "cache_write": 1, "cache_read": 1, "output": 3, "family": "bedrock"}}}"#,
+        "json",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("acme-coder") && stderr.contains("bedrock"),
+        "got {stderr}"
+    );
+}
+
+/// Runs a report against a config file holding `config`, with the
+/// environment variables that would otherwise leak into precedence removed.
+fn run_with_defaults(directory: &Path, config: &str, arguments: &[&str]) -> Output {
+    let config_file = directory.join("config.json");
+    fs::write(&config_file, config).unwrap();
+    Command::new(binary())
+        .args([
+            "--no-ai",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--config",
+            config_file.to_str().unwrap(),
+        ])
+        .args(arguments)
+        .env_remove("WORKSTATS_DIR")
+        .env_remove("WORKSTATS_AUTHOR")
+        .output()
+        .unwrap()
+}
+
+fn json_stdout(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// `defaults` fills in flags that were not given, and a flag given with the
+/// very value the built-in default has still wins over the config.
+#[test]
+fn config_defaults_fill_unset_flags_and_never_override_explicit_ones() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"defaults": {"format": "json", "human_idle": "45m", "review_credit": "10m"}}"#;
+
+    let report = json_stdout(&run_with_defaults(directory.path(), config, &[]));
+    assert_eq!("45m", report["inputs"]["human_idle"]);
+    assert_eq!("10m", report["inputs"]["review_credit"]);
+    assert_eq!(
+        serde_json::json!({"format": "json", "human_idle": "45m", "review_credit": "10m"}),
+        report["inputs"]["config_defaults"]
+    );
+
+    // --human-idle 1h is the built-in value; it must still beat the config.
+    let report = json_stdout(&run_with_defaults(
+        directory.path(),
+        config,
+        &["--human-idle", "1h", "--format", "json"],
+    ));
+    assert_eq!("1h", report["inputs"]["human_idle"]);
+    assert_eq!("10m", report["inputs"]["review_credit"]);
+    assert_eq!(
+        serde_json::json!({"review_credit": "10m"}),
+        report["inputs"]["config_defaults"]
+    );
+
+    // --format table is the built-in value too: the output must not be JSON.
+    let table = run_with_defaults(directory.path(), config, &["--format", "table"]);
+    assert!(table.status.success());
+    assert!(serde_json::from_slice::<Value>(&table.stdout).is_err());
+}
+
+#[test]
+fn config_default_dir_sits_between_the_environment_and_the_working_directory() {
+    let directory = tempdir().unwrap();
+    let configured = tempdir().unwrap();
+    let environment = tempdir().unwrap();
+    let flagged = tempdir().unwrap();
+    let config = format!(
+        r#"{{"defaults": {{"format": "json", "dir": {:?}}}}}"#,
+        configured.path().to_str().unwrap()
+    );
+
+    let root = |output: &Output| json_stdout(output)["inputs"]["git_root"].clone();
+    assert_eq!(
+        configured.path().to_str().unwrap(),
+        root(&run_with_defaults(directory.path(), &config, &[]))
+            .as_str()
+            .unwrap()
+    );
+
+    let config_file = directory.path().join("config.json");
+    let with_environment = Command::new(binary())
+        .args([
+            "--no-ai",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--config",
+        ])
+        .arg(&config_file)
+        .env("WORKSTATS_DIR", environment.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        environment.path().to_str().unwrap(),
+        root(&with_environment).as_str().unwrap()
+    );
+
+    let with_flag = Command::new(binary())
+        .args([
+            "--no-ai",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--config",
+        ])
+        .arg(&config_file)
+        .arg("--dir")
+        .arg(flagged.path())
+        .env("WORKSTATS_DIR", environment.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        flagged.path().to_str().unwrap(),
+        root(&with_flag).as_str().unwrap()
+    );
+}
+
+#[test]
+fn config_default_dir_is_recorded_only_when_it_was_the_source() {
+    let directory = tempdir().unwrap();
+    let configured = tempdir().unwrap();
+    let flagged = tempdir().unwrap();
+    let config = format!(
+        r#"{{"defaults": {{"format": "json", "dir": {:?}}}}}"#,
+        configured.path().to_str().unwrap()
+    );
+
+    let used = json_stdout(&run_with_defaults(directory.path(), &config, &[]));
+    assert_eq!(
+        configured.path().to_str().unwrap(),
+        used["inputs"]["config_defaults"]["dir"].as_str().unwrap()
+    );
+    let flag = flagged.path().to_str().unwrap();
+    let overridden = json_stdout(&run_with_defaults(
+        directory.path(),
+        &config,
+        &["--dir", flag],
+    ));
+    assert!(overridden["inputs"]["config_defaults"].get("dir").is_none());
+}
+
+#[test]
+fn config_defaults_that_applied_are_listed_in_every_human_readable_output() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"defaults": {"providers": ["claude", "codex"], "group_by": "repo,month"}}"#;
+    let note = "Config defaults: group_by=repo,month; providers=claude,codex";
+
+    let table = run_with_defaults(directory.path(), config, &[]);
+    assert!(table.status.success());
+    assert!(String::from_utf8_lossy(&table.stdout).contains(note));
+    let markdown = run_with_defaults(directory.path(), config, &["--format", "markdown"]);
+    assert!(
+        String::from_utf8_lossy(&markdown.stdout)
+            .contains("Config defaults: group\\_by=repo,month"),
+        "{}",
+        String::from_utf8_lossy(&markdown.stdout)
+    );
+    let html = run_with_defaults(directory.path(), config, &["--format", "html"]);
+    assert!(String::from_utf8_lossy(&html.stdout).contains(note));
+    // `allocate` reads its own `--config`, and a run with its own flags for
+    // everything else still lists what the config supplied.
+    for format in ["table", "markdown", "html"] {
+        let allocation = allocate_with_config(
+            directory.path(),
+            r#"{"defaults": {"human_idle": "45m"}}"#,
+            format,
+        );
+        assert!(
+            allocation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&allocation.stderr)
+        );
+        let text = String::from_utf8_lossy(&allocation.stdout);
+        assert!(
+            text.contains("Config defaults: human_idle=45m")
+                || text.contains("Config defaults: human\\_idle=45m"),
+            "{format}: {text}"
+        );
+    }
+
+    // Nothing applied, nothing said: flags given on the command line win.
+    let typed = run_with_defaults(
+        directory.path(),
+        config,
+        &["--provider", "pi", "--group-by", "repo"],
+    );
+    assert!(!String::from_utf8_lossy(&typed.stdout).contains("Config defaults"));
+}
+
+#[test]
+fn refusals_blame_the_config_when_the_format_came_from_it() {
+    let directory = tempdir().unwrap();
+    let window = ["--month", "2026-03", "--compare", "previous"];
+    let config = r#"{"defaults": {"format": "csv"}}"#.to_string();
+    let output = run_with_defaults(directory.path(), &config, &window);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("defaults.format \"csv\" (from config)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("pass --format table or --format json"),
+        "{error}"
+    );
+    assert!(!error.contains("with --format csv"), "{error}");
+
+    // Given on the command line, the flag is what to change.
+    let typed = run_with_defaults(
+        directory.path(),
+        &config,
+        &[
+            "--format", "csv", window[0], window[1], window[2], window[3],
+        ],
+    );
+    let error = String::from_utf8_lossy(&typed.stderr);
+    assert!(error.contains("with --format csv"), "{error}");
+    for format in ["csv", "markdown", "html"] {
+        let config = format!(r#"{{"defaults": {{"format": "{format}"}}}}"#);
+        let output = run_with_defaults(directory.path(), &config, &["--explain-human-time"]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(&format!("defaults.format \"{format}\" (from config)")),
+            "{error}"
+        );
+        assert!(
+            error.contains("pass --format table or --format json"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_config_calendar_grouping_gives_way_to_an_explicit_period() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"defaults": {"format": "json", "group_by": "repo,month"}}"#;
+    let report = json_stdout(&run_with_defaults(
+        directory.path(),
+        config,
+        &["--period", "week"],
+    ));
+    assert_eq!(serde_json::json!(["repo", "week"]), report["group_by"]);
+    assert_eq!(
+        serde_json::json!({"format": "json", "group_by": "repo"}),
+        report["inputs"]["config_defaults"]
+    );
+    // Without the flag the config's own grouping stands.
+    let report = json_stdout(&run_with_defaults(directory.path(), config, &[]));
+    assert_eq!(serde_json::json!(["repo", "month"]), report["group_by"]);
+}
+
+#[test]
+fn config_defaults_refuse_unknown_keys_and_bad_values_naming_them() {
+    let directory = tempdir().unwrap();
+    for (config, expected) in [
+        (r#"{"defaults": {"depht": 2}}"#, "depht"),
+        (r#"{"defaults": {"gap_cap": "soon"}}"#, "defaults.gap_cap"),
+        (r#"{"defaults": {"format": "xml"}}"#, "defaults.format"),
+        (r#"{"defaults": {"depth": "deep"}}"#, "defaults.depth"),
+        (
+            r#"{"defaults": {"dir": "/nonexistent/workstats"}}"#,
+            "defaults.dir",
+        ),
+    ] {
+        let output = run_with_defaults(directory.path(), config, &[]);
+        assert_eq!(Some(2), output.status.code(), "{config}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{config}: {stderr}");
+    }
+}
+
+/// A one-commit repository to render the report from, plus the flags that
+/// select it alone: no AI history, no cache, no progress line.
+fn document_fixture(temporary: &Path) -> (String, Vec<String>) {
+    let project = temporary.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.to_str().unwrap().to_string();
+    assert!(git(&["init", "-q", &path]).status.success());
+    commit_as(
+        &path,
+        "src/lib.rs",
+        "one\ntwo\nthree\n",
+        "Fixture <fixture@example.com>",
+        &["areas"],
+    );
+    let arguments = [
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    (path, arguments)
+}
+
+fn run_with_format(base: &[String], format: &str) -> Output {
+    let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+    arguments.extend(["--format", format]);
+    run(&arguments)
+}
+
+#[test]
+fn markdown_report_mirrors_the_table_sections_and_figures() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = document_fixture(temporary.path());
+    let table = run_with_format(&base, "table");
+    let markdown = run_with_format(&base, "markdown");
+    assert!(markdown.status.success());
+    // Nothing but the document on either stream.
+    assert!(markdown.stderr.is_empty());
+    let table = String::from_utf8_lossy(&table.stdout);
+    let markdown = String::from_utf8(markdown.stdout).unwrap();
+
+    assert!(markdown.starts_with("# WORKSTATS\n"), "{markdown}");
+    for heading in [
+        "## Summary",
+        "## Work composition",
+        "## By repo",
+        "## Notes",
+    ] {
+        assert!(markdown.contains(heading), "missing {heading}\n{markdown}");
+    }
+    assert!(markdown.contains("| Measure | Value |\n| --- | --- |"));
+    assert!(
+        markdown
+            .contains("| Work area | Human | Days | Avg/day | Commits | AI wall | Agent work |")
+    );
+    assert!(markdown.contains("| --- | ---: | ---: | ---: | ---: | ---: | ---: |"));
+    // The same formatted figure appears in both views.
+    let human = markdown
+        .lines()
+        .find_map(|line| line.strip_prefix("| Estimated human work | "))
+        .unwrap()
+        .trim_end_matches(" |");
+    assert!(
+        table.contains(&format!("Estimated human work  {human}")),
+        "{table}"
+    );
+    assert!(markdown.contains("| Git lines | +3 / -0 |"));
+    // No update notice, which the table may print after the report.
+    assert!(!markdown.contains("is available"));
+}
+
+#[test]
+fn html_report_is_one_self_contained_static_page() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = document_fixture(temporary.path());
+    let output = run_with_format(&base, "html");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let html = String::from_utf8(output.stdout).unwrap();
+
+    assert!(html.starts_with("<!doctype html>"), "{html}");
+    assert!(html.ends_with("</html>\n"));
+    assert!(html.contains("<style>"));
+    assert!(html.contains("prefers-color-scheme"));
+    assert!(html.contains("<h2>Summary</h2>"));
+    assert!(html.contains("<td class=\"num\">"));
+    // Offline by construction: no script, nothing referenced, nothing fetched.
+    for forbidden in [
+        "http://", "https://", "<script", "<link", "<img", "<iframe", "@import", "url(", " src=",
+        " href=",
+    ] {
+        assert!(!html.contains(forbidden), "found {forbidden}\n{html}");
+    }
+}
+
+/// The working directory of an event is an arbitrary string, which makes it the
+/// cross-platform way to put hostile text in a row label — a directory called
+/// `<script>` cannot exist on Windows, and `record --model` refuses the
+/// characters that matter here. The hostile part carries no slash, so it
+/// survives each platform's normalisation of the path around it unchanged.
+#[test]
+fn hostile_row_labels_are_escaped_in_markdown_and_html() {
+    let directory = tempdir().unwrap();
+    let events = directory.path().join("events.jsonl");
+    let hostile = "/x/<img src=x onerror=alert(1)>&\"x\"|`y`";
+    let line = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "provider": "cursor",
+        "session_id": "one",
+        "cwd": hostile,
+        "model": "abc",
+        "event": "prompt",
+        "role": "foreground",
+    });
+    fs::write(&events, format!("{line}\n")).unwrap();
+    let render = |format: &str| {
+        let output = run(&[
+            "--no-git",
+            "--provider",
+            "cursor",
+            "--events",
+            events.to_str().unwrap(),
+            "--no-default-events",
+            "--no-cache",
+            "--no-progress",
+            "--group-by",
+            "cwd",
+            "--format",
+            format,
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let html = render("html");
+    assert!(!html.contains("<img"), "{html}");
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(1)&gt;&amp;&quot;x&quot;|`y`"),
+        "{html}"
+    );
+
+    let markdown = render("markdown");
+    assert!(
+        markdown.contains(r#"\<img src=x onerror=alert(1)\>\&"x"\|\`y\` |"#),
+        "{markdown}"
+    );
+    // The row stayed one row: the pipe did not add a column.
+    let row = markdown
+        .lines()
+        .find(|line| line.contains("alert(1)"))
+        .unwrap();
+    assert_eq!(8, row.matches('|').count() - row.matches("\\|").count());
+}
+
+#[test]
+fn allocate_renders_markdown_and_html() {
+    let directory = tempdir().unwrap();
+    let ada = directory.path().join("ada");
+    fs::create_dir_all(&ada).unwrap();
+    let history = directory.path().join("pi-sessions");
+    pi_session(&history, "a1", &ada, "claude-opus-5", 60);
+    let render = |format: &str| {
+        let output = run(&[
+            "allocate",
+            "-p",
+            "ada",
+            "--sub",
+            "claude=2",
+            "--price",
+            "200",
+            "--month",
+            "2026-03",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--provider",
+            "pi",
+            "--history",
+            &format!("pi={}", history.display()),
+            "--format",
+            format,
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let markdown = render("markdown");
+    assert!(markdown.starts_with("# Allocation\n"), "{markdown}");
+    assert!(markdown.contains("Project: ada"));
+    assert!(
+        markdown
+            .contains("| Month | Family | Subs | Plan/mo | Project | Pool | Share | Owed | Note |")
+    );
+    assert!(markdown.contains("| **Attributable** |"));
+    assert!(markdown.contains("## Cross-check"));
+
+    let html = render("html");
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("<tfoot>"));
+    assert!(!html.contains("<script"), "{html}");
+    assert!(!html.contains("http://") && !html.contains("https://"));
+}
+
+#[test]
+fn markdown_and_html_are_refused_where_they_have_no_meaning() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = document_fixture(temporary.path());
+    for format in ["markdown", "html"] {
+        let sources = run(&["sources", "--format", format]);
+        assert!(!sources.status.success());
+        assert!(
+            String::from_utf8_lossy(&sources.stderr)
+                .contains("not available for `workstats sources`")
+        );
+        let classify = run(&["classify", "src/lib.rs", "--format", format]);
+        assert!(!classify.status.success());
+
+        let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+        arguments.extend(["--explain-human-time", "--format", format]);
+        let explained = run(&arguments);
+        assert!(!explained.status.success());
+        assert!(
+            String::from_utf8_lossy(&explained.stderr)
+                .contains(&format!("not available with --format {format}"))
+        );
+        let ui = run(&["ui", "--format", format]);
+        assert!(!ui.status.success());
+    }
+}
+
+/// Commits `body` to `file` as the fixture developer at noon UTC on `day`, a
+/// whole half-day clear of any local midnight so the month it lands in does not
+/// depend on the timezone the suite runs in.
+fn commit_on(repo: &str, file: &str, body: &str, day: &str) {
+    fs::create_dir_all(Path::new(repo).join(file).parent().unwrap()).unwrap();
+    fs::write(Path::new(repo).join(file), body).unwrap();
+    assert!(git(&["-C", repo, "add", "."]).status.success());
+    let date = format!("{day}T12:00:00Z");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-q",
+            "-m",
+            file,
+            "--author=Fixture <fixture@example.com>",
+        ])
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// February has two commits (two source lines, one test line), March three
+/// (eight source lines, three test lines), and January none. Each month has one
+/// Pi session in the repository, so AI figures exist on both sides.
+fn compare_fixture(temporary: &Path) -> (String, Vec<String>) {
+    let path = repository_on_main(temporary, "compared");
+    commit_on(&path, "src/a.rs", "1\n2\n", "2026-02-10");
+    commit_on(&path, "tests/a.rs", "1\n", "2026-02-11");
+    commit_on(&path, "src/b.rs", "1\n2\n3\n", "2026-03-10");
+    commit_on(&path, "src/c.rs", "1\n2\n3\n4\n5\n", "2026-03-11");
+    commit_on(&path, "tests/b.rs", "1\n2\n3\n", "2026-03-12");
+    let history = temporary.join("pi-sessions");
+    pi_session_on(
+        &history,
+        "feb",
+        Path::new(&path),
+        "claude-opus-5",
+        10,
+        "2026-02-10",
+    );
+    pi_session_on(
+        &history,
+        "mar",
+        Path::new(&path),
+        "claude-opus-5",
+        10,
+        "2026-03-10",
+    );
+    let arguments = [
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-cache",
+        "--no-progress",
+        "--provider",
+        "pi",
+        "--history",
+        &format!("pi={}", history.display()),
+        "--format",
+        "json",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    (path, arguments)
+}
+
+fn report_json(base: &[String], extra: &[&str]) -> Value {
+    let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+    arguments.extend(extra);
+    let output = run(&arguments);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn failure(base: &[String], extra: &[&str]) -> String {
+    let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+    arguments.extend(extra);
+    let output = run(&arguments);
+    assert!(!output.status.success(), "expected {extra:?} to be refused");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn compare_previous_puts_each_side_where_a_standalone_run_would() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    let march = report_json(&base, &["--month", "2026-03"]);
+    let february = report_json(&base, &["--month", "2026-02"]);
+    let compared = report_json(&base, &["--month", "2026-03", "--compare", "previous"]);
+
+    // The report itself is the selected window's, as if --compare were absent,
+    // and the flag adds only a `comparison` block.
+    assert!(march.get("comparison").is_none());
+    let mut without = compared.clone();
+    without.as_object_mut().unwrap().remove("comparison");
+    assert_eq!(march["summary"], without["summary"]);
+    assert_eq!(march["rows"], without["rows"]);
+    assert_eq!(
+        march["inputs"]["git_scan_roots"],
+        without["inputs"]["git_scan_roots"]
+    );
+
+    let comparison = &compared["comparison"];
+    assert_eq!("previous", comparison["basis"]);
+    assert_eq!("2026-03", comparison["current"]["label"]);
+    assert_eq!("2026-02", comparison["previous"]["label"]);
+    assert!(
+        comparison["note"]
+            .as_str()
+            .unwrap()
+            .contains("not stopwatch times")
+    );
+
+    // Both sides match the windows run on their own, figure for figure.
+    for (side, standalone) in [("current", &march), ("previous", &february)] {
+        let figures = &comparison[side]["figures"];
+        let summary = &standalone["summary"];
+        for key in [
+            "commit_count",
+            "additions",
+            "deletions",
+            "session_count",
+            "human_estimated_seconds",
+            "human_active_days",
+            "prompt_signal_count",
+            "parallel_agent_seconds",
+        ] {
+            assert_eq!(summary[key], figures[key], "{side} {key}");
+        }
+    }
+    assert_eq!(3, comparison["current"]["figures"]["commit_count"]);
+    assert_eq!(2, comparison["previous"]["figures"]["commit_count"]);
+    assert_eq!(1, comparison["current"]["figures"]["session_count"]);
+    assert_eq!(1, comparison["previous"]["figures"]["session_count"]);
+
+    let delta = &comparison["delta"];
+    assert_eq!(1.0, delta["commit_count"]["change"]);
+    assert_eq!(50.0, delta["commit_count"]["percent"]);
+    assert_eq!(8.0, delta["additions"]["change"]);
+    // Composition is compared per area in percentage points: source was 2 of 3
+    // changed lines in February and 8 of 11 in March.
+    let source = delta["composition"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|area| area["category"] == "source")
+        .unwrap();
+    // Shares are reported to three decimals (0.727 and 0.667), so the change is
+    // exactly six points rather than 6.06.
+    assert_eq!(6.0, source["change_points"].as_f64().unwrap(), "{source}");
+}
+
+/// A warning that does not depend on the window — here a malformed line in a
+/// transcript both passes read — is the selected window's own and already
+/// shown, so the baseline pass must not add a line about it: the compared
+/// report's warnings are exactly the standalone run's.
+#[test]
+fn compare_adds_no_warning_for_trouble_both_windows_share() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+    let history = temporary.path().join("pi-sessions");
+    let transcript = fs::read_dir(history.join("--feb--"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut body = fs::read_to_string(&transcript).unwrap();
+    body.push_str("not json\n");
+    fs::write(&transcript, body).unwrap();
+
+    let march = report_json(&base, &["--month", "2026-03"]);
+    let compared = report_json(&base, &["--month", "2026-03", "--compare", "previous"]);
+    let messages = march["diagnostics"]["messages"].as_array().unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.as_str().unwrap().contains("malformed")),
+        "the fixture must warn: {messages:?}"
+    );
+    assert_eq!(
+        march["diagnostics"]["messages"],
+        compared["diagnostics"]["messages"]
+    );
+    assert_eq!(
+        march["diagnostics"]["warning_count"],
+        compared["diagnostics"]["warning_count"]
+    );
+}
+
+#[test]
+fn compare_scans_the_same_checkouts_as_the_standalone_runs() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+    // A checkout outside --dir that only a January session points at, with a
+    // March commit: a standalone run scans it whatever the session's date, so
+    // --compare must not stop counting that commit.
+    let other = repository_on_main(temporary.path(), "other");
+    commit_on(&other, "src/o.rs", "1\n2\n", "2026-03-10");
+    pi_session_on(
+        &temporary.path().join("pi-sessions"),
+        "jan",
+        Path::new(&other),
+        "claude-opus-5",
+        10,
+        "2026-01-05",
+    );
+
+    for (month, compared_with) in [("2026-03", "previous"), ("2026-02", "2026-03")] {
+        let standalone = report_json(&base, &["--month", month]);
+        let compared = report_json(&base, &["--month", month, "--compare", compared_with]);
+        let roots = standalone["inputs"]["git_scan_roots"].as_array().unwrap();
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.as_str().unwrap().ends_with("other")),
+            "{month}: {roots:?}"
+        );
+        assert_eq!(standalone["summary"], compared["summary"], "{month}");
+        assert_eq!(standalone["rows"], compared["rows"], "{month}");
+        assert_eq!(
+            standalone["inputs"]["git_scan_roots"], compared["inputs"]["git_scan_roots"],
+            "{month}"
+        );
+        // The other side is the window a standalone run of it would print.
+        let side = if compared_with == "previous" {
+            "2026-02"
+        } else {
+            "2026-03"
+        };
+        let other_window = report_json(&base, &["--month", side]);
+        for key in ["commit_count", "additions", "deletions", "session_count"] {
+            assert_eq!(
+                other_window["summary"][key], compared["comparison"]["previous"]["figures"][key],
+                "{month} vs {side}: {key}"
+            );
+        }
+    }
+    let march = report_json(&base, &["--month", "2026-03"]);
+    assert_eq!(4, march["summary"]["commit_count"]);
+}
+
+/// Asserts that comparing `month` with `baseline` leaves the selected window's
+/// report exactly as a standalone run prints it, and that the baseline's
+/// figures are the ones a standalone run of that window reports.
+fn assert_compare_equals_standalone(
+    base: &[String],
+    extra: &[&str],
+    month: &str,
+    baseline: &str,
+    baseline_month: &str,
+) {
+    let mut standalone_arguments = vec!["--month", month];
+    standalone_arguments.extend(extra);
+    let standalone = report_json(base, &standalone_arguments);
+    let mut compared_arguments = standalone_arguments.clone();
+    compared_arguments.extend(["--compare", baseline]);
+    let compared = report_json(base, &compared_arguments);
+    for key in ["summary", "rows"] {
+        assert_eq!(standalone[key], compared[key], "{month} {key}");
+    }
+    assert_eq!(
+        standalone["inputs"]["git_scan_roots"], compared["inputs"]["git_scan_roots"],
+        "{month}"
+    );
+    let mut other_arguments = vec!["--month", baseline_month];
+    other_arguments.extend(extra);
+    let other = report_json(base, &other_arguments);
+    for key in ["commit_count", "additions", "deletions", "session_count"] {
+        assert_eq!(
+            other["summary"][key], compared["comparison"]["previous"]["figures"][key],
+            "{month} vs {baseline_month}: {key}"
+        );
+    }
+}
+
+#[test]
+fn compare_labels_repositories_as_the_standalone_runs_do() {
+    let temporary = tempdir().unwrap();
+    let checkouts = temporary.path().join("checkouts");
+    let mut arguments = vec!["--dir".to_string(), checkouts.to_str().unwrap().to_string()];
+    for (name, remote, day) in [
+        (
+            "one/product",
+            "https://github.com/acme/product.git",
+            "2026-03-10",
+        ),
+        (
+            "two/product",
+            "https://github.com/other/product.git",
+            "2026-02-10",
+        ),
+    ] {
+        let path = repository_on_main(&checkouts, name);
+        assert!(
+            git(&["-C", &path, "remote", "add", "origin", remote])
+                .status
+                .success()
+        );
+        commit_on(&path, "src/lib.rs", "1\n2\n", day);
+    }
+    arguments.extend(
+        [
+            "--author",
+            "fixture@example.com",
+            "--no-ai",
+            "--no-cache",
+            "--no-progress",
+            "--format",
+            "json",
+        ]
+        .map(str::to_string),
+    );
+
+    // Only one of the two same-named repositories is committed to in each
+    // window, so each window's standalone label is the plain name; the other
+    // window's repository must not turn it into `product [..]`.
+    for extra in [
+        vec!["--group-by", "repo"],
+        vec!["--group-by", "repo", "--repo-exact", "product"],
+    ] {
+        for (month, baseline, baseline_month) in [
+            ("2026-03", "previous", "2026-02"),
+            ("2026-02", "2026-03", "2026-03"),
+        ] {
+            assert_compare_equals_standalone(&arguments, &extra, month, baseline, baseline_month);
+        }
+    }
+    let march = report_json(&arguments, &["--month", "2026-03", "--group-by", "repo"]);
+    let rows = march["rows"].as_array().unwrap();
+    assert_eq!(1, rows.len(), "{rows:?}");
+    assert_eq!("product", rows[0]["key"]["repo"], "{rows:?}");
+}
+
+#[test]
+fn compare_discovers_codex_history_as_the_standalone_runs_do() {
+    let temporary = tempdir().unwrap();
+    let (_, mut base) = compare_fixture(temporary.path());
+    // A checkout outside --dir that only a March Codex rollout points at, with
+    // a February commit. A standalone February run never discovers the March
+    // rollout directory, so it never scans that checkout either.
+    let other = repository_on_main(temporary.path(), "other");
+    commit_on(&other, "src/o.rs", "1\n2\n", "2026-02-12");
+    let codex = temporary.path().join("codex");
+    let directory = codex.join("2026/03/10");
+    fs::create_dir_all(&directory).unwrap();
+    let rollout = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/rollout-2026-01-01T10-00-00-fixture.jsonl"),
+    )
+    .unwrap()
+    .replace("2026-01-01", "2026-03-10")
+    .replace("/home/example/project", &other);
+    fs::write(
+        directory.join("rollout-2026-03-10T10-00-00-fixture.jsonl"),
+        rollout,
+    )
+    .unwrap();
+    let codex_db = temporary.path().join("missing.sqlite");
+    let position = base.iter().position(|value| value == "--provider").unwrap();
+    base[position + 1] = "codex".to_string();
+    base.extend(
+        [
+            "--codex-dir",
+            codex.to_str().unwrap(),
+            "--codex-db",
+            codex_db.to_str().unwrap(),
+        ]
+        .map(str::to_string),
+    );
+
+    let february = report_json(&base, &["--month", "2026-02"]);
+    let roots = february["inputs"]["git_scan_roots"].as_array().unwrap();
+    assert!(
+        roots
+            .iter()
+            .all(|root| !root.as_str().unwrap().ends_with("other")),
+        "{roots:?}"
+    );
+    for (month, baseline, baseline_month) in [
+        ("2026-02", "2026-03", "2026-03"),
+        ("2026-03", "previous", "2026-02"),
+    ] {
+        assert_compare_equals_standalone(&base, &[], month, baseline, baseline_month);
+    }
+    let march = report_json(&base, &["--month", "2026-03"]);
+    assert_eq!(1, march["summary"]["session_count"]);
+}
+
+#[test]
+fn compare_shows_not_available_rather_than_infinity_when_the_earlier_window_is_empty() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    // January holds nothing, so February grew from zero.
+    let compared = report_json(&base, &["--month", "2026-02", "--compare", "previous"]);
+    let comparison = &compared["comparison"];
+    assert_eq!("2026-01", comparison["previous"]["label"]);
+    assert_eq!(0, comparison["previous"]["figures"]["commit_count"]);
+    assert_eq!(2.0, comparison["delta"]["commit_count"]["change"]);
+    assert!(comparison["delta"]["commit_count"]["percent"].is_null());
+    assert!(comparison["delta"]["human_estimated_seconds"]["percent"].is_null());
+
+    // Shares have nothing to be a share of in an empty window.
+    let area = &comparison["delta"]["composition"][0];
+    assert!(area["previous"].is_null() && area["change_points"].is_null());
+
+    let table = run(&[
+        "--dir",
+        &base[1],
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--month",
+        "2026-02",
+        "--compare",
+        "previous",
+    ]);
+    assert!(table.status.success());
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(text.contains("Comparison"), "{text}");
+    assert!(text.contains("(n/a)"), "{text}");
+    assert!(text.contains("estimates"), "{text}");
+    assert!(!text.contains("inf"), "{text}");
+}
+
+#[test]
+fn compare_accepts_a_named_baseline_and_ranges_and_renders_documents() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    let named = report_json(&base, &["--month", "2026-03", "--compare", "2026-02"]);
+    assert_eq!("2026-02", named["comparison"]["basis"]);
+    assert_eq!(
+        2,
+        named["comparison"]["previous"]["figures"]["commit_count"]
+    );
+
+    // A named baseline may lie after the selected window.
+    let later = report_json(&base, &["--month", "2026-02", "--compare", "2026-03"]);
+    assert_eq!(
+        3,
+        later["comparison"]["previous"]["figures"]["commit_count"]
+    );
+    assert_eq!(2, later["comparison"]["current"]["figures"]["commit_count"]);
+
+    // A range is compared with the same number of days before it.
+    let range = report_json(
+        &base,
+        &[
+            "--since",
+            "2026-03-01",
+            "--until",
+            "2026-03-31",
+            "--compare",
+            "previous",
+        ],
+    );
+    assert_eq!("2026-02", range["comparison"]["previous"]["label"]);
+
+    for (format, marker) in [
+        ("markdown", "## Comparison"),
+        ("html", "<h2>Comparison</h2>"),
+    ] {
+        let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+        arguments.extend(["--month", "2026-03", "--compare", "previous"]);
+        let position = arguments.iter().position(|item| *item == "json").unwrap();
+        arguments[position] = format;
+        let output = run(&arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(marker), "{format}: {text}");
+        assert!(text.contains("Estimated human work"), "{format}: {text}");
+        assert!(text.contains("+1 (+50%)"), "{format}: {text}");
+    }
+}
+
+#[test]
+fn compare_refuses_what_it_cannot_compare_or_show() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    for window in [
+        vec!["--compare", "previous"],
+        vec!["--since", "2026-03", "--compare", "previous"],
+    ] {
+        let error = failure(&base, &window);
+        assert!(error.contains("bounded window"), "{error}");
+    }
+    let error = failure(&base, &["--month", "2026-03", "--compare", "2026-03"]);
+    assert!(error.contains("overlaps"), "{error}");
+    let error = failure(&base, &["--month", "2026-03", "--compare", "sometime"]);
+    assert!(error.contains("--compare"), "{error}");
+
+    let mut csv = base.clone();
+    let position = csv.iter().position(|item| item == "json").unwrap();
+    csv[position] = "csv".to_string();
+    let error = failure(&csv, &["--month", "2026-03", "--compare", "previous"]);
+    assert!(error.contains("--format csv"), "{error}");
+
+    let error = failure(
+        &base,
+        &["ui", "--month", "2026-03", "--compare", "previous"],
+    );
+    assert!(error.contains("workstats ui"), "{error}");
+    let error = failure(
+        &["allocate", "--sub", "claude=1"]
+            .map(str::to_string)
+            .into_iter()
+            .chain(base.iter().cloned())
+            .collect::<Vec<_>>(),
+        &["--month", "2026-03", "--compare", "previous"],
+    );
+    assert!(error.contains("workstats allocate"), "{error}");
 }

@@ -1,0 +1,1 @@
+{"version":3,"sessionId":"vscode-fixture","requests":[{"timestamp":1767268800000,"modelId":"copilot/gpt-fixture","message":{"text":"Rename the helper"},"response":[{"value":"Renamed."}],"result":{"timings":{"firstProgress":400,"totalElapsed":20000}}},{"timestamp":1767269400000,"modelId":"copilot/gpt-fixture","message":{"text":"Cancel me"},"isCanceled":true}]}

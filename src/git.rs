@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::{self, JoinHandle};
 
 use chrono::{DateTime, Utc};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -83,6 +84,11 @@ const COMMIT_HEADER: &str = "--pretty=format:W%x09%H%x09%aI";
 /// Only the values are asked for, so no part of a commit message but the
 /// identities on its trailers is ever read into memory.
 const COMMIT_HEADER_WITH_CO_AUTHORS: &str = "--pretty=format:W%x09%H%x09%aI%x09%(trailers:key=Co-authored-by,valueonly,separator=%x02,unfold)";
+
+/// How far before `--since` Git is allowed to look, because it compares the
+/// committer date while the report windows on the author date. See
+/// `collect_commits`.
+const COMMITTER_DATE_SKEW: chrono::Duration = chrono::Duration::days(30);
 
 pub fn git_executable() -> Option<PathBuf> {
     if let Some(configured) = env::var_os("WORKSTATS_GIT") {
@@ -238,10 +244,14 @@ struct Pass<'a> {
 
 /// The commits the configured author wrote. These are human evidence; nothing
 /// else in this file is.
+///
+/// `authors` is every identity the developer commits as — a work address, a
+/// personal one, an old one — OR-ed by Git. They are one person's output, so
+/// they land in one collection and one human timeline.
 #[allow(clippy::too_many_arguments)]
 pub fn read_git_commits(
     base: &Path,
-    author: &str,
+    authors: &[String],
     resolver: &mut PathResolver,
     diagnostics: &mut Diagnostics,
     depth: usize,
@@ -253,11 +263,10 @@ pub fn read_git_commits(
     no_ignore: bool,
     co_authors: bool,
 ) -> Vec<GitCommit> {
-    let authors = [author.to_string()];
     collect_commits(
         base,
         &Pass {
-            authors: &authors,
+            authors,
             authorship: Authorship::default(),
             co_authors,
         },
@@ -316,6 +325,13 @@ pub fn read_agent_commits(
     )
 }
 
+/// Reads one pass's commits from every repository under `base`, in two Git
+/// invocations per repository: a cheap listing of the author's commits with
+/// their author dates, then `--numstat` only for those inside the window. The
+/// reasoning is at the call sites below; the short version is that Git's own
+/// date bounds compare the committer date, so the window has to be applied in
+/// Rust, and applying it after the diffs are computed made historical windows
+/// pay for every commit since.
 #[allow(clippy::too_many_arguments)]
 fn collect_commits(
     base: &Path,
@@ -378,6 +394,101 @@ fn collect_commits(
         }) {
             continue;
         }
+        // Two phases, because Git cannot be told the report's window. Its
+        // `--since` and `--until` compare the *committer* date, while the
+        // report windows on the *author* date (`%aI`): a commit authored in
+        // March and rebased or amended in May has a May committer date, so
+        // `--until` at the end of March dropped it from the March report it
+        // belongs to. `--until` is therefore never passed, and the exact
+        // author-date window is applied here, in Rust.
+        //
+        // What that costs is the trouble with a single pass. Without `--until`,
+        // Git computes `--numstat` (a diff per commit, by far the expensive
+        // part) for everything from `--since` to today, so asking about last
+        // March diffed every commit made since. So:
+        //
+        //  (a) a listing, `sha<TAB>author date` and nothing else: no diff, no
+        //      message. It carries the author filter and the widened `--since`
+        //      and covers the same refs a single pass would.
+        //  (b) the diffs, for exactly the commits of (a) that fall in the
+        //      window and were not already counted: their SHAs go to
+        //      `git log --no-walk --stdin` on standard input, which walks
+        //      nothing and prints the same header and `--numstat` records the
+        //      parser has always read. The SHAs are non-merges already, so a
+        //      merge cannot appear; `--no-walk` orders by commit date like the
+        //      walk did, and nothing downstream depends on the order of ties.
+        //
+        // `--since` stays in (a) as a cheap bound on the walk, because Git
+        // stops following a line of history at the first commit older than it
+        // and without it every run reads every repository's whole past. It is
+        // widened by `COMMITTER_DATE_SKEW` because the committer date is almost
+        // always the *later* of the two — a rebase only moves it forward — so
+        // the only commits it could wrongly hide are ones whose committer clock
+        // ran behind their author date, and a generous margin covers that.
+        let mut listing = Command::new(&git);
+        listing
+            .arg("--no-pager")
+            .arg("-C")
+            .arg(&repo_path)
+            .arg("log")
+            .arg("--regexp-ignore-case")
+            .arg("--no-merges")
+            .arg("--format=%H%x09%aI");
+        // Git ORs repeated `--author` arguments, which is how one pass asks for
+        // several identities without any alternation syntax to get wrong.
+        for pattern in pass.authors {
+            listing.arg(format!("--author={pattern}"));
+        }
+        if let Some(since) = since {
+            listing.arg(format!("--since={}", iso(since - COMMITTER_DATE_SKEW)));
+        }
+        // Every local branch, plus HEAD, rather than only what HEAD reaches: a
+        // clone routinely holds work on branches that are not checked out, and
+        // a report that silently ignores them understates a developer who
+        // switches branches. HEAD is named as well so a detached HEAD — a
+        // rebase in progress, a checked-out tag — still counts. Remote-tracking
+        // refs are left out on purpose: this is what was done on this machine,
+        // and a fetch would otherwise change the report. The same commit
+        // reached from two branches, or two worktrees, is still one commit: Git
+        // reports it once per invocation and `seen` covers the rest.
+        //
+        // HEAD is skipped when it does not resolve (a repository with no
+        // commits, or an orphan branch just created): naming an unborn HEAD is a
+        // hard error that would also throw away the branches that do have
+        // history.
+        if head_resolves(&git, &repo_path) {
+            listing.arg("HEAD");
+        }
+        listing.arg("--branches");
+
+        let Some((run, stdout)) = start_git(&mut listing, None, &repo_path, diagnostics) else {
+            continue;
+        };
+        let listed = parse_commit_listing(BufReader::new(stdout));
+        if !run.finish(&repo_path, diagnostics) {
+            continue;
+        }
+        // The exact window, on the same author date and with the same
+        // half-open bounds `aggregate.rs` applies, because Git was only given
+        // a widened lower bound. Doing it here rather than only in the report
+        // means every consumer of these commits, the explorer included, sees
+        // one window. A commit an earlier checkout of the same repository
+        // already yielded is skipped before its diff is computed, not after.
+        let empty_seen = HashSet::new();
+        let member_seen = seen.get(&repo_member_id).unwrap_or(&empty_seen);
+        let selected: Vec<&str> = listed
+            .iter()
+            .filter(|(sha, timestamp)| {
+                !since.is_some_and(|bound| *timestamp < bound)
+                    && !until.is_some_and(|bound| *timestamp >= bound)
+                    && !member_seen.contains(sha)
+            })
+            .map(|(sha, _)| sha.as_str())
+            .collect();
+        if selected.is_empty() {
+            continue;
+        }
+
         let mut command = Command::new(&git);
         command
             .arg("--no-pager")
@@ -391,7 +502,8 @@ fn collect_commits(
             .arg("-c")
             .arg("core.quotePath=false")
             .arg("log")
-            .arg("--regexp-ignore-case")
+            .arg("--no-walk")
+            .arg("--stdin")
             .arg("--no-merges")
             .arg("--date=iso-strict")
             .arg(if pass.co_authors {
@@ -406,58 +518,15 @@ fn collect_commits(
             // every large move into thousands of phantom added and deleted
             // lines.
             .arg("-z");
-        // Git ORs repeated `--author` arguments, which is how one pass asks for
-        // several identities without any alternation syntax to get wrong.
-        for pattern in pass.authors {
-            command.arg(format!("--author={pattern}"));
-        }
-        if let Some(since) = since {
-            command.arg(format!("--since={}", iso(since)));
-        }
-        if let Some(until) = until {
-            command.arg(format!("--until={}", iso(until)));
-        }
-        let mut errors = match tempfile() {
-            Ok(file) => file,
-            Err(error) => {
-                diagnostics.git_errors += 1;
-                diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
-                continue;
-            }
-        };
-        let stderr = match errors.try_clone() {
-            Ok(file) => file,
-            Err(error) => {
-                diagnostics.git_errors += 1;
-                diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
-                continue;
-            }
-        };
-        let mut child = match command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                diagnostics.git_errors += 1;
-                diagnostics.warn(format!(
-                    "Git unavailable for {}: {error}",
-                    repo_path.display()
-                ));
-                continue;
-            }
-        };
-        let Some(stdout) = child.stdout.take() else {
-            diagnostics.git_errors += 1;
-            diagnostics.warn(format!(
-                "Git stdout unavailable for {}",
-                repo_path.display()
-            ));
+        let input = selected.join("\n") + "\n";
+        let Some((run, stdout)) = start_git(
+            &mut command,
+            Some(input.into_bytes()),
+            &repo_path,
+            diagnostics,
+        ) else {
             continue;
         };
-        let empty_seen = HashSet::new();
-        let member_seen = seen.get(&repo_member_id).unwrap_or(&empty_seen);
         let repo_commits = parse_git_log(
             BufReader::new(stdout),
             pass,
@@ -470,20 +539,114 @@ fn collect_commits(
             ignores.as_ref(),
             member_seen,
         );
-        let status = child.wait();
-        let _ = errors.seek(SeekFrom::Start(0));
-        let mut error_text = String::new();
-        let _ = errors.take(1000).read_to_string(&mut error_text);
-        match status {
-            Ok(status) if status.success() => {
-                for commit in repo_commits {
-                    seen.entry(commit.repo_member_id.clone())
-                        .or_default()
-                        .insert(commit.sha.clone());
-                    commits.push(commit);
-                }
+        if run.finish(&repo_path, diagnostics) {
+            for commit in repo_commits {
+                seen.entry(commit.repo_member_id.clone())
+                    .or_default()
+                    .insert(commit.sha.clone());
+                commits.push(commit);
             }
-            Ok(_) if error_text.contains("does not have any commits yet") => {}
+        }
+    }
+    commits
+}
+
+/// A running `git` whose standard error goes to a temporary file rather than a
+/// pipe, so nothing has to drain it while standard output is being parsed.
+struct GitRun {
+    child: Child,
+    errors: File,
+    /// Writes the standard input of a command that takes one, off this thread:
+    /// Git may answer before it has read everything, and neither side may wait
+    /// on the other.
+    feeder: Option<JoinHandle<()>>,
+}
+
+/// Starts `command`, feeding `input` to it if there is any. Reports the reason
+/// and returns `None` when Git cannot be started.
+fn start_git(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    repo_path: &Path,
+    diagnostics: &mut Diagnostics,
+) -> Option<(GitRun, ChildStdout)> {
+    let errors = match tempfile() {
+        Ok(file) => file,
+        Err(error) => {
+            diagnostics.git_errors += 1;
+            diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
+            return None;
+        }
+    };
+    let stderr = match errors.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            diagnostics.git_errors += 1;
+            diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
+            return None;
+        }
+    };
+    let mut child = match command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            diagnostics.git_errors += 1;
+            diagnostics.warn(format!(
+                "Git unavailable for {}: {error}",
+                repo_path.display()
+            ));
+            return None;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        diagnostics.git_errors += 1;
+        diagnostics.warn(format!(
+            "Git stdout unavailable for {}",
+            repo_path.display()
+        ));
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let feeder = input.and_then(|input| {
+        let mut stdin = child.stdin.take()?;
+        Some(thread::spawn(move || {
+            // A Git that exits early closes the pipe; its status says why.
+            let _ = stdin.write_all(&input);
+        }))
+    });
+    Some((
+        GitRun {
+            child,
+            errors,
+            feeder,
+        },
+        stdout,
+    ))
+}
+
+impl GitRun {
+    /// Waits for Git and says whether its output can be trusted, reporting a
+    /// failure. A repository with no commits yet is not one.
+    fn finish(mut self, repo_path: &Path, diagnostics: &mut Diagnostics) -> bool {
+        if let Some(feeder) = self.feeder.take() {
+            let _ = feeder.join();
+        }
+        let status = self.child.wait();
+        let _ = self.errors.seek(SeekFrom::Start(0));
+        let mut error_text = String::new();
+        let _ = (&self.errors).take(1000).read_to_string(&mut error_text);
+        match status {
+            Ok(status) if status.success() => true,
+            Ok(_) if error_text.contains("does not have any commits yet") => false,
             Ok(_) => {
                 diagnostics.git_errors += 1;
                 diagnostics.warn(format!(
@@ -491,14 +654,30 @@ fn collect_commits(
                     repo_path.display(),
                     error_text.trim().chars().take(200).collect::<String>()
                 ));
+                false
             }
             Err(error) => {
                 diagnostics.git_errors += 1;
                 diagnostics.warn(format!("Git failed for {}: {error}", repo_path.display()));
+                false
             }
         }
     }
-    commits
+}
+
+/// Reads the listing phase's `sha<TAB>author date` lines. A line that does not
+/// parse is skipped: it could only cost a commit whose diff would not have
+/// parsed either.
+fn parse_commit_listing(reader: impl BufRead) -> Vec<(String, DateTime<Utc>)> {
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| {
+            let (sha, date) = line.split_once('\t')?;
+            let timestamp = DateTime::parse_from_rfc3339(date.trim()).ok()?;
+            (!sha.is_empty()).then(|| (sha.to_string(), timestamp.with_timezone(&Utc)))
+        })
+        .collect()
 }
 
 /// One commit being accumulated across its `--numstat` fields.
@@ -737,6 +916,18 @@ fn compile_globs(patterns: &[String]) -> Result<Option<GlobSet>, globset::Error>
     builder.build().map(Some)
 }
 
+/// Whether `HEAD` names a commit in `repo`.
+fn head_resolves(git: &Path, repo: &Path) -> bool {
+    Command::new(git)
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 fn iso(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, false)
 }
@@ -875,7 +1066,7 @@ mod tests {
 
         let mine = read_git_commits(
             base.path(),
-            "test@example.com",
+            &["test@example.com".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -946,7 +1137,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "test@example.com",
+            &["test@example.com".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -978,7 +1169,7 @@ mod tests {
         // same commits, same lines, no flags.
         let plain = read_git_commits(
             base.path(),
-            "test@example.com",
+            &["test@example.com".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1026,7 +1217,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "test@example.com",
+            &["test@example.com".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1045,6 +1236,45 @@ mod tests {
         );
         assert_eq!(vec!["code.rs".to_string()], commits[0].files);
         assert!(commits[0].authorship.is_agent_assisted());
+    }
+
+    /// A repository with no commits, and one whose HEAD is an unborn orphan
+    /// branch while another branch has history, are both ordinary states. Naming
+    /// an unborn `HEAD` to Git is a hard error, so the scan must not: the first
+    /// must be silent and the second must still find the other branch's work.
+    #[test]
+    fn an_unborn_head_neither_errors_nor_hides_the_branches() {
+        let base = tempdir().unwrap();
+        repository(base.path(), "empty");
+        let repo = repository(base.path(), "orphan");
+        let path = repo.to_str().unwrap().to_string();
+        let mut body = String::new();
+        commit_as(
+            &repo,
+            &mut body,
+            "Test Author <test@example.com>",
+            &["work"],
+        );
+        git(&["-C", &path, "checkout", "-q", "--orphan", "fresh"]);
+
+        let mut diagnostics = Diagnostics::default();
+        let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
+        let commits = read_git_commits(
+            base.path(),
+            &["test@example.com".to_string()],
+            &mut resolver,
+            &mut diagnostics,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(1, commits.len());
+        assert_eq!(0, diagnostics.git_errors, "{:?}", diagnostics.messages);
     }
 
     /// `--author` is a *basic* regular expression, so escaping `+`, `(` or `)`
@@ -1084,7 +1314,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            &git_regex_literal("person+work@example.com"),
+            &[git_regex_literal("person+work@example.com")],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1128,7 +1358,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1147,7 +1377,7 @@ mod tests {
 
         let filtered = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1192,7 +1422,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Arrow Author",
+            &["Arrow Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1305,7 +1535,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1377,7 +1607,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Area Author",
+            &["Area Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1435,7 +1665,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1477,7 +1707,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1517,7 +1747,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1556,7 +1786,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1613,7 +1843,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(Vec::new(), base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1649,7 +1879,7 @@ mod tests {
         let mut resolver = PathResolver::with_home(vec![rule], base.path().to_path_buf());
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
@@ -1669,7 +1899,7 @@ mod tests {
         let displayed = disambiguated_repository_label(&commits[0].repo, &commits[0].repo_id);
         let commits = read_git_commits(
             base.path(),
-            "Test Author",
+            &["Test Author".to_string()],
             &mut resolver,
             &mut diagnostics,
             3,
