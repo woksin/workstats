@@ -2,16 +2,19 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::ops::AddAssign;
+use std::path::Path;
 
 use anyhow::Result;
 use chrono::{DateTime, Local};
 
 use crate::classify::active_registry;
+use crate::cli::CALENDAR_DIMENSIONS;
 use crate::compare::{Comparison, ShareChange, Unit};
 use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
 use crate::model::{
     CompositionEntry, Diagnostics, HumanTimeExplanation, MAX_STORED_MESSAGES, Report, ReportRow,
 };
+use crate::paths::home_dir;
 
 pub fn print_json(report: &Report) -> Result<()> {
     let stdout = io::stdout();
@@ -589,7 +592,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             counted((report.rows.len() - top) as u64, "more row", "more rows")
         );
     }
-    if let Some(calendar) = ["day", "week", "month"]
+    if let Some(calendar) = CALENDAR_DIMENSIONS
         .into_iter()
         .find(|name| report.group_by.iter().any(|dimension| dimension == name))
         && !rows.is_empty()
@@ -690,7 +693,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
     // Without these a mistyped --history or --events path produces a clean
     // looking report with silently missing data.
-    for line in warning_lines(diagnostics) {
+    for line in warning_lines(diagnostics, None) {
         println!("{line}");
     }
 }
@@ -724,6 +727,9 @@ fn footer_notes(report: &Report, diagnostics: &Diagnostics) -> Vec<String> {
     }
     if report.inputs.repo_filter.is_some() || report.inputs.repo_exact_filter.is_some() {
         notes.push("Scope note: work blocks are recomputed from the selected repositories, so filtered totals can differ from an all-repo row.".to_string());
+    }
+    if let Some(note) = config_defaults_note(&report.inputs.config_defaults) {
+        notes.push(note);
     }
     notes.push("Local retained history only. Missing/pruned transcripts and work on other machines are not visible.".to_string());
     if diagnostics.malformed_lines != 0
@@ -790,12 +796,20 @@ fn footer_notes(report: &Report, diagnostics: &Diagnostics) -> Vec<String> {
 
 /// The warnings the table prints, each already prefixed and made safe to draw,
 /// with the footer that says how many were left out.
-fn warning_lines(diagnostics: &Diagnostics) -> Vec<String> {
+///
+/// `home` is given for the documents, which are made to be shared: a diagnostic
+/// often quotes a path, and the directory the user's name and client projects
+/// sit under is not the reader's to learn. The terminal shows its own user's
+/// paths untouched.
+fn warning_lines(diagnostics: &Diagnostics, home: Option<&Path>) -> Vec<String> {
     let mut lines: Vec<String> = diagnostics
         .messages
         .iter()
         .take(MAX_PRINTED_MESSAGES)
-        .map(|message| format!("Warning: {}", safe_message(message)))
+        .map(|message| match home {
+            Some(home) => format!("Warning: {}", safe_message(&redact_home(message, home))),
+            None => format!("Warning: {}", safe_message(message)),
+        })
         .collect();
     lines.extend(hidden_messages_note(diagnostics.warning_count));
     lines
@@ -1092,7 +1106,7 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             counted((report.rows.len() - top) as u64, "more row", "more rows")
         )));
     }
-    if let Some(calendar) = ["day", "month"]
+    if let Some(calendar) = CALENDAR_DIMENSIONS
         .into_iter()
         .find(|name| report.group_by.iter().any(|dimension| dimension == name))
         && !rows.is_empty()
@@ -1152,8 +1166,14 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
 
     blocks.push(Block::Section("Notes".to_string()));
-    blocks.push(Block::List(footer_notes(report, diagnostics)));
-    let warnings = warning_lines(diagnostics);
+    let home = home_dir();
+    blocks.push(Block::List(
+        footer_notes(report, diagnostics)
+            .iter()
+            .map(|note| redact_home(note, &home))
+            .collect(),
+    ));
+    let warnings = warning_lines(diagnostics, Some(&home));
     if !warnings.is_empty() {
         blocks.push(Block::Section("Warnings".to_string()));
         blocks.push(Block::List(warnings));
@@ -1437,6 +1457,60 @@ fn hidden_messages_note(raised: u64) -> Option<String> {
 
 /// Human seconds per calendar period, oldest first, from the rows the table
 /// printed rather than from every row in the report.
+/// `Config defaults: providers=claude,codex; group_by=repo,month`, or nothing
+/// when the config supplied no value this run used. A report that reads
+/// differently from the flags on the command line should say why.
+pub(crate) fn config_defaults_note(defaults: &BTreeMap<String, String>) -> Option<String> {
+    (!defaults.is_empty()).then(|| {
+        format!(
+            "Config defaults: {}",
+            defaults
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })
+}
+
+/// Replaces the user's home directory with `~`. Only at a path boundary, so
+/// `/home/ada` does not eat the start of `/home/adam` or of `/mnt/home/ada`.
+pub(crate) fn redact_home(text: &str, home: &Path) -> String {
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches(['/', '\\']);
+    // A home of `/` or nothing would turn every path into `~...`.
+    if home.is_empty() {
+        return text.to_string();
+    }
+    let name_start =
+        |character: char| character.is_alphanumeric() || matches!(character, '_' | '-' | '.');
+    // A full stop after the path is the end of a sentence, not of a name.
+    let name_end = |character: char| character.is_alphanumeric() || matches!(character, '_' | '-');
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut before: Option<char> = None;
+    while let Some(position) = rest.find(home) {
+        let (head, tail) = rest.split_at(position);
+        let after = &tail[home.len()..];
+        let previous = head.chars().next_back().or(before);
+        let at_start = previous.is_none_or(|character| !name_start(character));
+        let at_end = after
+            .chars()
+            .next()
+            .is_none_or(|character| !name_end(character));
+        redacted.push_str(head);
+        if at_start && at_end {
+            redacted.push('~');
+        } else {
+            redacted.push_str(home);
+        }
+        before = home.chars().next_back();
+        rest = after;
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
 fn trend_totals(rows: &[ReportRow], calendar: &str) -> Vec<f64> {
     let mut totals: BTreeMap<&str, f64> = BTreeMap::new();
     for row in rows {
@@ -2411,6 +2485,112 @@ mod tests {
         for note in footer_notes(&report, &report.diagnostics) {
             assert!(markdown.contains(&escape_markdown(&note)), "missing {note}");
         }
+    }
+
+    /// The table and the document decide whether a trend belongs from the same
+    /// list, so a grouping that draws one in the terminal draws it in a PR.
+    #[test]
+    fn the_document_draws_the_trend_for_every_calendar_grouping() {
+        for calendar in CALENDAR_DIMENSIONS {
+            let mut report = report_with(vec![calendar.to_string()]);
+            let mut row = row_with(Vec::new());
+            row.key.insert(calendar.to_string(), "2026-05".to_string());
+            row.human_estimated_seconds = 60.0;
+            report.rows.push(row);
+            let markdown =
+                render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+            assert!(
+                markdown.contains("Human-work trend"),
+                "{calendar}\n{markdown}"
+            );
+        }
+        let report = report_with(vec!["repo".to_string()]);
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!markdown.contains("Human-work trend"));
+    }
+
+    #[test]
+    fn config_defaults_are_listed_in_the_notes_when_any_applied() {
+        let mut report = report_with(vec!["repo".to_string()]);
+        assert!(
+            !footer_notes(&report, &report.diagnostics)
+                .iter()
+                .any(|note| note.starts_with("Config defaults"))
+        );
+        report.inputs.config_defaults = BTreeMap::from([
+            ("providers".to_string(), "claude,codex".to_string()),
+            ("group_by".to_string(), "repo,month".to_string()),
+        ]);
+        let notes = footer_notes(&report, &report.diagnostics);
+        assert!(
+            notes.contains(
+                &"Config defaults: group_by=repo,month; providers=claude,codex".to_string()
+            ),
+            "{notes:?}"
+        );
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(
+            markdown.contains(&escape_markdown(
+                "Config defaults: group_by=repo,month; providers=claude,codex"
+            )),
+            "{markdown}"
+        );
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(html.contains("Config defaults: group_by=repo,month; providers=claude,codex"));
+    }
+
+    #[test]
+    fn the_home_directory_is_redacted_at_path_boundaries_only() {
+        let home = Path::new("/home/ada");
+        assert_eq!(
+            "cannot read ~/client/app/x.jsonl: denied, ~.",
+            redact_home(
+                "cannot read /home/ada/client/app/x.jsonl: denied, /home/ada.",
+                home
+            )
+        );
+        assert_eq!("~", redact_home("/home/ada", home));
+        assert_eq!(
+            "/home/adam/x /mnt/home/ada/x /home/ada-b",
+            redact_home("/home/adam/x /mnt/home/ada/x /home/ada-b", home)
+        );
+        assert_eq!("/srv/x", redact_home("/srv/x", Path::new("/")));
+        assert_eq!("/srv/x", redact_home("/srv/x", Path::new("")));
+    }
+
+    #[test]
+    fn the_documents_redact_the_home_directory_in_warnings_but_the_table_does_not() {
+        let mut report = hostile_report();
+        let home = home_dir();
+        let path = format!("{}/client-project/history.jsonl", home.display());
+        report.diagnostics.messages = vec![format!("could not read {path}")];
+        report.inputs.config_defaults = BTreeMap::from([("dir".to_string(), path.clone())]);
+        let document = report_document(&report, &report.diagnostics, 0, false);
+        for (text, escape) in [
+            (render_markdown(&document), true),
+            (render_html(&document), false),
+        ] {
+            let expect = |expected: &str| {
+                if escape {
+                    escape_markdown(expected)
+                } else {
+                    expected.to_string()
+                }
+            };
+            assert!(
+                text.contains(&expect("could not read ~/client-project/history.jsonl")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&expect("dir=~/client-project/history.jsonl")),
+                "{text}"
+            );
+            assert!(!text.contains(&*home.to_string_lossy()), "{text}");
+        }
+        assert!(
+            warning_lines(&report.diagnostics, None)[0].contains(&path),
+            "the terminal shows its own user's paths"
+        );
     }
 
     #[test]

@@ -29,6 +29,8 @@ use serde::Serialize;
 use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
 use crate::model::ReportRow;
 use crate::output::number;
+use crate::output::{config_defaults_note, redact_home};
+use crate::paths::home_dir;
 use crate::pricing::{self, RATES_AS_OF, RateOverrides, RateSource};
 
 /// Which measured quantity drives the split.
@@ -261,6 +263,11 @@ pub struct Allocation {
     pub effective_share: f64,
     #[serde(skip)]
     pub top: usize,
+    /// Config `defaults` this run's report used, for the one-line note; set by
+    /// the caller, which knows the config. Not part of the JSON, which the
+    /// report's own `inputs.config_defaults` already describes.
+    #[serde(skip)]
+    pub config_defaults: BTreeMap<String, String>,
     pub periods: Vec<PeriodRow>,
     /// Every project's slice of the spend. Present only when no project was
     /// named, because that is the question being asked.
@@ -576,6 +583,7 @@ pub fn build(rows: &[ReportRow], options: &AllocationOptions) -> Allocation {
             0.0
         },
         top: options.top,
+        config_defaults: BTreeMap::new(),
         periods,
         breakdown,
         models: model_rows,
@@ -827,6 +835,9 @@ pub fn print_table(allocation: &Allocation) {
         money(allocation.billed, &allocation.currency),
         allocation.basis.label()
     );
+    if let Some(note) = config_defaults_note(&allocation.config_defaults) {
+        println!("  {note}");
+    }
     println!();
 
     if !allocation.breakdown.is_empty() {
@@ -1069,6 +1080,9 @@ fn allocation_document(allocation: &Allocation) -> Document {
             allocation.basis.label()
         )),
     ];
+    if let Some(note) = config_defaults_note(&allocation.config_defaults) {
+        blocks.push(Block::Paragraph(redact_home(&note, &home_dir())));
+    }
 
     if allocation.breakdown.is_empty() {
         push_period_blocks(&mut blocks, allocation);

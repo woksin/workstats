@@ -184,8 +184,16 @@ pub(crate) fn run(
     let mut diagnostics = Diagnostics::default();
     let config = load_config(arguments.config.as_deref(), &mut diagnostics);
     let defaults = config.config_defaults(&home_dir())?;
-    let resolved = defaults.resolve(&mut arguments, presentation == Presentation::Explore);
+    let mut resolved = defaults.resolve(&mut arguments, presentation == Presentation::Explore);
     let output_format = resolved.format;
+    // Where the format came from decides what a refusal can usefully suggest:
+    // `--format csv` is fixed by dropping the flag, a configured one is not.
+    let format_from_config = resolved.from_config.contains_key("format");
+    let format_origin = if format_from_config {
+        format!("defaults.format \"{}\" (from config)", output_format.name())
+    } else {
+        format!("--format {}", output_format.name())
+    };
     // Refused before any scanning: `workstats ui --format json` can only mean
     // the user wanted one of the two, and picking silently is how --by-repo
     // used to lose an explicit --group-by.
@@ -212,10 +220,12 @@ pub(crate) fn run(
         OutputFormat::Csv | OutputFormat::Markdown | OutputFormat::Html
     ) && (arguments.explain_human_time || arguments.explain_repository_attribution)
     {
-        bail!(
-            "explanation flags are not available with --format {}; use table output or --format json",
-            output_format.name()
-        );
+        let fix = if format_from_config {
+            "pass --format table or --format json"
+        } else {
+            "use table output or --format json"
+        };
+        bail!("explanation flags are not available with {format_origin}; {fix}");
     }
     // A comparison is a second report beside the first. The explorer has no
     // place for one, an allocation is a statement about a single period, and
@@ -234,8 +244,13 @@ pub(crate) fn run(
             );
         }
         if output_format == OutputFormat::Csv {
+            let fix = if format_from_config {
+                "pass --format table or --format json"
+            } else {
+                "use table, json, markdown, or html"
+            };
             bail!(
-                "--compare is not available with --format csv, which has one row per group and nowhere to put a second window; use table, json, markdown, or html"
+                "--compare is not available with {format_origin}, which has one row per group and nowhere to put a second window; {fix}"
             );
         }
     }
@@ -277,6 +292,16 @@ pub(crate) fn run(
         defaults.dir.clone(),
         env::current_dir().ok(),
     )?;
+    // `scan_directory` ranks the sources; this only notes whether the config's
+    // was the one that won, so the report can say where its root came from.
+    if arguments.directory.is_none()
+        && env::var_os("WORKSTATS_DIR").is_none()
+        && defaults.dir.is_some()
+    {
+        resolved
+            .from_config
+            .insert("dir".to_string(), directory.to_string_lossy().into_owned());
+    }
     let mut history_paths = default_history_paths();
     history_paths.retain(|provider, paths| {
         paths.iter().any(|path| {
@@ -727,7 +752,8 @@ pub(crate) fn run(
         options.rate_overrides = rate_overrides;
         // A different presentation of the report that was just built, so the
         // numbers behind a claim are the numbers `workstats` would print.
-        let allocation = allocate::build(&report.rows, &options);
+        let mut allocation = allocate::build(&report.rows, &options);
+        allocation.config_defaults = report.inputs.config_defaults.clone();
         match output_format {
             OutputFormat::Json => allocate::print_json(&allocation)?,
             OutputFormat::Csv => allocate::print_csv(&allocation)?,

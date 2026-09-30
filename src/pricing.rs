@@ -372,6 +372,25 @@ pub struct RateOverrides {
 }
 
 impl RateOverrides {
+    /// Reads the raw `model_rates` value, one entry at a time, so that a
+    /// misspelt field or a wrong type is refused as `model_rates.<key>: ...`
+    /// instead of serde discarding the whole config file.
+    pub fn from_value(value: &serde_json::Value) -> Result<Self> {
+        let Some(entries) = value.as_object() else {
+            bail!("model_rates must be an object keyed by model name");
+        };
+        if entries.len() > 256 {
+            bail!("at most 256 model rates are supported");
+        }
+        let mut config = BTreeMap::new();
+        for (key, entry) in entries {
+            let parsed: ModelRateConfig = serde_json::from_value(entry.clone())
+                .with_context(|| format!("invalid model_rates.{key}"))?;
+            config.insert(key.clone(), parsed);
+        }
+        Self::from_config(&config)
+    }
+
     /// Validates the `model_rates` config map. Errors name the offending key.
     pub fn from_config(config: &BTreeMap<String, ModelRateConfig>) -> Result<Self> {
         if config.len() > 256 {
@@ -729,6 +748,36 @@ mod tests {
         assert!(
             serde_json::from_str::<BTreeMap<String, ModelRateConfig>>(r#"{"x": {"inptu": 1}}"#)
                 .is_err()
+        );
+    }
+
+    /// Read from the raw config value, a bad entry is a hard error that names
+    /// its key, whether serde or the validation found it.
+    #[test]
+    fn a_raw_entry_that_does_not_parse_is_refused_naming_its_key() {
+        let raw = |json: &str| {
+            format!(
+                "{:#}",
+                RateOverrides::from_value(&serde_json::from_str(json).unwrap()).unwrap_err()
+            )
+        };
+        let misspelt =
+            raw(r#"{"acme": {"inptu": 1, "cache_write": 1, "cache_read": 1, "output": 2}}"#);
+        assert!(
+            misspelt.contains("model_rates.acme") && misspelt.contains("inptu"),
+            "{misspelt}"
+        );
+        let wrong_type =
+            raw(r#"{"acme": {"input": "fast", "cache_write": 1, "cache_read": 1, "output": 2}}"#);
+        assert!(wrong_type.contains("model_rates.acme"), "{wrong_type}");
+        assert!(raw(r#"["acme"]"#).contains("model_rates must be an object"));
+        assert!(raw(r#"{"acme": 3}"#).contains("model_rates.acme"));
+        let valid = serde_json::json!({"acme": {"input": 1, "cache_write": 1, "cache_read": 1, "output": 2}});
+        assert!(
+            RateOverrides::from_value(&valid)
+                .unwrap()
+                .resolve("acme-1")
+                .is_some()
         );
     }
 }

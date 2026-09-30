@@ -201,6 +201,8 @@ pub(crate) struct RecordArguments {
 
 /// Used when neither `--group-by` nor one of its shortcut flags is given.
 pub(crate) const DEFAULT_GROUP_BY: &str = "repo";
+/// The grouping dimensions that are buckets of time; a row sits in only one.
+pub(crate) const CALENDAR_DIMENSIONS: [&str; 3] = ["day", "week", "month"];
 /// Built-in values for the flags a config `defaults` block may set. They are
 /// applied by [`ConfigDefaults::resolve`] rather than by clap, because clap
 /// cannot say whether a value was typed or defaulted.
@@ -677,7 +679,7 @@ fn validate_dimensions(dimensions: &[String]) -> Result<()> {
     }
     // A row sits in one calendar bucket, and a week straddles months, so any
     // two of these would describe a bucket that does not exist.
-    if ["day", "week", "month"]
+    if CALENDAR_DIMENSIONS
         .iter()
         .filter(|calendar| dimensions.iter().any(|name| name == *calendar))
         .count()
@@ -843,8 +845,29 @@ impl ConfigDefaults {
             && !grouping_is_overridden(arguments)
             && let Some(group_by) = &self.group_by
         {
-            arguments.group_by = Some(group_by.clone());
-            from_config.insert("group_by".to_string(), group_by.clone());
+            // `--period` adds a calendar dimension to whatever grouping is in
+            // force, and only one of day/week/month can be in it. A config
+            // that groups by month must not make `--period week` an error the
+            // user cannot have caused with the flag they typed, so the flag
+            // wins and the config keeps its other dimensions.
+            let group_by = match &arguments.period {
+                Some(period) => group_by
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|piece| {
+                        !piece.is_empty()
+                            && (*piece == period.as_str() || !CALENDAR_DIMENSIONS.contains(piece))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(","),
+                None => group_by.clone(),
+            };
+            // Nothing left means the config only named calendar dimensions, so
+            // the built-in grouping applies (and `--period` then adds its own).
+            if !group_by.is_empty() {
+                arguments.group_by = Some(group_by.clone());
+                from_config.insert("group_by".to_string(), group_by);
+            }
         }
         let mut pick = |key: &str,
                         flag: &Option<String>,
@@ -1585,6 +1608,32 @@ mod tests {
         assert_eq!(Some("repo"), typed.group_by.as_deref());
         assert_eq!(vec!["claude"], typed.provider);
         assert!(resolved.from_config.is_empty());
+
+        // `--period` is a flag too: it replaces the config's calendar
+        // dimension instead of colliding with it, and keeps the others.
+        let grouped = defaults(r#"{"group_by": "repo,month"}"#).unwrap();
+        for (flags, expected) in [
+            (vec!["--period", "week"], "repo"),
+            (vec!["--period", "month"], "repo,month"),
+        ] {
+            let mut typed = report_arguments(&flags);
+            let resolved = grouped.resolve(&mut typed, false);
+            assert_eq!(Some(expected), typed.group_by.as_deref(), "{flags:?}");
+            assert_eq!(
+                Some(expected),
+                resolved.from_config.get("group_by").map(String::as_str)
+            );
+            assert!(grouping_dimensions(&typed).is_ok(), "{flags:?}");
+        }
+        // Only calendar dimensions configured: the built-in grouping and the
+        // flag's own period.
+        let mut only = report_arguments(&["--period", "week"]);
+        let resolved = defaults(r#"{"group_by": "month"}"#)
+            .unwrap()
+            .resolve(&mut only, false);
+        assert_eq!(None, only.group_by);
+        assert!(resolved.from_config.is_empty());
+        assert_eq!(vec!["repo", "week"], grouping_dimensions(&only).unwrap());
 
         // The shortcut flags own the grouping, so the config must not add a
         // --group-by that would conflict with them.

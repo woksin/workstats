@@ -1733,6 +1733,38 @@ fn allocate_prices_unknown_models_from_config_rate_overrides() {
     );
 }
 
+/// One misspelt field used to make serde discard the whole config with a
+/// warning, silently losing the rest of it (authors, defaults, aliases).
+#[test]
+fn a_misspelt_model_rates_field_is_a_hard_error_naming_the_key() {
+    let directory = tempdir().unwrap();
+    for (config, expected) in [
+        (
+            r#"{"authors": ["me@example.com"], "model_rates": {"acme-coder": {
+                "inptu": 1, "cache_write": 1, "cache_read": 1, "output": 2}}}"#,
+            "model_rates.acme-coder",
+        ),
+        (
+            r#"{"defaults": {"format": "json"}, "model_rates": {"acme-coder": {
+                "input": "fast", "cache_write": 1, "cache_read": 1, "output": 2}}}"#,
+            "model_rates.acme-coder",
+        ),
+        (r#"{"model_rates": ["acme-coder"]}"#, "model_rates"),
+    ] {
+        let output = run_with_defaults(directory.path(), config, &[]);
+        assert_eq!(Some(2), output.status.code(), "{config}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{config}: {stderr}");
+        assert!(!stderr.contains("ignoring config"), "{config}: {stderr}");
+    }
+    let output = run_with_defaults(
+        directory.path(),
+        r#"{"model_rates": {"acme-coder": {"inptu": 1}}}"#,
+        &[],
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inptu"));
+}
+
 /// A bad override is refused by name rather than silently priced at nonsense.
 #[test]
 fn allocate_refuses_invalid_rate_overrides_naming_the_key() {
@@ -1885,6 +1917,141 @@ fn config_default_dir_sits_between_the_environment_and_the_working_directory() {
         flagged.path().to_str().unwrap(),
         root(&with_flag).as_str().unwrap()
     );
+}
+
+#[test]
+fn config_default_dir_is_recorded_only_when_it_was_the_source() {
+    let directory = tempdir().unwrap();
+    let configured = tempdir().unwrap();
+    let flagged = tempdir().unwrap();
+    let config = format!(
+        r#"{{"defaults": {{"format": "json", "dir": {:?}}}}}"#,
+        configured.path().to_str().unwrap()
+    );
+
+    let used = json_stdout(&run_with_defaults(directory.path(), &config, &[]));
+    assert_eq!(
+        configured.path().to_str().unwrap(),
+        used["inputs"]["config_defaults"]["dir"].as_str().unwrap()
+    );
+    let flag = flagged.path().to_str().unwrap();
+    let overridden = json_stdout(&run_with_defaults(
+        directory.path(),
+        &config,
+        &["--dir", flag],
+    ));
+    assert!(overridden["inputs"]["config_defaults"].get("dir").is_none());
+}
+
+#[test]
+fn config_defaults_that_applied_are_listed_in_every_human_readable_output() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"defaults": {"providers": ["claude", "codex"], "group_by": "repo,month"}}"#;
+    let note = "Config defaults: group_by=repo,month; providers=claude,codex";
+
+    let table = run_with_defaults(directory.path(), config, &[]);
+    assert!(table.status.success());
+    assert!(String::from_utf8_lossy(&table.stdout).contains(note));
+    let markdown = run_with_defaults(directory.path(), config, &["--format", "markdown"]);
+    assert!(
+        String::from_utf8_lossy(&markdown.stdout)
+            .contains("Config defaults: group\\_by=repo,month"),
+        "{}",
+        String::from_utf8_lossy(&markdown.stdout)
+    );
+    let html = run_with_defaults(directory.path(), config, &["--format", "html"]);
+    assert!(String::from_utf8_lossy(&html.stdout).contains(note));
+    // `allocate` reads its own `--config`, and a run with its own flags for
+    // everything else still lists what the config supplied.
+    for format in ["table", "markdown", "html"] {
+        let allocation = allocate_with_config(
+            directory.path(),
+            r#"{"defaults": {"human_idle": "45m"}}"#,
+            format,
+        );
+        assert!(
+            allocation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&allocation.stderr)
+        );
+        let text = String::from_utf8_lossy(&allocation.stdout);
+        assert!(
+            text.contains("Config defaults: human_idle=45m")
+                || text.contains("Config defaults: human\\_idle=45m"),
+            "{format}: {text}"
+        );
+    }
+
+    // Nothing applied, nothing said: flags given on the command line win.
+    let typed = run_with_defaults(
+        directory.path(),
+        config,
+        &["--provider", "pi", "--group-by", "repo"],
+    );
+    assert!(!String::from_utf8_lossy(&typed.stdout).contains("Config defaults"));
+}
+
+#[test]
+fn refusals_blame_the_config_when_the_format_came_from_it() {
+    let directory = tempdir().unwrap();
+    let window = ["--month", "2026-03", "--compare", "previous"];
+    let config = r#"{"defaults": {"format": "csv"}}"#.to_string();
+    let output = run_with_defaults(directory.path(), &config, &window);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("defaults.format \"csv\" (from config)"),
+        "{error}"
+    );
+    assert!(
+        error.contains("pass --format table or --format json"),
+        "{error}"
+    );
+    assert!(!error.contains("with --format csv"), "{error}");
+
+    // Given on the command line, the flag is what to change.
+    let typed = run_with_defaults(
+        directory.path(),
+        &config,
+        &[
+            "--format", "csv", window[0], window[1], window[2], window[3],
+        ],
+    );
+    let error = String::from_utf8_lossy(&typed.stderr);
+    assert!(error.contains("with --format csv"), "{error}");
+    for format in ["csv", "markdown", "html"] {
+        let config = format!(r#"{{"defaults": {{"format": "{format}"}}}}"#);
+        let output = run_with_defaults(directory.path(), &config, &["--explain-human-time"]);
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(&format!("defaults.format \"{format}\" (from config)")),
+            "{error}"
+        );
+        assert!(
+            error.contains("pass --format table or --format json"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_config_calendar_grouping_gives_way_to_an_explicit_period() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"defaults": {"format": "json", "group_by": "repo,month"}}"#;
+    let report = json_stdout(&run_with_defaults(
+        directory.path(),
+        config,
+        &["--period", "week"],
+    ));
+    assert_eq!(serde_json::json!(["repo", "week"]), report["group_by"]);
+    assert_eq!(
+        serde_json::json!({"format": "json", "group_by": "repo"}),
+        report["inputs"]["config_defaults"]
+    );
+    // Without the flag the config's own grouping stands.
+    let report = json_stdout(&run_with_defaults(directory.path(), config, &[]));
+    assert_eq!(serde_json::json!(["repo", "month"]), report["group_by"]);
 }
 
 #[test]

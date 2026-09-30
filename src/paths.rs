@@ -81,8 +81,12 @@ pub struct Config {
     pub project_aliases: BTreeMap<String, ProjectAliasConfig>,
     /// Per-model list rates that override the built-in table used by
     /// `allocate`. The key is a model-name prefix; see `pricing::RateOverrides`.
+    /// Kept as raw JSON and checked entry by entry when compiled: typed here, a
+    /// misspelt field or a wrong type would make serde reject the whole file,
+    /// and everything else in it (authors, defaults, aliases) would be lost
+    /// with only a warning.
     #[serde(default)]
-    pub model_rates: BTreeMap<String, crate::pricing::ModelRateConfig>,
+    pub model_rates: Option<serde_json::Value>,
     /// Everyday flags (`dir`, `depth`, `format`, `providers`, `group_by`,
     /// `gap_cap`, `human_idle`, `review_credit`) that apply when the flag and
     /// its environment variable are absent. Kept as raw JSON so a bad key or
@@ -112,8 +116,11 @@ impl Config {
     }
 
     pub fn compiled_model_rates(&self) -> Result<crate::pricing::RateOverrides> {
-        crate::pricing::RateOverrides::from_config(&self.model_rates)
-            .context("invalid \"model_rates\" configuration")
+        match &self.model_rates {
+            Some(value) => crate::pricing::RateOverrides::from_value(value)
+                .context("invalid \"model_rates\" configuration"),
+            None => Ok(crate::pricing::RateOverrides::default()),
+        }
     }
 }
 

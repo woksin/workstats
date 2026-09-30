@@ -72,7 +72,8 @@ impl Table {
 }
 
 /// Backslash-escapes every character that Markdown, GitHub's table syntax, or
-/// GitHub's inline HTML handling would otherwise act on.
+/// GitHub's inline HTML handling would otherwise act on, and defuses the
+/// references GitHub links from plain text.
 ///
 /// `|` would end a table cell and start a new one, `<` could open an HTML tag,
 /// `` ` `` `*` `_` `~` `[` `]` are emphasis, code and link syntax, `&` starts an
@@ -81,9 +82,19 @@ impl Table {
 /// still renders as written. `>` is included so a value that begins a line
 /// cannot become a quote. Newlines and other control characters have already
 /// been replaced by [`safe_text`], so a value cannot leave its table row.
+///
+/// A repository called `@scope/pkg` would notify a user or team when the report
+/// is pasted into a PR, and `#123` or `GH-123` would link someone else's issue.
+/// GitHub finds those in the rendered text, where a backslash is already gone,
+/// so the escape cannot be one: a zero-width space after the `@`, and between
+/// the marker and its number, breaks the match without changing how the text
+/// reads. The table and the HTML page are untouched by this: only Markdown is
+/// pasted somewhere that links.
 pub(crate) fn escape_markdown(value: &str) -> String {
+    const ZERO_WIDTH_SPACE: char = '\u{200B}';
+    let characters: Vec<char> = value.chars().collect();
     let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
+    for (index, &character) in characters.iter().enumerate() {
         if matches!(
             character,
             '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>' | '|' | '~' | '&'
@@ -91,6 +102,14 @@ pub(crate) fn escape_markdown(value: &str) -> String {
             escaped.push('\\');
         }
         escaped.push(character);
+        let next_is_digit = characters.get(index + 1).is_some_and(char::is_ascii_digit);
+        let after_gh = character == '-'
+            && index >= 2
+            && characters[index - 2].eq_ignore_ascii_case(&'G')
+            && characters[index - 1].eq_ignore_ascii_case(&'H');
+        if character == '@' || (next_is_digit && (character == '#' || after_gh)) {
+            escaped.push(ZERO_WIDTH_SPACE);
+        }
     }
     escaped
 }
@@ -307,6 +326,40 @@ mod tests {
             escape_markdown(HOSTILE)
         );
         assert_eq!("plain text 1.5 -2", escape_markdown("plain text 1.5 -2"));
+    }
+
+    #[test]
+    fn markdown_defuses_mentions_and_issue_references() {
+        let zwsp = '\u{200B}';
+        let escaped = escape_markdown("@scope/pkg #123 GH-42 a#b C# #tag @");
+        assert_eq!(
+            format!("@{zwsp}scope/pkg #{zwsp}123 GH-{zwsp}42 a#b C# #tag @{zwsp}"),
+            escaped
+        );
+        // What GitHub would link is no longer contiguous text.
+        assert!(
+            !escaped.contains("@scope") && !escaped.contains("#123") && !escaped.contains("GH-42")
+        );
+
+        // Through the renderer, in every place a value can appear, but not in
+        // the HTML page, which links nothing.
+        let hostile = "@team #7";
+        let document = Document {
+            title: hostile.to_string(),
+            blocks: vec![
+                Block::Section(hostile.to_string()),
+                Block::Facts(vec![(hostile.to_string(), hostile.to_string())]),
+                Block::Paragraph(hostile.to_string()),
+                Block::List(vec![hostile.to_string()]),
+            ],
+        };
+        let markdown = render_markdown(&document);
+        assert!(
+            !markdown.contains("@team") && !markdown.contains("#7"),
+            "{markdown}"
+        );
+        assert!(markdown.contains(&format!("@{zwsp}team #{zwsp}7")));
+        assert!(render_html(&document).contains("@team #7"));
     }
 
     #[test]
