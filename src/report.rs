@@ -451,17 +451,7 @@ pub(crate) fn run(
                 &mut transcript_cache,
                 &mut baseline_diagnostics,
             )?;
-            let unseen = baseline_diagnostics
-                .messages
-                .iter()
-                .filter(|message| !diagnostics.messages.contains(message))
-                .count() as u64;
-            // Past the storage cap the texts are gone, so the unstored rest
-            // cannot be compared and is counted as new.
-            let unstored = baseline_diagnostics
-                .warning_count
-                .saturating_sub(baseline_diagnostics.messages.len() as u64);
-            let new_warnings = unseen + unstored;
+            let new_warnings = baseline_only_warnings(&diagnostics, &baseline_diagnostics);
             if new_warnings > 0 {
                 diagnostics.warn(format!(
                     "the comparison window raised {new_warnings} warning(s) of its own; run it on its own to see them"
@@ -1054,9 +1044,75 @@ fn inferred_repository_roots<'a>(sessions: impl IntoIterator<Item = &'a Session>
     roots.into_iter().collect()
 }
 
+/// How many of the baseline pass's warnings the selected window did not
+/// already show.
+///
+/// While the selected window stored every message, the texts can be compared
+/// one by one; the baseline's own unstored overflow is then counted as new,
+/// because its texts are gone. Once the selected window hit the storage cap,
+/// its dropped texts cannot be compared either, and shared warnings are
+/// exactly what fills the cap, so the count falls back to how many more
+/// warnings the baseline raised than the selected window did. That can miss a
+/// baseline-only warning hidden behind a flood the report already reports,
+/// which is the better failure than a line blaming the baseline for the flood.
+fn baseline_only_warnings(selected: &Diagnostics, baseline: &Diagnostics) -> u64 {
+    let selected_complete = selected.warning_count == selected.messages.len() as u64;
+    if !selected_complete {
+        return baseline
+            .warning_count
+            .saturating_sub(selected.warning_count);
+    }
+    let unseen = baseline
+        .messages
+        .iter()
+        .filter(|message| !selected.messages.contains(message))
+        .count() as u64;
+    let unstored = baseline
+        .warning_count
+        .saturating_sub(baseline.messages.len() as u64);
+    unseen + unstored
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn warned(messages: &[&str]) -> Diagnostics {
+        let mut diagnostics = Diagnostics::default();
+        for message in messages {
+            diagnostics.warn(*message);
+        }
+        diagnostics
+    }
+
+    #[test]
+    fn the_baseline_is_blamed_only_for_warnings_the_report_has_not_shown() {
+        let selected = warned(&["shared"]);
+        assert_eq!(0, baseline_only_warnings(&selected, &warned(&["shared"])));
+        assert_eq!(
+            2,
+            baseline_only_warnings(&selected, &warned(&["shared", "own", "another"]))
+        );
+        assert_eq!(1, baseline_only_warnings(&warned(&[]), &warned(&["own"])));
+    }
+
+    #[test]
+    fn a_shared_flood_past_the_storage_cap_blames_the_baseline_for_nothing() {
+        let flood: Vec<String> = (0..crate::model::MAX_STORED_MESSAGES + 20)
+            .map(|line| format!("malformed line {line}"))
+            .collect();
+        let flood: Vec<&str> = flood.iter().map(String::as_str).collect();
+        let selected = warned(&flood);
+        assert_eq!(0, baseline_only_warnings(&selected, &warned(&flood)));
+        // With the selected window capped, only an excess can be attributed.
+        let mut more = flood.clone();
+        more.push("own");
+        assert_eq!(1, baseline_only_warnings(&selected, &warned(&more)));
+        // When the report stored everything it raised, the baseline's
+        // overflow past the cap counts too, text or no text.
+        assert_eq!(120, baseline_only_warnings(&warned(&[]), &warned(&flood)));
+    }
+
     use std::fs;
 
     #[test]
