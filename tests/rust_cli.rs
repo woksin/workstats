@@ -1910,6 +1910,24 @@ fn allocate_prices_unknown_models_from_config_rate_overrides() {
     );
 }
 
+#[test]
+fn allocate_json_carries_the_config_defaults_its_report_used() {
+    let directory = tempdir().unwrap();
+    let with = allocate_with_config(
+        directory.path(),
+        r#"{"defaults": {"human_idle": "45m"}}"#,
+        "json",
+    );
+    let with = json_stdout(&with);
+    assert_eq!(
+        serde_json::json!({"human_idle": "45m"}),
+        with["config_defaults"]
+    );
+
+    let without = allocate_with_config(directory.path(), "{}", "json");
+    assert!(json_stdout(&without).get("config_defaults").is_none());
+}
+
 /// One misspelt field used to make serde discard the whole config with a
 /// warning, silently losing the rest of it (authors, defaults, aliases).
 #[test]

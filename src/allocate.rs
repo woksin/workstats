@@ -263,10 +263,11 @@ pub struct Allocation {
     pub effective_share: f64,
     #[serde(skip)]
     pub top: usize,
-    /// Config `defaults` this run's report used, for the one-line note; set by
-    /// the caller, which knows the config. Not part of the JSON, which the
-    /// report's own `inputs.config_defaults` already describes.
-    #[serde(skip)]
+    /// Config `defaults` this run's report used (flag name to value), set by
+    /// the caller, which knows the config. They are in the JSON, and in the
+    /// one-line note of the table, Markdown and HTML, because they change what
+    /// the allocation covers; CSV has no place for them and omits them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub config_defaults: BTreeMap<String, String>,
     pub periods: Vec<PeriodRow>,
     /// Every project's slice of the spend. Present only when no project was
