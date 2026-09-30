@@ -25,8 +25,10 @@ Remote-tracking branches are not read, so a `git fetch` never changes a report.
 `--year` and `--week` select commits by when they were *authored*, not when they were last
 committed, so a commit written in March and rebased or amended in May is still
 March work. (Git's own `--since`/`--until` use the committer date; workstats
-only gives Git a widened lower bound to keep the history walk short and applies
-the exact window itself.)
+only gives Git a widened lower bound to keep the history walk short, lists the
+author dates, applies the exact window itself, and asks Git for line counts only
+for the commits inside it — so a report on an old month does not pay for every
+commit made since.)
 
 Your Git author defaults to `git config --global user.email`, falling back to
 `user.name`. Override it with `--author REGEX` or `WORKSTATS_AUTHOR`. If you
@@ -184,13 +186,18 @@ reading a change as a change in effort.
 
 Histories and Git are read once over both windows and each window is cut from
 what was read, so each side is the report that window would print on its own.
-The selected window's report is unchanged; in `--format json` the comparison is
+Git is read from the same checkouts a run without `--compare` reads (`--dir` plus
+the checkout of every retained session), whatever the session's date, so adding
+`--compare` never changes the selected window's report, including
+`inputs.git_scan_roots`; in `--format json` the comparison is
 an added `comparison` object with `current`, `previous` and `delta` (a `change`
 and a `percent`, which is `null` when the earlier figure is zero, per figure;
 `change_points` for shares). Table, Markdown and HTML show the same block just
 after the summary. CSV, `workstats ui` and `workstats allocate` refuse
 `--compare` with an error: CSV is one flat table with no place for a second
 window, the explorer browses one report, and an allocation covers one period.
+When the refused format came from `defaults.format` rather than `--format`, the
+error says so and suggests passing `--format table` or `--format json`.
 
 `--depth N` (default 4) bounds Git repository discovery below the scan root.
 `--no-ignore` includes the generated and vendor paths — `node_modules/`,
@@ -250,7 +257,15 @@ CSV columns for the file areas follow the
 `--format markdown` prints GitHub-flavoured tables with the same sections and
 figures as the table view — summary, grouped rows, the agent-authored section,
 notes and warnings — and escapes `|`, backticks, `<` and the other characters
-Markdown acts on in repository names and paths. `--format html` prints one
+Markdown acts on in repository names and paths. It also defuses what GitHub
+links from plain text: a zero-width space follows an `@` and sits between `#` or
+`GH-` and a number, so a repository called `@scope/pkg` does not mention anyone
+and `#123` does not link an issue when the report is pasted into a PR. The
+Markdown and HTML notes and warnings replace your home directory with `~`, so a
+document does not carry your username or client folder names; the table view
+shows paths as they are. A run that took values from the config ends its notes
+with `Config defaults: …`, in the table, Markdown, HTML and `allocate` outputs
+alike. `--format html` prints one
 static page to stdout: inline CSS only, no JavaScript, no fonts, images or
 links, and a `Content-Security-Policy` of `default-src 'none'`, so it opens
 identically offline and never phones home. It follows the reader's light or

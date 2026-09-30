@@ -136,7 +136,9 @@ and all four are required:
 - **Validation** happens before anything is scanned. A negative or non-numeric
   rate, a missing rate, an unknown `family`, a blank key, or two keys that match
   the same models (`gpt-5.5` and `gpt-5-5`) stops the run with an error naming
-  the key, for example `invalid "model_rates" configuration: model rate
+  the key (a misspelt field such as `inptu`, or a value of the wrong type, is
+  refused as `invalid model_rates.<key>` the same way), for example
+  `invalid "model_rates" configuration: model rate
   "acme-coder": "output" must be a non-negative number of USD per million
   tokens, got -3`.
 

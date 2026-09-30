@@ -28,7 +28,10 @@ tag are the generated list of pull requests.
   characters Markdown acts on in repository names and paths. HTML prints one
   self-contained static page: inline CSS only, no scripts, fonts, images or
   links, a `Content-Security-Policy` of `default-src 'none'`, every value
-  escaped, and light and dark themes from the reader's setting. Both work for
+  escaped, and light and dark themes from the reader's setting. Markdown also
+  keeps `@scope/pkg` and `#123` from becoming mentions and issue links when
+  pasted into a PR, and both formats replace the home directory with `~` in
+  notes and warnings. Both work for
   `workstats` and `workstats allocate`, print no update notice, and are refused
   with `--explain-human-time`, like CSV.
 
@@ -37,7 +40,11 @@ tag are the generated list of pull requests.
   `review_credit`. Precedence is flag, then environment variable, then config,
   then the built-in default, so a flag typed with its built-in value still wins.
   An unknown key or invalid value stops the run naming it, and `--format json`
-  lists what was taken from the config under `inputs.config_defaults`.
+  lists what was taken from the config under `inputs.config_defaults`, and the
+  table, Markdown, HTML and `allocate` outputs note which defaults applied. A
+  calendar `group_by` yields to an explicit `--period`, and `model_rates`
+  entries are validated one by one, so a misspelt field is an error naming the
+  entry rather than the whole config being ignored with a warning.
 
 - `--compare previous|YYYY-MM|YYYY-Www|YYYY` reports the selected window beside
   an earlier one. `previous` is the window of the same kind and length just
@@ -48,7 +55,9 @@ tag are the generated list of pull requests.
   figure with its change, and a figure that was zero in the baseline shows `n/a`
   rather than a percentage. In `--format json` it is an added `comparison`
   object. `--compare` refuses CSV, `workstats ui` and `workstats allocate`,
-  because their shapes cannot carry a second window.
+  because their shapes cannot carry a second window. The selected window's
+  report, including the Git checkouts it reads, is the one it would print
+  without `--compare`.
 
 - The documentation moved out of the README into `docs/`: install, usage,
   configuration, how the estimate works, `allocate`, privacy, and development.

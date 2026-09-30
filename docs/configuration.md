@@ -82,14 +82,24 @@ as `--depth 4`, still beats the config.
 | `depth` | `--depth` | Whole number |
 | `format` | `--format` | Any `--format` value |
 | `providers` | `--provider` | List of provider names, or one comma-separated string |
-| `group_by` | `--group-by` | Comma-separated dimensions; ignored when `--by-repo`, `--matrix`, or `--by-dir` is given |
+| `group_by` | `--group-by` | Comma-separated dimensions; ignored when `--by-repo`, `--matrix`, or `--by-dir` is given, and its `day`, `week` or `month` gives way to an explicit `--period` (other dimensions stay) |
 | `gap_cap`, `human_idle`, `review_credit` | `--gap-cap`, `--human-idle`, `--review-credit` | Durations such as `30s`, `5m`, `1h` |
 
 An unknown key or an invalid value stops the run with a message naming it, for
 example `invalid defaults.gap_cap "soon"` or a misspelt key such as `depht`,
 rather than being ignored. `workstats ui` ignores `format`, and `allocate` ignores `group_by`,
 because each sets that itself. `--format json` lists the values taken from the
-config under `inputs.config_defaults`.
+config under `inputs.config_defaults` (including `dir` when the config's
+directory was the one scanned), and the table, Markdown, HTML and `allocate`
+outputs end their notes with a one-line `Config defaults: …` when any applied.
+A refusal caused by a configured format, such as `--compare` with
+`defaults.format "csv"`, names the config and suggests `--format table` or
+`--format json`.
+
+`model_rates` is checked the same way as `defaults`: a misspelt field (`inptu`),
+a wrong type, or a bad value stops the run with an error naming the entry, for
+example `invalid "model_rates" configuration: invalid model_rates.acme-coder`,
+and the rest of the file is never discarded for it.
 
 `WORKSTATS_CACHE`, `WORKSTATS_CONFIG`, `WORKSTATS_EVENTS`, `WORKSTATS_VIEWS`,
 `WORKSTATS_DIR`, and `WORKSTATS_GIT` provide explicit overrides. When
