@@ -191,9 +191,13 @@ report that window would print alone: the same sources, the same Git checkouts
 labels and `--repo-exact` matching. The transcript index keeps the second pass
 cheap. Adding `--compare` never changes the selected window's report, including
 `inputs.git_scan_roots`, with one exception: when the baseline raises warnings
-the selected window did not, one extra warning says how many, so run the
-baseline on its own to read them. Warnings both windows share, such as a
-malformed transcript line, are shown once and add nothing; in `--format json` the comparison is
+the selected window did not show, one extra warning says so, and running the
+baseline on its own shows them. Warnings both windows share, such as a
+malformed transcript line, are shown once and add nothing. Only the first 100
+warnings of a run keep their text, so the number in that line counts only
+those and is a floor; and when the selected window itself raised more than
+100, no extra line is added at all, because its dropped warnings may be the
+baseline's. In `--format json` the comparison is
 an added `comparison` object with `current`, `previous` and `delta` (a `change`
 and a `percent`, which is `null` when the earlier figure is zero, per figure;
 `change_points` for shares). Table, Markdown and HTML show the same block just

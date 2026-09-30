@@ -61,7 +61,8 @@ tag are the generated list of pull requests.
   without `--compare`, and so is the baseline's: each window is built by the
   same code path a run of that window alone uses, one after the other. The
   one addition is a single warning when the baseline raised warnings the
-  selected window did not.
+  selected window did not show, counted from the warnings whose text is kept
+  (the first 100 of each run).
 
 - The documentation moved out of the README into `docs/`: install, usage,
   configuration, how the estimate works, `allocate`, privacy, and development.
