@@ -62,6 +62,12 @@ pub struct Config {
     pub source_roots: Vec<ConfigRule>,
     #[serde(default)]
     pub check_updates: Option<bool>,
+    /// Git author patterns for the developer's identities, used when neither
+    /// `--author` nor `WORKSTATS_AUTHOR` is given. Each is a `git log
+    /// --author` basic regular expression, exactly as on the command line, and
+    /// they are OR-ed.
+    #[serde(default)]
+    pub authors: Vec<String>,
     /// File-area rules, keyed by category name. A name the built-ins do not
     /// know creates a new category.
     #[serde(default)]

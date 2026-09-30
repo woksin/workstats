@@ -1437,6 +1437,7 @@ mod tests {
                 included_providers: Vec::new(),
                 excluded_providers: Vec::new(),
                 author: String::new(),
+                authors: Vec::new(),
                 agent_authors: Vec::new(),
                 co_authors: false,
                 repo_filter: None,

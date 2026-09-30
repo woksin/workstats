@@ -246,8 +246,13 @@ struct ReportArguments {
         help = "Git repository or directory to scan (default: current directory)"
     )]
     directory: Option<PathBuf>,
-    #[arg(short = 'a', long, help = "Git author regex")]
-    author: Option<String>,
+    #[arg(
+        short = 'a',
+        long,
+        value_name = "REGEX",
+        help = "Git author regex; repeat for several identities (config: \"authors\")"
+    )]
+    author: Vec<String>,
     #[arg(
         short = 'R',
         long,
@@ -545,6 +550,33 @@ fn scan_directory(
     Ok(directory)
 }
 
+/// The Git author patterns a run describes, from the first source that names
+/// any: `--author` (repeatable), then `WORKSTATS_AUTHOR` (one value), then the
+/// config file's `authors`, then the global Git identity.
+///
+/// The sources replace each other rather than combine. A flag on the command
+/// line has to be able to narrow a run to one identity even when the config
+/// file lists three, and a union would make that impossible. The Git default is
+/// the last resort and is only consulted — it spawns `git config` — when
+/// nothing more specific was given.
+fn resolve_authors(
+    flags: &[String],
+    environment: Option<String>,
+    configured: &[String],
+    default: impl FnOnce() -> Option<String>,
+) -> Vec<String> {
+    if !flags.is_empty() {
+        return flags.to_vec();
+    }
+    if let Some(value) = environment {
+        return vec![value];
+    }
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    default().into_iter().collect()
+}
+
 /// The Git identities the second, agent-authorship pass matches.
 ///
 /// Empty is the default and means no second pass runs at all, not that it runs
@@ -781,15 +813,6 @@ fn run(
         env::var_os("WORKSTATS_DIR").map(PathBuf::from),
         env::current_dir().ok(),
     )?;
-    let author = arguments.author.clone().unwrap_or_else(|| {
-        env::var("WORKSTATS_AUTHOR")
-            .ok()
-            .or_else(default_git_author)
-            .unwrap_or_default()
-    });
-    if !arguments.no_git && author.is_empty() {
-        bail!("Git author is not configured; set git config --global user.email or pass --author");
-    }
     let mut history_paths = default_history_paths();
     history_paths.retain(|provider, paths| {
         paths.iter().any(|path| {
@@ -863,6 +886,18 @@ fn run(
     // Before anything classifies a path, so every commit in this run is read
     // through the same registry.
     classify::install(config.category_registry()?)?;
+    let authors = resolve_authors(
+        &arguments.author,
+        env::var("WORKSTATS_AUTHOR").ok(),
+        &config.authors,
+        default_git_author,
+    );
+    // A blank pattern is refused as well as a missing one: Git treats an empty
+    // `--author` as matching every commit, which would report other people's
+    // work as the developer's.
+    if !arguments.no_git && (authors.is_empty() || authors.iter().any(|a| a.trim().is_empty())) {
+        bail!("Git author is not configured; set git config --global user.email or pass --author");
+    }
     let rules = configured_rules(&config, &arguments.source_rule)?;
     let aliases = config.compiled_project_aliases(&home_dir())?;
     let cache_path = arguments.cache.clone().unwrap_or_else(default_cache_path);
@@ -1016,7 +1051,7 @@ fn run(
             let scoped_filter = if from_session { None } else { repo_filter };
             commits.extend(read_git_commits(
                 root,
-                &author,
+                &authors,
                 &mut resolver,
                 &mut diagnostics,
                 depth,
@@ -1168,7 +1203,8 @@ fn run(
                 .collect(),
             included_providers: included.into_iter().collect(),
             excluded_providers: excluded.into_iter().collect(),
-            author,
+            author: authors.join(", "),
+            authors,
             agent_authors,
             co_authors: arguments.co_authors,
             repo_filter: arguments.repo,
@@ -2036,6 +2072,33 @@ mod tests {
 
     /// Nothing happens unless the run asks for it, and asking for it with a
     /// pattern replaces the built-in identities rather than joining them.
+    #[test]
+    fn author_is_repeatable_and_the_sources_replace_rather_than_merge() {
+        let flags = report_arguments(&["-a", "a@x", "--author", "b@y"]).author;
+        assert_eq!(vec!["a@x", "b@y"], flags);
+        assert!(report_arguments(&[]).author.is_empty());
+
+        let configured = vec!["c@z".to_string(), "d@z".to_string()];
+        let env = Some("e@env".to_string());
+        let unused =
+            || panic!("the Git default must not be read when something more specific exists");
+        // CLI > env > config > git config.
+        assert_eq!(
+            flags,
+            resolve_authors(&flags, env.clone(), &configured, unused)
+        );
+        assert_eq!(
+            vec!["e@env"],
+            resolve_authors(&[], env, &configured, unused)
+        );
+        assert_eq!(configured, resolve_authors(&[], None, &configured, unused));
+        assert_eq!(
+            vec!["g@git"],
+            resolve_authors(&[], None, &[], || Some("g@git".to_string()))
+        );
+        assert!(resolve_authors(&[], None, &[], || None).is_empty());
+    }
+
     #[test]
     fn agent_commits_are_off_until_asked_for_and_the_pattern_replaces_the_defaults() {
         assert!(

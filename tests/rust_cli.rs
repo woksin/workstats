@@ -1326,3 +1326,213 @@ fn allocate_refuses_to_read_pruned_history_as_an_absence_of_work() {
         "the gap must be named, got {warnings:?}"
     );
 }
+
+/// A report over `path` with `arguments` appended, parsed. The shared flags
+/// keep every Git test away from AI history, the cache and the terminal.
+fn git_report(path: &str, arguments: &[&str]) -> Value {
+    report_with_env(path, arguments, &[])
+}
+
+fn report_with_env(path: &str, arguments: &[&str], environment: &[(&str, &str)]) -> Value {
+    let mut command = Command::new(binary());
+    command
+        .args([
+            "--dir",
+            path,
+            "--no-ai",
+            "--no-cache",
+            "--no-progress",
+            "--format",
+            "json",
+        ])
+        .args(arguments)
+        .env_remove("WORKSTATS_AUTHOR")
+        .envs(environment.iter().copied());
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// A repository whose first branch is called `main`, whatever the machine's
+/// `init.defaultBranch` says.
+fn repository_on_main(temporary: &Path, name: &str) -> String {
+    let project = temporary.join(name);
+    fs::create_dir_all(&project).unwrap();
+    let path = project.to_str().unwrap().to_string();
+    assert!(git(&["init", "-q", "-b", "main", &path]).status.success());
+    path
+}
+
+#[test]
+fn commits_on_other_local_branches_are_counted_once() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "branches");
+    const ME: &str = "Fixture <fixture@example.com>";
+
+    commit_as(&path, "src/lib.rs", "one\n", ME, &["on main"]);
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "-b", "side"])
+            .status
+            .success()
+    );
+    commit_as(&path, "src/side.rs", "two\nthree\n", ME, &["on side"]);
+    // Back on `main`: HEAD no longer reaches the side branch's commit.
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "main"])
+            .status
+            .success()
+    );
+    let head_only = git(&["-C", &path, "rev-list", "--count", "HEAD"]);
+    assert_eq!("1", String::from_utf8_lossy(&head_only.stdout).trim());
+
+    let report = git_report(&path, &["--author", "fixture@example.com"]);
+    assert_eq!(2, report["summary"]["commit_count"]);
+    assert_eq!(3, report["summary"]["additions"]);
+
+    // A detached HEAD on a commit no branch names still counts, and a commit
+    // reachable from both HEAD and a branch is not counted twice.
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "--detach", "side"])
+            .status
+            .success()
+    );
+    commit_as(&path, "src/loose.rs", "four\n", ME, &["detached"]);
+    let report = git_report(&path, &["--author", "fixture@example.com"]);
+    assert_eq!(3, report["summary"]["commit_count"]);
+}
+
+#[test]
+fn the_window_is_the_author_date_not_the_committer_date() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "dates");
+    const ME: &str = "Fixture <fixture@example.com>";
+
+    // (file, author date, committer date)
+    let commits = [
+        // Authored before the window, committed inside it: a rebase or a
+        // cherry-pick. Not March work.
+        ("before.rs", "2026-02-10T10:00:00Z", "2026-03-15T10:00:00Z"),
+        // Authored and committed inside the window.
+        ("both.rs", "2026-03-12T10:00:00Z", "2026-03-12T10:00:00Z"),
+        // Authored inside the window, amended after it: still March work.
+        ("amended.rs", "2026-03-10T10:00:00Z", "2026-05-20T10:00:00Z"),
+    ];
+    for (file, authored, committed) in commits {
+        fs::write(Path::new(&path).join(file), "line\n").unwrap();
+        assert!(git(&["-C", &path, "add", "."]).status.success());
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &path,
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-q",
+                "-m",
+                file,
+                &format!("--author={ME}"),
+            ])
+            .env("GIT_AUTHOR_DATE", authored)
+            .env("GIT_COMMITTER_DATE", committed)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let march = git_report(
+        &path,
+        &["--author", "fixture@example.com", "--month", "2026-03"],
+    );
+    assert_eq!(
+        2, march["summary"]["commit_count"],
+        "the amended commit belongs to March and the rebased one does not"
+    );
+    assert_eq!(2, march["summary"]["additions"]);
+
+    // The same two bounds spelled as a range behave the same way.
+    let range = git_report(
+        &path,
+        &[
+            "--author",
+            "fixture@example.com",
+            "--since",
+            "2026-03-01",
+            "--until",
+            "2026-03-31",
+        ],
+    );
+    assert_eq!(2, range["summary"]["commit_count"]);
+
+    let everything = git_report(&path, &["--author", "fixture@example.com"]);
+    assert_eq!(3, everything["summary"]["commit_count"]);
+}
+
+#[test]
+fn several_author_identities_are_one_developer() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "identities");
+    commit_as(&path, "a.rs", "1\n", "A <a@example.com>", &["a"]);
+    commit_as(&path, "b.rs", "1\n", "B <b@example.com>", &["b"]);
+    commit_as(&path, "c.rs", "1\n", "C <c@example.com>", &["c"]);
+    let count = |report: &Value| report["summary"]["commit_count"].as_u64().unwrap();
+
+    let flags = git_report(&path, &["-a", "a@example.com", "--author", "b@example.com"]);
+    assert_eq!(2, count(&flags));
+    assert_eq!(
+        vec!["a@example.com", "b@example.com"],
+        flags["inputs"]["authors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!("a@example.com, b@example.com", flags["inputs"]["author"]);
+
+    // Config < environment < flags.
+    let config = temporary.path().join("config.json");
+    fs::write(
+        &config,
+        r#"{"authors": ["a@example.com", "c@example.com"]}"#,
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+    let from_config = git_report(&path, &["--config", config]);
+    assert_eq!(2, count(&from_config));
+    assert_eq!(
+        "a@example.com, c@example.com",
+        from_config["inputs"]["author"]
+    );
+
+    let from_environment = report_with_env(
+        &path,
+        &["--config", config],
+        &[("WORKSTATS_AUTHOR", "b@example.com")],
+    );
+    assert_eq!(1, count(&from_environment));
+    assert_eq!(
+        1,
+        from_environment["inputs"]["authors"]
+            .as_array()
+            .unwrap()
+            .len()
+    );
+
+    let from_flag = report_with_env(
+        &path,
+        &["--config", config, "--author", "c@example.com"],
+        &[("WORKSTATS_AUTHOR", "b@example.com")],
+    );
+    assert_eq!(1, count(&from_flag));
+    assert_eq!("c@example.com", from_flag["inputs"]["author"]);
+}

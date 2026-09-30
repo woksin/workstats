@@ -282,12 +282,35 @@ you narrow it with `--repo`, `--repo-exact`, `--since`/`--until`,
 `--dir` and `WORKSTATS_DIR` must name a directory that exists. A path that does
 not is an error naming which of the two was wrong, not an all-zero report.
 
+Within each repository, **every local branch** is scanned, plus `HEAD` so a
+detached checkout still counts — not only the branch you have checked out. A
+commit reachable from several branches or worktrees is counted once.
+Remote-tracking branches are not read, so a `git fetch` never changes a report.
+
+**The author date decides the window.** `--since`, `--until`, `--month` and
+`--year` select commits by when they were *authored*, not when they were last
+committed, so a commit written in March and rebased or amended in May is still
+March work. (Git's own `--since`/`--until` use the committer date; workstats
+only gives Git a widened lower bound to keep the history walk short and applies
+the exact window itself.)
+
 Your Git author defaults to `git config --global user.email`, falling back to
-`user.name`. Override it with `--author REGEX` or `WORKSTATS_AUTHOR`. That one
-identity is the whole of what a report describes by default; commits a coding
-agent authored are read only when you ask, and even then are reported apart from
-your own and never as human time — see
-[Agent-authored commits](#agent-authored-commits).
+`user.name`. Override it with `--author REGEX` or `WORKSTATS_AUTHOR`. If you
+commit under several identities — work and personal addresses, an old name —
+repeat the flag, `--author a@example.com -a b@example.com`, or list them under
+`"authors"` in the [config file](#inputs-and-index); Git ORs them into one
+developer. The first source that names any wins, and sources do not combine:
+`--author` flags, then `WORKSTATS_AUTHOR` (a single value), then the config
+file's `authors`, then your global Git identity. The report's `inputs.author`
+joins them with `, ` and `inputs.authors` lists them. Those identities are the
+whole of what a report describes by default; commits a coding agent authored are
+read only when you ask, and even then are reported apart from your own and never
+as human time — see [Agent-authored commits](#agent-authored-commits).
+
+**Nested repositories are not scanned.** Discovery stops at the first `.git` it
+finds, so a submodule or a clone nested inside another checkout is not scanned
+as its own repository (its commits are not part of the parent's history
+either). Point `--dir` at the nested repository to include it.
 
 ### Explore it interactively
 
@@ -678,7 +701,8 @@ and supports `--format json` and `--format csv`.
 - no credential discovery and no attempt to sign in to providers;
 - no prompt or response bodies in reports or the cache;
 - Git is read for commit metadata only — the commit id, the author date, and
-  `--numstat`'s per-path line counts. The second pass
+  `--numstat`'s per-path line counts — from every local branch of each
+  repository, never a remote. The second pass
   [`--agent-commits`](#agent-authored-commits) runs is the same read with a
   different `--author`, over the history already on disk, and it makes no network
   call. `--co-authors` widens that read by exactly the *values* of
@@ -793,7 +817,7 @@ workstats --config ./team.json  # read source roots and categories from elsewher
 ```
 
 The config file holds `source_roots`, `categories`, `category_mode`,
-`project_aliases`, and `check_updates`. `workstats ui`'s saved views are kept beside it as
+`project_aliases`, `authors`, and `check_updates`. `workstats ui`'s saved views are kept beside it as
 `views.json` — configuration, never cache — so `--rebuild-cache` and
 `--no-cache` leave them alone.
 

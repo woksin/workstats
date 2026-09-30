@@ -639,7 +639,12 @@ pub struct Inputs {
     pub history_sources: BTreeMap<String, Vec<String>>,
     pub included_providers: Vec<String>,
     pub excluded_providers: Vec<String>,
+    /// The author patterns joined with `", "`, kept so consumers written
+    /// against the single-author report keep working; `authors` is the
+    /// structured form.
     pub author: String,
+    /// Every `--author` pattern the human pass ran with, in the order given.
+    pub authors: Vec<String>,
     /// The `--author` patterns the second, agent-identity pass ran with; empty
     /// when the run did not ask for one. Recorded because the patterns are
     /// overridable, so a report is only reproducible if it says which ones it
