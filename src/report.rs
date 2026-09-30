@@ -1048,8 +1048,8 @@ fn inferred_repository_roots<'a>(sessions: impl IntoIterator<Item = &'a Session>
 /// already show.
 ///
 /// While the selected window stored every message, the texts can be compared
-/// one by one; the baseline's own unstored overflow is then counted as new,
-/// because its texts are gone. Once the selected window hit the storage cap,
+/// one by one, and the baseline's textless overflow counts only as far as the
+/// baseline raised more warnings than the report did. Once the selected window hit the storage cap,
 /// its dropped texts cannot be compared either, and shared warnings are
 /// exactly what fills the cap, so the count falls back to how many more
 /// warnings the baseline raised than the selected window did. That can miss a
@@ -1067,10 +1067,15 @@ fn baseline_only_warnings(selected: &Diagnostics, baseline: &Diagnostics) -> u64
         .iter()
         .filter(|message| !selected.messages.contains(message))
         .count() as u64;
-    let unstored = baseline
-        .warning_count
-        .saturating_sub(baseline.messages.len() as u64);
-    unseen + unstored
+    // The baseline's overflow past the cap has no texts. It may hold shared
+    // warnings pushed out by the baseline's own earlier ones, so it is not
+    // all new; what is certainly new is either a text the report never
+    // showed or an excess over the report's own count, whichever is larger.
+    unseen.max(
+        baseline
+            .warning_count
+            .saturating_sub(selected.warning_count),
+    )
 }
 
 #[cfg(test)]
@@ -1111,6 +1116,15 @@ mod tests {
         // When the report stored everything it raised, the baseline's
         // overflow past the cap counts too, text or no text.
         assert_eq!(120, baseline_only_warnings(&warned(&[]), &warned(&flood)));
+        // Own warnings first push shared ones into the baseline's overflow;
+        // those are still the report's, so only the five own ones count.
+        let shared: Vec<&str> = flood[..100].to_vec();
+        let mut own_first = vec!["own 1", "own 2", "own 3", "own 4", "own 5"];
+        own_first.extend(shared.iter().copied());
+        assert_eq!(
+            5,
+            baseline_only_warnings(&warned(&shared), &warned(&own_first))
+        );
     }
 
     use std::fs;
