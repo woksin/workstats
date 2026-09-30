@@ -1804,6 +1804,38 @@ fn several_author_identities_are_one_developer() {
     assert_eq!("c@example.com", from_flag["inputs"]["author"]);
 }
 
+/// A string used to make serde discard the whole config with a warning.
+#[test]
+fn a_single_author_string_in_the_config_is_accepted_and_other_types_are_refused() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "identities");
+    commit_as(&path, "a.rs", "1\n", "A <a@example.com>", &["a"]);
+    commit_as(&path, "b.rs", "1\n", "B <b@example.com>", &["b"]);
+    let config = temporary.path().join("config.json");
+    let config_path = config.to_str().unwrap();
+
+    fs::write(&config, r#"{"authors": "a@example.com"}"#).unwrap();
+    let report = git_report(&path, &["--config", config_path]);
+    assert_eq!(1, report["summary"]["commit_count"]);
+    assert_eq!("a@example.com", report["inputs"]["author"]);
+    assert_eq!(0, report["diagnostics"]["warning_count"]);
+
+    fs::write(&config, r#"{"authors": 7, "defaults": {"format": "json"}}"#).unwrap();
+    let output = run(&[
+        "--dir",
+        &path,
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--config",
+        config_path,
+    ]);
+    assert_eq!(Some(2), output.status.code());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("\"authors\""), "{stderr}");
+    assert!(!stderr.contains("config ignored"), "{stderr}");
+}
+
 fn allocate_with_config(directory: &Path, config: &str, format: &str) -> Output {
     let ada = directory.join("ada");
     let other = directory.join("other");

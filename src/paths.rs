@@ -65,9 +65,11 @@ pub struct Config {
     /// Git author patterns for the developer's identities, used when neither
     /// `--author` nor `WORKSTATS_AUTHOR` is given. Each is a `git log
     /// --author` basic regular expression, exactly as on the command line, and
-    /// they are OR-ed.
+    /// they are OR-ed. A single string is accepted for a single identity.
+    /// Kept as raw JSON so a value of any other type is a hard error naming
+    /// `authors` rather than the whole config being ignored with a warning.
     #[serde(default)]
-    pub authors: Vec<String>,
+    pub authors: Option<serde_json::Value>,
     /// File-area rules, keyed by category name. A name the built-ins do not
     /// know creates a new category.
     #[serde(default)]
@@ -106,6 +108,26 @@ impl Config {
     pub fn compiled_project_aliases(&self, home: &Path) -> Result<ProjectAliases> {
         ProjectAliases::compile(&self.project_aliases, home)
             .context("invalid \"project_aliases\" configuration")
+    }
+
+    pub fn configured_authors(&self) -> Result<Vec<String>> {
+        let Some(value) = &self.authors else {
+            return Ok(Vec::new());
+        };
+        let invalid = || {
+            anyhow::anyhow!(
+                "invalid \"authors\" configuration: expected a string or a list of strings, got {value}"
+            )
+        };
+        match value {
+            serde_json::Value::Null => Ok(Vec::new()),
+            serde_json::Value::String(author) => Ok(vec![author.clone()]),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|item| item.as_str().map(str::to_string).ok_or_else(invalid))
+                .collect(),
+            _ => Err(invalid()),
+        }
     }
 
     pub fn config_defaults(&self, home: &Path) -> Result<crate::cli::ConfigDefaults> {
@@ -1479,6 +1501,32 @@ mod tests {
             ..Config::default()
         };
         assert!(config.category_registry().is_err());
+    }
+
+    #[test]
+    fn authors_accept_a_string_or_a_list_and_refuse_anything_else_by_name() {
+        let authors = |json: &str| {
+            let config: Config = serde_json::from_str(json).unwrap();
+            config.configured_authors()
+        };
+        assert_eq!(
+            vec!["me@example.com"],
+            authors(r#"{"authors": "me@example.com"}"#).unwrap()
+        );
+        assert_eq!(
+            vec!["a@example.com", "b@example.com"],
+            authors(r#"{"authors": ["a@example.com", "b@example.com"]}"#).unwrap()
+        );
+        assert!(authors("{}").unwrap().is_empty());
+        assert!(authors(r#"{"authors": null}"#).unwrap().is_empty());
+        for bad in [
+            r#"{"authors": 7}"#,
+            r#"{"authors": {"me": true}}"#,
+            r#"{"authors": ["a@example.com", 7]}"#,
+        ] {
+            let error = format!("{:#}", authors(bad).unwrap_err());
+            assert!(error.contains("\"authors\""), "{bad}: {error}");
+        }
     }
 
     #[test]

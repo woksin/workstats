@@ -184,6 +184,7 @@ pub(crate) fn run(
     let mut diagnostics = Diagnostics::default();
     let config = load_config(arguments.config.as_deref(), &mut diagnostics);
     let defaults = config.config_defaults(&home_dir())?;
+    let configured_authors = config.configured_authors()?;
     let mut resolved = defaults.resolve(&mut arguments, presentation == Presentation::Explore);
     let output_format = resolved.format;
     // Where the format came from decides what a refusal can usefully suggest:
@@ -364,7 +365,7 @@ pub(crate) fn run(
     let authors = resolve_authors(
         &arguments.author,
         env::var("WORKSTATS_AUTHOR").ok(),
-        &config.authors,
+        &configured_authors,
         default_git_author,
     );
     // A blank pattern is refused as well as a missing one: Git treats an empty
