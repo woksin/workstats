@@ -826,6 +826,7 @@ fn warning_lines(diagnostics: &Diagnostics, home: Option<&Path>) -> Vec<String> 
 /// `run` refuses up front rather than dropping them here.
 fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) -> Document {
     let summary = &report.summary;
+    let home = home_dir();
     let mut blocks = vec![
         Block::Paragraph("Human involvement across local projects".to_string()),
         Block::Section("Summary".to_string()),
@@ -1085,7 +1086,7 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         rows.iter()
             .map(|row| {
                 let mut cells = vec![
-                    label(row, &report.group_by),
+                    document_label(row, &report.group_by, &home),
                     hours(row.human_estimated_seconds),
                     number(row.human_active_days),
                     hours(row.average_human_seconds_per_active_day),
@@ -1145,7 +1146,7 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                 .iter()
                 .map(|row| {
                     vec![
-                        label(row, &report.group_by),
+                        document_label(row, &report.group_by, &home),
                         number(row.agent_commit_count),
                         format!("+{}", number(row.agent_additions)),
                         format!("-{}", number(row.agent_deletions)),
@@ -1166,7 +1167,6 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
 
     blocks.push(Block::Section("Notes".to_string()));
-    let home = home_dir();
     blocks.push(Block::List(
         footer_notes(report, diagnostics)
             .iter()
@@ -1723,6 +1723,16 @@ fn clipped_label(row: &ReportRow, dimensions: &[String]) -> String {
 }
 
 fn label(row: &ReportRow, dimensions: &[String]) -> String {
+    row_label(row, dimensions, None)
+}
+
+/// A row label for a document: `cwd` and `root` are paths, and like every other
+/// path in a document they must not carry the reader-unknown home directory.
+fn document_label(row: &ReportRow, dimensions: &[String], home: &Path) -> String {
+    row_label(row, dimensions, Some(home))
+}
+
+fn row_label(row: &ReportRow, dimensions: &[String], home: Option<&Path>) -> String {
     dimensions
         .iter()
         .map(|name| {
@@ -1730,6 +1740,10 @@ fn label(row: &ReportRow, dimensions: &[String]) -> String {
             match name.as_str() {
                 "month" => named_month(&value).unwrap_or(value),
                 "model" => display_model(&value),
+                "cwd" | "root" => match home {
+                    Some(home) => redact_home(&value, home),
+                    None => value,
+                },
                 _ => value,
             }
         })
@@ -2591,6 +2605,26 @@ mod tests {
             warning_lines(&report.diagnostics, None)[0].contains(&path),
             "the terminal shows its own user's paths"
         );
+    }
+
+    #[test]
+    fn the_documents_redact_the_home_directory_in_path_row_labels_but_the_table_does_not() {
+        let home = home_dir();
+        let path = format!("{}/client-project/src", home.display());
+        let mut report = report_with(vec!["cwd".to_string(), "root".to_string()]);
+        let mut row = row_with(Vec::new());
+        row.key.insert("cwd".to_string(), path.clone());
+        row.key
+            .insert("root".to_string(), home.display().to_string());
+        row.agent_commit_count = 1;
+        report.summary.agent_commit_count = 1;
+        report.rows.push(row);
+        let document = report_document(&report, &report.diagnostics, 0, false);
+        for text in [render_markdown(&document), render_html(&document)] {
+            assert!(text.contains("~/client-project/src"), "{text}");
+            assert!(!text.contains(&*home.to_string_lossy()), "{text}");
+        }
+        assert!(label(&report.rows[0], &report.group_by).contains(&path));
     }
 
     #[test]
