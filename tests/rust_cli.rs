@@ -2317,6 +2317,58 @@ fn compare_previous_puts_each_side_where_a_standalone_run_would() {
 }
 
 #[test]
+fn compare_scans_the_same_checkouts_as_the_standalone_runs() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+    // A checkout outside --dir that only a January session points at, with a
+    // March commit: a standalone run scans it whatever the session's date, so
+    // --compare must not stop counting that commit.
+    let other = repository_on_main(temporary.path(), "other");
+    commit_on(&other, "src/o.rs", "1\n2\n", "2026-03-10");
+    pi_session_on(
+        &temporary.path().join("pi-sessions"),
+        "jan",
+        Path::new(&other),
+        "claude-opus-5",
+        10,
+        "2026-01-05",
+    );
+
+    for (month, compared_with) in [("2026-03", "previous"), ("2026-02", "2026-03")] {
+        let standalone = report_json(&base, &["--month", month]);
+        let compared = report_json(&base, &["--month", month, "--compare", compared_with]);
+        let roots = standalone["inputs"]["git_scan_roots"].as_array().unwrap();
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.as_str().unwrap().ends_with("other")),
+            "{month}: {roots:?}"
+        );
+        assert_eq!(standalone["summary"], compared["summary"], "{month}");
+        assert_eq!(standalone["rows"], compared["rows"], "{month}");
+        assert_eq!(
+            standalone["inputs"]["git_scan_roots"], compared["inputs"]["git_scan_roots"],
+            "{month}"
+        );
+        // The other side is the window a standalone run of it would print.
+        let side = if compared_with == "previous" {
+            "2026-02"
+        } else {
+            "2026-03"
+        };
+        let other_window = report_json(&base, &["--month", side]);
+        for key in ["commit_count", "additions", "deletions", "session_count"] {
+            assert_eq!(
+                other_window["summary"][key], compared["comparison"]["previous"]["figures"][key],
+                "{month} vs {side}: {key}"
+            );
+        }
+    }
+    let march = report_json(&base, &["--month", "2026-03"]);
+    assert_eq!(4, march["summary"]["commit_count"]);
+}
+
+#[test]
 fn compare_shows_not_available_rather_than_infinity_when_the_earlier_window_is_empty() {
     let temporary = tempdir().unwrap();
     let (_, base) = compare_fixture(temporary.path());

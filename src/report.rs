@@ -264,10 +264,6 @@ pub(crate) fn run(
         ),
         None => window,
     };
-    let windows: Vec<Option<(DateTime<Utc>, DateTime<Utc>)>> = match &compare {
-        Some(plan) => vec![Some(plan.current), Some(plan.previous)],
-        None => vec![None],
-    };
     let dimensions = grouping_dimensions(&arguments)?;
 
     let progress = Progress::new(
@@ -490,48 +486,28 @@ pub(crate) fn run(
     let repo_filter = arguments.repo.as_deref();
     let agent_authors = agent_author_patterns(arguments.agent_commits.as_deref());
     let canonical_root = |root: &Path| root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    // The checkouts Git is read from for one window: `--dir`, plus the checkout
-    // of every session active in it. Sessions can belong to locally available
-    // checkouts outside `--dir`. Always scan those roots so adding or removing a
-    // repo filter cannot change which commits contribute to a retained
-    // session's report. Without `--compare` there is one window, unbounded here,
-    // and every retained session counts. With it each window takes only its own
-    // sessions' checkouts, so a checkout that only the other window's sessions
-    // point at cannot add commits to this one: each side of a comparison is the
-    // report that window would have printed alone.
-    let scan_roots_for = |window: Option<(DateTime<Utc>, DateTime<Utc>)>| -> Vec<PathBuf> {
+    // The checkouts Git is read from: `--dir`, plus the checkout of every
+    // retained session. Sessions can belong to locally available checkouts
+    // outside `--dir`. Always scan those roots so adding or removing a repo
+    // filter cannot change which commits contribute to a retained session's
+    // report. The roots deliberately do not depend on the window: with
+    // `--compare` the report itself must stay what the same window would have
+    // printed without it, and a standalone run scans the checkout of every
+    // retained session whatever its dates. The commits are cut to each window
+    // afterwards, so a wider root set only ever adds commits that belong there.
+    let scan_roots: Vec<PathBuf> = {
         let mut roots = vec![directory.clone()];
-        roots.extend(inferred_repository_roots(sessions.iter().filter(
-            |session| {
-                window.is_none_or(|(since, until)| {
-                    session
-                        .first_seen()
-                        .zip(session.last_seen())
-                        .is_some_and(|(first, last)| first < until && last >= since)
-                })
-            },
-        )));
+        roots.extend(inferred_repository_roots(sessions.iter()));
         let mut seen_roots = BTreeSet::new();
         roots.retain(|root| seen_roots.insert(canonical_root(root)));
         roots
     };
-    let window_roots: Vec<Vec<PathBuf>> = windows
-        .iter()
-        .map(|window| scan_roots_for(*window))
-        .collect();
-    let mut git_scan_roots: Vec<PathBuf> = Vec::new();
     let mut commits = Vec::new();
     let mut agent_commits = Vec::new();
-    // Which repositories each root yielded commits for, so a window can be cut
-    // from the combined read by the repositories its own roots contain.
-    let mut root_repositories: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     if !arguments.no_git {
-        git_scan_roots.extend(window_roots.iter().flatten().cloned());
-        let mut seen_roots = BTreeSet::new();
-        git_scan_roots.retain(|root| seen_roots.insert(canonical_root(root)));
         let configured_root = canonical_root(&directory);
         progress.set("Scanning Git repositories");
-        for root in &git_scan_roots {
+        for root in &scan_roots {
             let scan_root = canonical_root(root);
             // Everything but the configured directory got here by being the
             // checkout of a retained session.
@@ -572,12 +548,6 @@ pub(crate) fn run(
                 &csv_globs(&arguments.path_exclude),
                 arguments.no_ignore,
             );
-            root_repositories.entry(scan_root).or_default().extend(
-                human
-                    .iter()
-                    .chain(&agent)
-                    .map(|commit| commit.repo_member_id.clone()),
-            );
             commits.extend(human);
             agent_commits.extend(agent);
         }
@@ -596,20 +566,6 @@ pub(crate) fn run(
             !seen_agent_commits.contains(&key) && seen_commits.insert(key)
         });
     }
-    // Only a comparison needs these: one set of repositories per window.
-    let window_repositories: Vec<Option<HashSet<String>>> = window_roots
-        .iter()
-        .map(|roots| {
-            compare.is_some().then(|| {
-                roots
-                    .iter()
-                    .filter_map(|root| root_repositories.get(&canonical_root(root)))
-                    .flatten()
-                    .cloned()
-                    .collect()
-            })
-        })
-        .collect();
     resolver.validate_project_aliases()?;
     let display_labels =
         disambiguate_repository_labels(&mut sessions, &mut commits, &mut agent_commits);
@@ -662,21 +618,11 @@ pub(crate) fn run(
 
     progress.set("Estimating human involvement");
     let build_window = |window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
-                        repositories: Option<&HashSet<String>>,
                         explain_human_time: bool| {
-        let scoped = |items: &[model::GitCommit]| -> Vec<model::GitCommit> {
-            items
-                .iter()
-                .filter(|commit| {
-                    repositories.is_none_or(|known| known.contains(&commit.repo_member_id))
-                })
-                .cloned()
-                .collect()
-        };
         build_report_with_human_time_explanation(
             &sessions,
-            &scoped(&commits),
-            &scoped(&agent_commits),
+            &commits,
+            &agent_commits,
             gap_cap,
             window.0,
             window.1,
@@ -686,17 +632,9 @@ pub(crate) fn run(
             explain_human_time,
         )
     };
-    let built = build_window(
-        window,
-        window_repositories[0].as_ref(),
-        arguments.explain_human_time,
-    );
+    let built = build_window(window, arguments.explain_human_time);
     let comparison = compare.map(|plan| {
-        let earlier = build_window(
-            (Some(plan.previous.0), Some(plan.previous.1)),
-            window_repositories[1].as_ref(),
-            false,
-        );
+        let earlier = build_window((Some(plan.previous.0), Some(plan.previous.1)), false);
         Comparison::new(
             Period::new(plan.current, &built.summary),
             Period::new(plan.previous, &earlier.summary),
@@ -725,7 +663,7 @@ pub(crate) fn run(
             git_scan_roots: if arguments.no_git {
                 Vec::new()
             } else {
-                window_roots[0]
+                scan_roots
                     .iter()
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect()
