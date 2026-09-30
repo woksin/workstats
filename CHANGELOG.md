@@ -14,6 +14,46 @@ tag are the generated list of pull requests.
 
 ### Added
 
+- ISO 8601 week periods. `--period week` and `--group-by week` cut a report
+  into Monday-to-Sunday weeks labelled `2026-W09`, and `--week` narrows the
+  window to one (`--week 2026-W09`, `--week last`, `--week current`), the way
+  `--month` and `--year` already do. Weeks follow the ISO week-numbering year,
+  so 29 December 2025 is in `2026-W01`, and a week that does not exist
+  (`2025-W53`) is an error. Weeks are cut on the local calendar, `workstats ui`
+  cycles to them with `p`, and a month or year window keeps its partial edge
+  weeks rather than padding them.
+
+- `--format markdown` and `--format html`. Markdown prints GitHub-flavoured
+  tables with the same sections and figures as the table view, escaping the
+  characters Markdown acts on in repository names and paths. HTML prints one
+  self-contained static page: inline CSS only, no scripts, fonts, images or
+  links, a `Content-Security-Policy` of `default-src 'none'`, every value
+  escaped, and light and dark themes from the reader's setting. Both work for
+  `workstats` and `workstats allocate`, print no update notice, and are refused
+  with `--explain-human-time`, like CSV.
+
+- A `defaults` block in the config file for the flags you retype on every run:
+  `dir`, `depth`, `format`, `providers`, `group_by`, `gap_cap`, `human_idle` and
+  `review_credit`. Precedence is flag, then environment variable, then config,
+  then the built-in default, so a flag typed with its built-in value still wins.
+  An unknown key or invalid value stops the run naming it, and `--format json`
+  lists what was taken from the config under `inputs.config_defaults`.
+
+- `--compare previous|YYYY-MM|YYYY-Www|YYYY` reports the selected window beside
+  an earlier one. `previous` is the window of the same kind and length just
+  before it; the others name a baseline outright, and it may not overlap the
+  selected window. The comparison is headline-level (the human estimate, active
+  days, prompts, sessions, commits and changed lines, agent-authored output,
+  agent wall clock and parallel work, and each file area's share), each
+  figure with its change, and a figure that was zero in the baseline shows `n/a`
+  rather than a percentage. In `--format json` it is an added `comparison`
+  object. `--compare` refuses CSV, `workstats ui` and `workstats allocate`,
+  because their shapes cannot carry a second window.
+
+- The documentation moved out of the README into `docs/`: install, usage,
+  configuration, how the estimate works, `allocate`, privacy, and development.
+  The README is now the entry point and links to each.
+
 - `workstats allocate` no longer requires `--project`. Naming one asks what it
   is owed; omitting it asks where the whole spend went, and answers with every
   project ranked by amount, one column per plan held. The rows reconcile
@@ -269,6 +309,10 @@ tag are the generated list of pull requests.
   repository to include it.
 
 ### Fixed
+
+- The `allocate` error for a stray `--group-by` named only `--month`, `--since`
+  and `--until` as ways to pick the window. It now names every window flag:
+  `--month`, `--year`, `--week`, or `--since`/`--until`.
 
 - Repository rows now represent logical projects rather than checkout folder
   names. Linked Git worktrees are combined through their common Git directory,
