@@ -1,0 +1,6 @@
+{"type":"session.start","timestamp":"2026-01-01T12:00:00Z","data":{"sessionId":"copilot-fixture","copilotVersion":"1.0.0","selectedModel":"gpt-fixture","context":{"cwd":"/home/example/project"}}}
+{"type":"user.message","timestamp":"2026-01-01T12:00:05Z","data":{"content":"Fix the flaky test"}}
+{"type":"assistant.message","timestamp":"2026-01-01T12:00:30Z","data":{"model":"gpt-fixture","content":"Looking."}}
+{"type":"subagent.completed","timestamp":"2026-01-01T12:01:00Z","data":{"toolCallId":"agent-1","model":"gpt-fixture","durationMs":30000}}
+{"type":"user.message","timestamp":"2026-01-01T12:06:00Z","data":{"content":"Thanks"}}
+{"type":"session.shutdown","timestamp":"2026-01-01T12:07:00Z","data":{"modelMetrics":{"gpt-fixture":{"usage":{"inputTokens":500,"outputTokens":120,"cacheReadTokens":50,"cacheWriteTokens":10}}}}}

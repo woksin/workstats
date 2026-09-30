@@ -163,7 +163,7 @@ pub fn parse_copilot_file(
     for_json_lines(
         path,
         max_line_bytes,
-        &mut result.diagnostics,
+        &mut result,
         |record: CopilotRecord| {
             let Some(record_type) = record.record_type.as_deref() else {
                 return;
@@ -549,6 +549,7 @@ pub fn read_copilot_session_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{fixture, utc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -911,5 +912,57 @@ mod tests {
             MAX_JSONL_LINE_BYTES,
         );
         assert!(parsed.sessions[0].approximate_cwd);
+    }
+
+    #[test]
+    fn the_copilot_cli_fixture_parses_to_its_documented_timestamps_and_tokens() {
+        let root = fixture("copilot/session-state");
+        let files = discover_copilot_files(&root);
+        assert_eq!(1, files.len());
+
+        let parsed = parse_copilot_file(
+            &files[0],
+            &CopilotSessionStore::default(),
+            MAX_JSONL_LINE_BYTES,
+        );
+        assert_eq!(6, parsed.records_read);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        assert_eq!(2, parsed.sessions.len());
+        let foreground = parsed
+            .sessions
+            .iter()
+            .find(|session| !session.is_subagent)
+            .unwrap();
+        assert_eq!("/home/example/project", foreground.cwd);
+        assert!(!foreground.approximate_cwd);
+        assert_eq!(
+            vec![utc("2026-01-01T12:00:05Z"), utc("2026-01-01T12:06:00Z")],
+            foreground
+                .human_points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        // Usage arrives once, at shutdown, for the whole session.
+        assert_eq!(1, foreground.token_events.len());
+        let event = &foreground.token_events[0];
+        assert_eq!(utc("2026-01-01T12:07:00Z"), event.timestamp);
+        assert_eq!("gpt-fixture", event.model);
+        assert_eq!(450, event.usage.input_tokens);
+        assert_eq!(120, event.usage.output_tokens);
+        assert_eq!(50, event.usage.cache_read_tokens);
+        assert_eq!(10, event.usage.cache_creation_tokens);
+        let subagent = parsed
+            .sessions
+            .iter()
+            .find(|session| session.is_subagent)
+            .unwrap();
+        assert!(subagent.human_points.is_empty());
+        assert_eq!(1, subagent.exact_intervals.len());
+        assert_eq!(
+            utc("2026-01-01T12:00:30Z"),
+            subagent.exact_intervals[0].start
+        );
+        assert_eq!(utc("2026-01-01T12:01:00Z"), subagent.exact_intervals[0].end);
     }
 }

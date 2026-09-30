@@ -419,12 +419,9 @@ fn pi_parent_cwd(parent_session: &str, root: &Path) -> Option<String> {
 pub fn parse_pi_file(path: &Path, root: &Path, max_line_bytes: usize) -> ParsedFile {
     let mut result = ParsedFile::default();
     let mut state = PiSessionState::default();
-    for_json_lines(
-        path,
-        max_line_bytes,
-        &mut result.diagnostics,
-        |record: PiRecord| state.record(record),
-    );
+    for_json_lines(path, max_line_bytes, &mut result, |record: PiRecord| {
+        state.record(record)
+    });
     state.finish(path, root, &mut result);
     result
 }
@@ -686,6 +683,7 @@ impl PiSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{file_time_range, fixture, utc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -1276,5 +1274,71 @@ mod tests {
         assert_eq!("/tmp/project", session.cwd);
         // `UserMessage.content` may be a bare string, which is ordinary typed text.
         assert_eq!(1, session.human_points.len());
+    }
+
+    #[test]
+    fn the_pi_fixture_parses_to_its_documented_timestamps_and_tokens() {
+        let root = fixture("pi");
+        let files = discover_pi_files(&root);
+        assert_eq!(1, files.len());
+
+        let parsed = parse_pi_file(&files[0], &root, MAX_JSONL_LINE_BYTES);
+        assert_eq!(6, parsed.records_read);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        assert_eq!(1, parsed.sessions.len());
+        let session = &parsed.sessions[0];
+        assert_eq!("/home/example/project", session.cwd);
+        assert!(!session.approximate_cwd);
+        assert!(!session.is_subagent);
+        assert_eq!(
+            vec![utc("2026-01-01T13:00:05Z"), utc("2026-01-01T13:06:00Z")],
+            session
+                .human_points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        let tokens: Vec<_> = session
+            .token_events
+            .iter()
+            .map(|event| {
+                (
+                    event.timestamp,
+                    event.model.as_str(),
+                    event.usage.input_tokens,
+                    event.usage.output_tokens,
+                    event.usage.cache_read_tokens,
+                    event.usage.cache_creation_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(
+            vec![
+                (
+                    utc("2026-01-01T13:00:25Z"),
+                    "pi-fixture-model",
+                    1000,
+                    200,
+                    300,
+                    50
+                ),
+                (
+                    utc("2026-01-01T13:06:20Z"),
+                    "pi-fixture-model",
+                    400,
+                    80,
+                    0,
+                    0
+                ),
+            ],
+            tokens
+        );
+        assert_eq!(
+            (
+                Some(utc("2026-01-01T13:00:05Z")),
+                Some(utc("2026-01-01T13:06:20Z"))
+            ),
+            file_time_range(&parsed.sessions)
+        );
     }
 }

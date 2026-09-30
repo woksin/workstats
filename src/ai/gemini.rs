@@ -107,27 +107,22 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         .extension()
         .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
     {
-        for_json_lines(
-            path,
-            max_line_bytes,
-            &mut result.diagnostics,
-            |record: GeminiRecord| {
-                if session_id.is_none() {
-                    session_id = record.session_id;
-                }
-                if kind.is_none() {
-                    kind = record.kind;
-                }
-                if record.record_type.is_some() {
-                    messages.push(GeminiMessage {
-                        record_type: record.record_type,
-                        timestamp: record.timestamp,
-                        model: record.model,
-                        tokens: record.tokens,
-                    });
-                }
-            },
-        );
+        for_json_lines(path, max_line_bytes, &mut result, |record: GeminiRecord| {
+            if session_id.is_none() {
+                session_id = record.session_id;
+            }
+            if kind.is_none() {
+                kind = record.kind;
+            }
+            if record.record_type.is_some() {
+                messages.push(GeminiMessage {
+                    record_type: record.record_type,
+                    timestamp: record.timestamp,
+                    model: record.model,
+                    tokens: record.tokens,
+                });
+            }
+        });
     } else {
         // A legacy session is one JSON document, so `max_line_bytes` cannot bound it and
         // the whole file would otherwise be read into memory unbounded. The BufReader is
@@ -154,6 +149,7 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
                     .last_updated
                     .or(record.start_time)
                     .map(|_| "legacy-json".to_string());
+                result.records_read = record.messages.len() as u64;
                 messages = record.messages;
             }
             Err(error) => {
@@ -293,6 +289,7 @@ fn gemini_context_fingerprint(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{fixture, utc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -395,5 +392,99 @@ mod tests {
         assert_eq!(8, event.usage.input_tokens);
         assert_eq!(5, event.usage.output_tokens);
         assert_eq!(2, event.usage.cache_read_tokens);
+    }
+
+    #[test]
+    fn the_gemini_fixtures_parse_to_their_documented_timestamps_and_tokens() {
+        let root = fixture("gemini");
+        let files = discover_gemini_files(&root);
+        assert_eq!(2, files.len());
+        let (legacy, lines) = if files[0].extension().is_some_and(|value| value == "json") {
+            (&files[0], &files[1])
+        } else {
+            (&files[1], &files[0])
+        };
+
+        let parsed = parse_gemini_file(lines, &root, MAX_JSONL_LINE_BYTES);
+        // The header line parses too; it just is not a message.
+        assert_eq!(6, parsed.records_read);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        let session = &parsed.sessions[0];
+        assert!(session.session_id.starts_with("gemini-fixture:"));
+        assert_eq!("/home/example/project", session.cwd);
+        assert!(!session.approximate_cwd);
+        assert!(!session.is_subagent);
+        // The `info` notice is neither a prompt nor a reply.
+        assert_eq!(
+            vec![
+                utc("2026-01-01T11:00:01Z"),
+                utc("2026-01-01T11:00:20Z"),
+                utc("2026-01-01T11:04:00Z"),
+                utc("2026-01-01T11:04:10Z"),
+            ],
+            session
+                .points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            vec![utc("2026-01-01T11:00:01Z"), utc("2026-01-01T11:04:00Z")],
+            session
+                .human_points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        let tokens: Vec<_> = session
+            .token_events
+            .iter()
+            .map(|event| {
+                (
+                    event.timestamp,
+                    event.model.as_str(),
+                    event.usage.input_tokens,
+                    event.usage.output_tokens,
+                    event.usage.cache_read_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(
+            vec![
+                (
+                    utc("2026-01-01T11:00:20Z"),
+                    "gemini-fixture-model",
+                    70,
+                    40,
+                    30
+                ),
+                (
+                    utc("2026-01-01T11:04:10Z"),
+                    "gemini-fixture-model",
+                    150,
+                    20,
+                    0
+                ),
+            ],
+            tokens
+        );
+
+        // The legacy layout is one JSON document holding the same kind of messages.
+        let parsed = parse_gemini_file(legacy, &root, MAX_JSONL_LINE_BYTES);
+        assert_eq!(2, parsed.records_read);
+        let session = &parsed.sessions[0];
+        assert_eq!(Some("legacy-json"), session.version.as_deref());
+        assert_eq!(
+            vec![utc("2026-01-02T11:00:05Z"), utc("2026-01-02T11:00:30Z")],
+            session
+                .points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, session.human_points.len());
+        assert_eq!(1, session.token_events.len());
+        assert_eq!(60, session.token_events[0].usage.input_tokens);
+        assert_eq!(10, session.token_events[0].usage.output_tokens);
     }
 }

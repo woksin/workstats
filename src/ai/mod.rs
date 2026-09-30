@@ -46,6 +46,20 @@ pub const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
 pub struct ParsedFile {
     pub sessions: Vec<RawSession>,
     pub diagnostics: Diagnostics,
+    /// How many records the parser took in as well-formed input, whether or not any of
+    /// them turned out to describe activity. A parser for a format the user does not
+    /// control leaves this at zero only when the file was empty, unreadable or declined
+    /// for another reported reason.
+    ///
+    /// It is what separates an empty file from one whose records the parser no longer
+    /// understands: both yield no timestamps, but only the second has records.
+    #[serde(default)]
+    pub records_read: u64,
+    /// Set by `load_files` once per parse: records were read but not a single timestamp
+    /// came out of them. Stored rather than recomputed because a range-pruned cache hit
+    /// has had its timestamps cleared, and would otherwise look like drift.
+    #[serde(default)]
+    pub unrecognized: bool,
 }
 
 fn deserialize_maybe_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -192,15 +206,23 @@ where
         .par_iter()
         .map(|(index, path)| (*index, parser(path)))
         .collect();
-    for (index, parsed) in parsed_misses {
+    for (index, mut parsed) in parsed_misses {
+        parsed.unrecognized = records_without_activity(&parsed);
         slots[index] = Some(parsed);
     }
 
     let mut sessions = Vec::new();
+    let mut unrecognized_files = 0_usize;
+    let mut recognized_files = 0_usize;
     for (index, item) in slots.into_iter().enumerate() {
         let Some(item) = item else {
             continue;
         };
+        if item.unrecognized {
+            unrecognized_files += 1;
+        } else if item.records_read > 0 {
+            recognized_files += 1;
+        }
         if let (Some(cache), Some(stamp)) = (cache.as_deref_mut(), pending_stamps[index])
             && item.diagnostics.unreadable_files == 0
         {
@@ -220,20 +242,61 @@ where
             sessions.push(resolver.resolve_session(raw));
         }
     }
+    warn_if_format_drifted(provider, unrecognized_files, recognized_files, diagnostics);
     sessions
+}
+
+/// Whether a parse read records yet recovered no timestamp from any of them.
+///
+/// A timestamp of any kind counts (activity, prompt, exact interval or token event), so
+/// this flags only a file from which nothing at all could be used. A file with no records
+/// is not flagged: an empty or zero-length transcript is ordinary, and only records the
+/// parser could not make sense of are evidence that the format moved.
+fn records_without_activity(parsed: &ParsedFile) -> bool {
+    parsed.records_read > 0 && file_time_range(&parsed.sessions).0.is_none()
+}
+
+/// Says so when a provider's history was read but nothing in it was understood.
+///
+/// Upstream tools change their transcript formats without notice. A record that still
+/// parses as JSON but no longer carries the fields a parser looks for is dropped without
+/// a trace, so the provider would quietly report zero and look like a quiet week. The
+/// warning is raised only when *no* file of the provider yielded anything, and at least
+/// one had records: a session that holds only metadata (Claude's file snapshots, a Gemini
+/// header written before the first prompt) is ordinary, but a whole provider made of
+/// them is not. A provider where some files still work is left alone; its unusable files
+/// are then most likely just such sessions, and the threshold has to stay high enough
+/// that the warning means something when it appears.
+fn warn_if_format_drifted(
+    provider: &str,
+    unrecognized_files: usize,
+    recognized_files: usize,
+    diagnostics: &mut Diagnostics,
+) {
+    if unrecognized_files == 0 || recognized_files > 0 {
+        return;
+    }
+    let files = if unrecognized_files == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{unrecognized_files} files")
+    };
+    diagnostics.warn(format!(
+        "{provider}: read {files} but found no usable activity records in them; the history format may have changed"
+    ));
 }
 
 fn for_json_lines<T: for<'de> Deserialize<'de>>(
     path: &Path,
     max_line_bytes: usize,
-    diagnostics: &mut Diagnostics,
+    parsed: &mut ParsedFile,
     mut consume: impl FnMut(T),
 ) {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(error) => {
-            diagnostics.unreadable_files += 1;
-            diagnostics.warn(format!(
+            parsed.diagnostics.unreadable_files += 1;
+            parsed.diagnostics.warn(format!(
                 "unreadable transcript skipped: {}: {error}",
                 path.display()
             ));
@@ -248,19 +311,22 @@ fn for_json_lines<T: for<'de> Deserialize<'de>>(
             Ok(Some((line, oversized))) => {
                 line_number += 1;
                 if oversized {
-                    diagnostics.malformed_lines += 1;
-                    diagnostics.warn(format!(
+                    parsed.diagnostics.malformed_lines += 1;
+                    parsed.diagnostics.warn(format!(
                         "oversized JSONL line skipped: {}:{line_number}",
                         path.display()
                     ));
                     continue;
                 }
                 match serde_json::from_slice(&line) {
-                    Ok(record) => consume(record),
+                    Ok(record) => {
+                        parsed.records_read += 1;
+                        consume(record);
+                    }
                     Err(_) => {
-                        diagnostics.malformed_lines += 1;
-                        if diagnostics.malformed_lines <= 20 {
-                            diagnostics.warn(format!(
+                        parsed.diagnostics.malformed_lines += 1;
+                        if parsed.diagnostics.malformed_lines <= 20 {
+                            parsed.diagnostics.warn(format!(
                                 "malformed JSONL skipped: {}:{line_number}",
                                 path.display()
                             ));
@@ -269,8 +335,8 @@ fn for_json_lines<T: for<'de> Deserialize<'de>>(
                 }
             }
             Err(error) => {
-                diagnostics.unreadable_files += 1;
-                diagnostics.warn(format!(
+                parsed.diagnostics.unreadable_files += 1;
+                parsed.diagnostics.warn(format!(
                     "unreadable transcript skipped: {}: {error}",
                     path.display()
                 ));
@@ -380,11 +446,46 @@ pub fn file_time_range(sessions: &[RawSession]) -> (Option<DateTime<Utc>>, Optio
     (minimum, maximum)
 }
 
+/// The directory of synthetic sessions each provider's regression test parses. They are
+/// written to look like what the tools emit, with invented paths and text, so a change to
+/// a parser that misreads a real layout fails here instead of only on a developer's own
+/// history.
+#[cfg(test)]
+fn fixture(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(relative)
+}
+
+#[cfg(test)]
+fn utc(value: &str) -> DateTime<Utc> {
+    crate::timeutil::parse_timestamp(value).expect("fixture timestamps are valid")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{ActivityPoint, TokenEvent, TokenUsage};
     use crate::timeutil::parse_timestamp;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// A record that is valid JSON and valid for every provider's permissive record
+    /// struct, yet names nothing any of them looks for: what a renamed-field upstream
+    /// release looks like to the parsers.
+    const UNRECOGNIZED_RECORD: &str = r#"{"schema":"v9","at":"2026-01-01T00:00:00Z"}"#;
+
+    fn resolver(home: &Path) -> PathResolver {
+        PathResolver::with_home(Vec::new(), home.to_path_buf())
+    }
+
+    fn drift_warnings(diagnostics: &Diagnostics) -> Vec<&String> {
+        diagnostics
+            .messages
+            .iter()
+            .filter(|message| message.contains("format may have changed"))
+            .collect()
+    }
 
     #[test]
     fn model_validation_rejects_control_text() {
@@ -423,5 +524,286 @@ mod tests {
         let (minimum, maximum) = file_time_range(std::slice::from_ref(&session));
         assert_eq!(parse_timestamp("2026-01-01T23:00:00Z"), minimum);
         assert_eq!(parse_timestamp("2026-01-02T00:30:00Z"), maximum);
+    }
+
+    #[test]
+    fn jsonl_parsers_count_records_they_read_but_cannot_use() {
+        let root = tempdir().unwrap();
+        let drifted = root.path().join("drifted.jsonl");
+        fs::write(
+            &drifted,
+            format!("{UNRECOGNIZED_RECORD}\n{UNRECOGNIZED_RECORD}\n"),
+        )
+        .unwrap();
+        let empty = root.path().join("empty.jsonl");
+        fs::write(&empty, "").unwrap();
+        let limit = MAX_JSONL_LINE_BYTES;
+        let store = copilot_cli::CopilotSessionStore::default();
+        let metadata = codex::CodexMetadataIndex::default();
+
+        type Parser<'a> = Box<dyn Fn(&Path) -> ParsedFile + 'a>;
+        let parsers: [(&str, Parser<'_>); 5] = [
+            (
+                "claude",
+                Box::new(|path| claude::parse_claude_file(path, root.path(), limit)),
+            ),
+            (
+                "codex",
+                Box::new(|path| codex::parse_codex_file(path, &metadata, limit)),
+            ),
+            (
+                "copilot",
+                Box::new(|path| copilot_cli::parse_copilot_file(path, &store, limit)),
+            ),
+            (
+                "gemini",
+                Box::new(|path| gemini::parse_gemini_file(path, root.path(), limit)),
+            ),
+            (
+                "pi",
+                Box::new(|path| pi::parse_pi_file(path, root.path(), limit)),
+            ),
+        ];
+        for (name, parse) in &parsers {
+            let unusable = parse(&drifted);
+            assert_eq!(2, unusable.records_read, "{name}");
+            assert!(records_without_activity(&unusable), "{name}");
+            // A zero-length transcript is ordinary, not a format change.
+            let nothing = parse(&empty);
+            assert_eq!(0, nothing.records_read, "{name}");
+            assert!(!records_without_activity(&nothing), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_provider_whose_every_record_is_unrecognized_warns_once() {
+        let root = tempdir().unwrap();
+        let history = root.path().join("history");
+        let project = history.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("one.jsonl"),
+            format!("{UNRECOGNIZED_RECORD}\n"),
+        )
+        .unwrap();
+        fs::write(
+            project.join("two.jsonl"),
+            format!("{UNRECOGNIZED_RECORD}\n{UNRECOGNIZED_RECORD}\n"),
+        )
+        .unwrap();
+        // An empty file beside them must not count towards the number of files.
+        fs::write(project.join("empty.jsonl"), "").unwrap();
+        let mut diagnostics = Diagnostics::default();
+
+        let sessions = read_claude_sessions_indexed(
+            &history,
+            &mut resolver(root.path()),
+            &mut diagnostics,
+            None,
+            None,
+            None,
+        );
+
+        assert!(sessions.is_empty());
+        let warnings = drift_warnings(&diagnostics);
+        assert_eq!(1, warnings.len(), "{:?}", diagnostics.messages);
+        assert!(
+            warnings[0].starts_with("claude: read 2 files"),
+            "{}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn empty_or_metadata_only_histories_next_to_a_working_one_do_not_warn() {
+        let root = tempdir().unwrap();
+        let history = root.path().join("history");
+        let project = history.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("empty.jsonl"), "").unwrap();
+        let mut diagnostics = Diagnostics::default();
+        read_claude_sessions_indexed(
+            &history,
+            &mut resolver(root.path()),
+            &mut diagnostics,
+            None,
+            None,
+            None,
+        );
+        assert!(drift_warnings(&diagnostics).is_empty());
+
+        // A session that never got past its metadata is ordinary while another file in
+        // the same history still parses, so the warning is held back.
+        fs::write(
+            project.join("snapshot-only.jsonl"),
+            format!("{UNRECOGNIZED_RECORD}\n"),
+        )
+        .unwrap();
+        fs::write(
+            project.join("real.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":{},\"message\":{{\"content\":\"hello\"}}}}\n",
+                serde_json::to_string(&project).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut diagnostics = Diagnostics::default();
+        let sessions = read_claude_sessions_indexed(
+            &history,
+            &mut resolver(root.path()),
+            &mut diagnostics,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(1, sessions.len());
+        assert!(drift_warnings(&diagnostics).is_empty());
+    }
+
+    #[test]
+    fn the_verdict_survives_the_cache_including_a_range_pruned_hit() {
+        let root = tempdir().unwrap();
+        let history = root.path().join("history");
+        let project = history.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join("real.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":{},\"message\":{{\"content\":\"hello\"}}}}\n",
+                serde_json::to_string(&project).unwrap()
+            ),
+        )
+        .unwrap();
+        let mut cache = TranscriptCache::open(&root.path().join("cache.sqlite3"), false).unwrap();
+        let mut read = |since: Option<DateTime<Utc>>| {
+            let mut diagnostics = Diagnostics::default();
+            read_claude_sessions_indexed(
+                &history,
+                &mut resolver(root.path()),
+                &mut diagnostics,
+                Some(&mut cache),
+                since,
+                None,
+            );
+            diagnostics
+        };
+        assert!(drift_warnings(&read(None)).is_empty());
+        // Everything in the file is before the range, so the hit is pruned and its
+        // timestamps are gone; it must not be mistaken for a file nothing came out of.
+        let pruned = read(parse_timestamp("2026-06-01T00:00:00Z"));
+        assert_eq!(1, pruned.pruned_files);
+        assert!(drift_warnings(&pruned).is_empty());
+
+        // And a drifted file warns on the cold read and again when served from the cache.
+        fs::remove_file(project.join("real.jsonl")).unwrap();
+        fs::write(
+            project.join("drifted.jsonl"),
+            format!("{UNRECOGNIZED_RECORD}\n"),
+        )
+        .unwrap();
+        let cold = read(None);
+        assert_eq!(1, drift_warnings(&cold).len());
+        let warm = read(None);
+        assert_eq!(1, warm.cache_hits);
+        assert_eq!(1, drift_warnings(&warm).len());
+    }
+
+    #[test]
+    fn opencode_messages_without_a_usable_timestamp_are_drift() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("opencode.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+                 CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    time_created TEXT,
+                    data TEXT
+                 );
+                 INSERT INTO session VALUES ('s', '/tmp/project');
+                 INSERT INTO session_message VALUES ('m', 's', 'user', NULL, '{}');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut diagnostics = Diagnostics::default();
+
+        read_opencode_sessions_indexed(
+            &path,
+            &mut resolver(root.path()),
+            &mut diagnostics,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            1,
+            drift_warnings(&diagnostics).len(),
+            "{:?}",
+            diagnostics.messages
+        );
+        assert!(drift_warnings(&diagnostics)[0].starts_with("opencode: read 1 file "));
+    }
+
+    #[test]
+    fn an_opencode_session_without_messages_is_not_drift() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("opencode.db");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT NOT NULL);
+                 CREATE TABLE session_message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    data TEXT
+                 );
+                 INSERT INTO session VALUES ('s', '/tmp/project');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut diagnostics = Diagnostics::default();
+
+        read_opencode_sessions_indexed(
+            &path,
+            &mut resolver(root.path()),
+            &mut diagnostics,
+            None,
+            None,
+            None,
+        );
+
+        assert!(drift_warnings(&diagnostics).is_empty());
+    }
+
+    #[test]
+    fn copilot_chat_requests_without_timestamps_are_drift_but_no_requests_is_not() {
+        let root = tempdir().unwrap();
+        let drifted = root.path().join("drifted.json");
+        fs::write(
+            &drifted,
+            r#"{"version":3,"sessionId":"a","requests":[{"sentAt":1767225600000}]}"#,
+        )
+        .unwrap();
+        let parsed = copilot_vscode::parse_copilot_vscode_file(
+            &drifted,
+            copilot_vscode::MAX_VSCODE_CHAT_JSON_BYTES,
+        );
+        assert_eq!(1, parsed.records_read);
+        assert!(records_without_activity(&parsed));
+
+        let unused = root.path().join("unused.json");
+        fs::write(&unused, r#"{"version":3,"sessionId":"b","requests":[]}"#).unwrap();
+        let parsed = copilot_vscode::parse_copilot_vscode_file(
+            &unused,
+            copilot_vscode::MAX_VSCODE_CHAT_JSON_BYTES,
+        );
+        assert_eq!(0, parsed.records_read);
+        assert!(!records_without_activity(&parsed));
     }
 }

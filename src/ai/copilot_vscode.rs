@@ -241,6 +241,7 @@ pub fn parse_copilot_vscode_file(path: &Path, max_bytes: u64) -> ParsedFile {
     let mut human_points = Vec::new();
     let mut exact_intervals = Vec::new();
     let mut current_model = "unknown".to_string();
+    result.records_read = document.requests.len() as u64;
     for request in document.requests {
         if let Some(model) = request.model_id.as_deref() {
             current_model = copilot_vscode_model(model);
@@ -443,6 +444,7 @@ fn percent_decode(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::ai::canonical_string;
+    use crate::ai::{fixture, utc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -696,5 +698,47 @@ mod tests {
         assert!(parsed.sessions.is_empty());
         assert_eq!(1, parsed.diagnostics.skipped_sessions);
         assert_eq!(0, parsed.diagnostics.unreadable_files);
+    }
+
+    #[test]
+    fn the_copilot_chat_fixture_parses_to_its_documented_timestamps() {
+        let root = fixture("copilot-vscode/workspaceStorage");
+        let files = discover_copilot_vscode_files(&root);
+        assert_eq!(1, files.len());
+
+        let parsed = parse_copilot_vscode_file(&files[0], MAX_VSCODE_CHAT_JSON_BYTES);
+        assert_eq!(2, parsed.records_read);
+        assert_eq!(1, parsed.sessions.len());
+        let session = &parsed.sessions[0];
+        assert_eq!("vscode-fixture:0a1b2c3d", session.session_id);
+        assert_eq!("/home/example/project", session.cwd);
+        assert!(!session.approximate_cwd);
+        assert_eq!(Some("vscode-chat-v3"), session.version.as_deref());
+        // Both submissions are prompts; only the turn VS Code timed is an exact interval,
+        // and the cancelled one falls back to a plain activity point.
+        assert_eq!(
+            vec![utc("2026-01-01T12:00:00Z"), utc("2026-01-01T12:10:00Z")],
+            session
+                .human_points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, session.exact_intervals.len());
+        assert_eq!(
+            utc("2026-01-01T12:00:00Z"),
+            session.exact_intervals[0].start
+        );
+        assert_eq!(utc("2026-01-01T12:00:20Z"), session.exact_intervals[0].end);
+        assert_eq!("gpt-fixture", session.exact_intervals[0].model);
+        assert_eq!(
+            vec![utc("2026-01-01T12:10:00Z")],
+            session
+                .points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert!(session.token_events.is_empty());
     }
 }

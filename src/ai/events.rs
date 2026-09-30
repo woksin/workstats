@@ -118,7 +118,7 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
     for_json_lines(
         path,
         max_line_bytes,
-        &mut result.diagnostics,
+        &mut result,
         |record: WorkstatsEvent| {
             if record.carries_sensitive_payload() {
                 sensitive_records += 1;
@@ -175,6 +175,11 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
             }
         },
     );
+    // The events format is a published schema written by the user's own tooling, and a
+    // record that does not fit it is already reported as a malformed line or a content
+    // rejection. Leaving `records_read` at zero keeps those from being second-guessed as
+    // an upstream format change.
+    result.records_read = 0;
     if sensitive_records > 0 {
         result.diagnostics.content_rejections += sensitive_records;
         result.diagnostics.warn(format!(
@@ -229,6 +234,7 @@ fn safe_provider(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{fixture, utc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -385,5 +391,52 @@ mod tests {
         assert_ne!(foreground.session_id, subagent.session_id);
         assert!(foreground.session_id.starts_with("task-one:"));
         assert!(subagent.session_id.ends_with(":subagent"));
+    }
+
+    #[test]
+    fn the_events_fixture_parses_to_its_documented_timestamps() {
+        let root = fixture("events");
+        let files = discover_event_files(&root);
+        assert_eq!(vec![root.join("events.jsonl")], files);
+
+        let parsed = parse_event_file(&files[0], MAX_JSONL_LINE_BYTES);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        assert_eq!(0, parsed.diagnostics.content_rejections);
+        assert_eq!(2, parsed.sessions.len());
+        let foreground = parsed
+            .sessions
+            .iter()
+            .find(|session| !session.is_subagent)
+            .unwrap();
+        assert_eq!("fixture-tool", foreground.provider);
+        assert_eq!("task-1:/home/example/project", foreground.session_id);
+        assert_eq!(3, foreground.points.len());
+        assert_eq!(
+            vec![utc("2026-01-01T14:00:00Z"), utc("2026-01-01T14:05:00Z")],
+            foreground
+                .human_points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, foreground.exact_intervals.len());
+        assert_eq!(
+            utc("2026-01-01T14:00:05Z"),
+            foreground.exact_intervals[0].start
+        );
+        assert_eq!(
+            utc("2026-01-01T14:00:30Z"),
+            foreground.exact_intervals[0].end
+        );
+        let subagent = parsed
+            .sessions
+            .iter()
+            .find(|session| session.is_subagent)
+            .unwrap();
+        assert_eq!("task-1:/home/example/project:subagent", subagent.session_id);
+        assert_eq!(1, subagent.points.len());
+        assert!(subagent.human_points.is_empty());
+        // Events carry no token counts.
+        assert!(foreground.token_events.is_empty());
     }
 }

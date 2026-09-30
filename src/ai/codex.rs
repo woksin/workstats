@@ -228,82 +228,76 @@ pub fn parse_codex_file(
     let mut current_model = "unknown".to_string();
     let mut is_subagent = false;
     let mut previous_token_total = None;
-    for_json_lines(
-        path,
-        max_line_bytes,
-        &mut result.diagnostics,
-        |record: CodexRecord| {
-            let payload = record.payload;
-            match record.record_type.as_deref() {
-                Some("session_meta") => {
-                    if let Some(id) = payload.id.or(payload.session_id) {
-                        session_id = Some(id);
-                    }
-                    is_subagent |= payload.parent_thread_id.is_some() || payload.source;
-                    if let Some(value) = payload.cwd {
-                        metadata_cwd = Some(value.clone());
-                        cwd = Some(value);
-                    }
-                    if let Some(model) = payload.model {
-                        current_model = safe_model(&model);
-                    }
+    for_json_lines(path, max_line_bytes, &mut result, |record: CodexRecord| {
+        let payload = record.payload;
+        match record.record_type.as_deref() {
+            Some("session_meta") => {
+                if let Some(id) = payload.id.or(payload.session_id) {
+                    session_id = Some(id);
                 }
-                Some("turn_context") => {
-                    if let Some(value) = payload.cwd {
-                        cwd = Some(value);
-                    }
-                    if let Some(model) = payload.model {
-                        current_model = safe_model(&model);
-                    }
+                is_subagent |= payload.parent_thread_id.is_some() || payload.source;
+                if let Some(value) = payload.cwd {
+                    metadata_cwd = Some(value.clone());
+                    cwd = Some(value);
                 }
-                Some("response_item" | "event_msg") => {
-                    if let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) {
-                        points_by_cwd
+                if let Some(model) = payload.model {
+                    current_model = safe_model(&model);
+                }
+            }
+            Some("turn_context") => {
+                if let Some(value) = payload.cwd {
+                    cwd = Some(value);
+                }
+                if let Some(model) = payload.model {
+                    current_model = safe_model(&model);
+                }
+            }
+            Some("response_item" | "event_msg") => {
+                if let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) {
+                    points_by_cwd
+                        .entry(cwd.clone())
+                        .or_default()
+                        .push(ActivityPoint {
+                            timestamp,
+                            model: current_model.clone(),
+                        });
+                    if record.record_type.as_deref() == Some("response_item")
+                        && payload.payload_type.as_deref() == Some("message")
+                        && payload.role.as_deref() == Some("user")
+                        && !is_subagent
+                    {
+                        human_by_cwd
                             .entry(cwd.clone())
                             .or_default()
                             .push(ActivityPoint {
                                 timestamp,
                                 model: current_model.clone(),
                             });
-                        if record.record_type.as_deref() == Some("response_item")
-                            && payload.payload_type.as_deref() == Some("message")
-                            && payload.role.as_deref() == Some("user")
-                            && !is_subagent
-                        {
-                            human_by_cwd
-                                .entry(cwd.clone())
-                                .or_default()
-                                .push(ActivityPoint {
-                                    timestamp,
-                                    model: current_model.clone(),
-                                });
-                        }
-                    }
-                    if record.record_type.as_deref() == Some("event_msg")
-                        && let Some(interval) = exact_codex_interval(&payload, &current_model)
-                    {
-                        exact_by_cwd.entry(cwd.clone()).or_default().push(interval);
-                    }
-                    if record.record_type.as_deref() == Some("event_msg")
-                        && let Some(timestamp) =
-                            record.timestamp.as_deref().and_then(parse_timestamp)
-                        && let Some(event) = codex_token_event(
-                            &payload,
-                            timestamp,
-                            &current_model,
-                            &mut previous_token_total,
-                        )
-                    {
-                        token_events_by_cwd
-                            .entry(cwd.clone())
-                            .or_default()
-                            .push(event);
                     }
                 }
-                _ => {}
+                if record.record_type.as_deref() == Some("event_msg")
+                    && let Some(interval) = exact_codex_interval(&payload, &current_model)
+                {
+                    exact_by_cwd.entry(cwd.clone()).or_default().push(interval);
+                }
+                if record.record_type.as_deref() == Some("event_msg")
+                    && let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp)
+                    && let Some(event) = codex_token_event(
+                        &payload,
+                        timestamp,
+                        &current_model,
+                        &mut previous_token_total,
+                    )
+                {
+                    token_events_by_cwd
+                        .entry(cwd.clone())
+                        .or_default()
+                        .push(event);
+                }
             }
-        },
-    );
+            _ => {}
+        }
+    });
 
     let resolved_path = canonical_string(path);
     let meta = metadata
@@ -558,6 +552,7 @@ pub fn read_codex_sqlite_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{fixture, utc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -780,5 +775,83 @@ mod tests {
         let events = &parsed.sessions[0].token_events;
         assert_eq!(1, events.len());
         assert_eq!(120, events[0].usage.total());
+    }
+
+    #[test]
+    fn the_codex_fixture_parses_to_its_documented_timestamps_and_tokens() {
+        let root = fixture("codex");
+        let files = discover_codex_files_bounded(&root, None);
+        assert_eq!(1, files.len());
+
+        let parsed = parse_codex_file(
+            &files[0],
+            &CodexMetadataIndex::default(),
+            MAX_JSONL_LINE_BYTES,
+        );
+        assert_eq!(8, parsed.records_read);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        assert_eq!(1, parsed.sessions.len());
+        let session = &parsed.sessions[0];
+        assert_eq!("codex-fixture", session.session_id);
+        assert_eq!("/home/example/project", session.cwd);
+        assert!(!session.approximate_cwd);
+        assert!(!session.is_subagent);
+        // Metadata and context records carry no activity; the rest do.
+        assert_eq!(
+            vec![
+                utc("2026-01-01T10:00:02Z"),
+                utc("2026-01-01T10:00:10Z"),
+                utc("2026-01-01T10:00:20Z"),
+                utc("2026-01-01T10:01:00Z"),
+                utc("2026-01-01T10:05:00Z"),
+                utc("2026-01-01T10:05:30Z"),
+            ],
+            session
+                .points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            session
+                .points
+                .iter()
+                .all(|point| point.model == "gpt-fixture")
+        );
+        assert_eq!(
+            vec![utc("2026-01-01T10:00:02Z"), utc("2026-01-01T10:05:00Z")],
+            session
+                .human_points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, session.exact_intervals.len());
+        assert_eq!(
+            utc("2026-01-01T10:00:30Z"),
+            session.exact_intervals[0].start
+        );
+        assert_eq!(utc("2026-01-01T10:01:00Z"), session.exact_intervals[0].end);
+        // The second count is reported as a delta against the first, with cached input
+        // taken out of the input it is a subset of.
+        let tokens: Vec<_> = session
+            .token_events
+            .iter()
+            .map(|event| {
+                (
+                    event.timestamp,
+                    event.usage.input_tokens,
+                    event.usage.output_tokens,
+                    event.usage.cache_read_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(
+            vec![
+                (utc("2026-01-01T10:00:20Z"), 60, 20, 40),
+                (utc("2026-01-01T10:05:30Z"), 100, 30, 100),
+            ],
+            tokens
+        );
     }
 }

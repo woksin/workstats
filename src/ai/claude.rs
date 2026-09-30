@@ -248,109 +248,102 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
     let mut session_id = None;
     let mut version = None;
     let mut current_model = "unknown".to_string();
-    for_json_lines(
-        path,
-        max_line_bytes,
-        &mut result.diagnostics,
-        |record: ClaudeRecord| {
-            let Some(record_type) = record.record_type.as_deref() else {
-                return;
-            };
-            if record_type != "user" && record_type != "assistant" {
-                return;
-            }
-            if cwd.is_none() {
-                cwd = record.cwd;
-            }
-            if session_id.is_none() {
-                session_id = record.session_id;
-            }
-            if version.is_none() {
-                version = record.version;
-            }
-            if record_type == "assistant"
-                && let Some(model) = record
-                    .message
-                    .as_ref()
-                    .and_then(|message| message.model.as_deref())
-            {
-                current_model = safe_model(model);
-            }
-            let usage = record
+    for_json_lines(path, max_line_bytes, &mut result, |record: ClaudeRecord| {
+        let Some(record_type) = record.record_type.as_deref() else {
+            return;
+        };
+        if record_type != "user" && record_type != "assistant" {
+            return;
+        }
+        if cwd.is_none() {
+            cwd = record.cwd;
+        }
+        if session_id.is_none() {
+            session_id = record.session_id;
+        }
+        if version.is_none() {
+            version = record.version;
+        }
+        if record_type == "assistant"
+            && let Some(model) = record
                 .message
                 .as_ref()
-                .and_then(|message| message.usage.clone());
-            let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) else {
-                return;
+                .and_then(|message| message.model.as_deref())
+        {
+            current_model = safe_model(model);
+        }
+        let usage = record
+            .message
+            .as_ref()
+            .and_then(|message| message.usage.clone());
+        let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) else {
+            return;
+        };
+        points.push(ActivityPoint {
+            timestamp,
+            model: current_model.clone(),
+        });
+        if record_type == "assistant"
+            && let Some(usage) = usage
+        {
+            let usage = TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_tokens: usage.cache_read_input_tokens,
+                cache_creation_tokens: usage.cache_creation_input_tokens,
             };
-            points.push(ActivityPoint {
+            if !usage.is_zero() {
+                let event = TokenEvent {
+                    timestamp,
+                    model: current_model.clone(),
+                    usage,
+                };
+                // Claude Code writes one record per content block of a single API
+                // response — a text block, then one per tool call — and every one of
+                // them repeats the same ids and a byte-identical usage. The response,
+                // not the record, is what may be counted.
+                let response_key = match (
+                    record
+                        .message
+                        .as_ref()
+                        .and_then(|message| message.id.clone()),
+                    record.request_id.clone(),
+                ) {
+                    (None, None) => None,
+                    (id, request) => Some((id.unwrap_or_default(), request.unwrap_or_default())),
+                };
+                let counted = response_key
+                    .as_ref()
+                    .and_then(|key| counted_responses.get(key).copied());
+                match (response_key, counted) {
+                    // Last occurrence wins. The repeats are identical apart from the
+                    // timestamp, so this only moves the response to the moment its
+                    // final block was written.
+                    (_, Some(index)) => token_events[index] = event,
+                    (Some(key), None) => {
+                        counted_responses.insert(key, token_events.len());
+                        token_events.push(event);
+                    }
+                    // A record carrying neither id cannot be matched to a sibling, so
+                    // it is counted rather than dropped.
+                    (None, None) => token_events.push(event),
+                }
+            }
+        }
+        let human = record_type == "user"
+            && record.message.is_some_and(|message| message.human_content)
+            && !record.is_meta
+            && !record.is_sidechain
+            && !record.is_compact_summary
+            && !record.visible_only
+            && record.source_tool_use_id.is_none();
+        if human {
+            human_points.push(ActivityPoint {
                 timestamp,
                 model: current_model.clone(),
             });
-            if record_type == "assistant"
-                && let Some(usage) = usage
-            {
-                let usage = TokenUsage {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    cache_read_tokens: usage.cache_read_input_tokens,
-                    cache_creation_tokens: usage.cache_creation_input_tokens,
-                };
-                if !usage.is_zero() {
-                    let event = TokenEvent {
-                        timestamp,
-                        model: current_model.clone(),
-                        usage,
-                    };
-                    // Claude Code writes one record per content block of a single API
-                    // response — a text block, then one per tool call — and every one of
-                    // them repeats the same ids and a byte-identical usage. The response,
-                    // not the record, is what may be counted.
-                    let response_key = match (
-                        record
-                            .message
-                            .as_ref()
-                            .and_then(|message| message.id.clone()),
-                        record.request_id.clone(),
-                    ) {
-                        (None, None) => None,
-                        (id, request) => {
-                            Some((id.unwrap_or_default(), request.unwrap_or_default()))
-                        }
-                    };
-                    let counted = response_key
-                        .as_ref()
-                        .and_then(|key| counted_responses.get(key).copied());
-                    match (response_key, counted) {
-                        // Last occurrence wins. The repeats are identical apart from the
-                        // timestamp, so this only moves the response to the moment its
-                        // final block was written.
-                        (_, Some(index)) => token_events[index] = event,
-                        (Some(key), None) => {
-                            counted_responses.insert(key, token_events.len());
-                            token_events.push(event);
-                        }
-                        // A record carrying neither id cannot be matched to a sibling, so
-                        // it is counted rather than dropped.
-                        (None, None) => token_events.push(event),
-                    }
-                }
-            }
-            let human = record_type == "user"
-                && record.message.is_some_and(|message| message.human_content)
-                && !record.is_meta
-                && !record.is_sidechain
-                && !record.is_compact_summary
-                && !record.visible_only
-                && record.source_tool_use_id.is_none();
-            if human {
-                human_points.push(ActivityPoint {
-                    timestamp,
-                    model: current_model.clone(),
-                });
-            }
-        },
-    );
+        }
+    });
     if points.is_empty() {
         result.diagnostics.skipped_sessions += 1;
         return result;
@@ -392,6 +385,7 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{file_time_range, fixture, utc};
     use std::fs;
     use tempfile::tempdir;
 
@@ -558,6 +552,77 @@ mod tests {
         assert_eq!(
             parse_timestamp("2026-01-01T00:00:06Z").unwrap(),
             events[0].timestamp
+        );
+    }
+
+    #[test]
+    fn the_claude_fixture_parses_to_its_documented_timestamps_and_tokens() {
+        let root = fixture("claude");
+        let files = discover_claude_files(&root);
+        assert_eq!(
+            vec![root.join("-home-example-project/session.jsonl")],
+            files
+        );
+
+        let parsed = parse_claude_file(&files[0], &root, MAX_JSONL_LINE_BYTES);
+        assert_eq!(9, parsed.records_read);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        assert_eq!(1, parsed.sessions.len());
+        let session = &parsed.sessions[0];
+        assert_eq!(
+            "claude-fixture:-home-example-project/session.jsonl",
+            session.session_id
+        );
+        assert_eq!("/home/example/project", session.cwd);
+        assert!(!session.approximate_cwd);
+        assert_eq!(Some("2.0.0"), session.version.as_deref());
+        // Every user and assistant record is activity; the file-history snapshot is not.
+        assert_eq!(8, session.points.len());
+        // A tool result and a meta caveat are user records nobody typed. A prompt takes
+        // the model of the nearest reply, since it is sent before any reply names one.
+        assert!(
+            session
+                .human_points
+                .iter()
+                .all(|point| point.model == "claude-fixture-model")
+        );
+        assert_eq!(
+            vec![utc("2026-01-01T09:00:00Z"), utc("2026-01-01T09:05:00Z")],
+            session
+                .human_points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        // msg-1 is written twice (a text block, then a tool call) and counts once, at
+        // the moment of its last block.
+        let tokens: Vec<_> = session
+            .token_events
+            .iter()
+            .map(|event| {
+                (
+                    event.timestamp,
+                    event.usage.input_tokens,
+                    event.usage.output_tokens,
+                    event.usage.cache_read_tokens,
+                    event.usage.cache_creation_tokens,
+                )
+            })
+            .collect();
+        assert_eq!(
+            vec![
+                (utc("2026-01-01T09:00:12Z"), 100, 50, 10, 20),
+                (utc("2026-01-01T09:00:30Z"), 200, 30, 120, 0),
+                (utc("2026-01-01T09:05:10Z"), 10, 5, 0, 0),
+            ],
+            tokens
+        );
+        assert_eq!(
+            (
+                Some(utc("2026-01-01T09:00:00Z")),
+                Some(utc("2026-01-01T09:05:10Z"))
+            ),
+            file_time_range(&parsed.sessions)
         );
     }
 }

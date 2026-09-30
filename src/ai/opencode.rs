@@ -58,10 +58,10 @@ struct OpenCodeSession {
 
 pub fn parse_opencode_database(path: &Path) -> ParsedFile {
     let mut result = ParsedFile::default();
-    let parsed = (|| -> rusqlite::Result<(Vec<RawSession>, u64)> {
+    let parsed = (|| -> rusqlite::Result<(Vec<RawSession>, u64, u64)> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         if !sqlite_table_exists(&connection, "session")? {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), 0, 0));
         }
         let columns = sqlite_columns(&connection, "session")?;
         let expression = |name: &str, fallback: &str| {
@@ -83,6 +83,10 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
         let mut rows = statement.query([])?;
         let mut sessions: BTreeMap<String, OpenCodeSession> = BTreeMap::new();
         let mut skipped_rows = 0_u64;
+        // Message rows seen, used or not. Sessions alone prove nothing about drift: an
+        // opened session with no messages is ordinary, whereas messages that yield no
+        // timestamp mean the columns they are read from no longer mean what they did.
+        let mut messages_read = 0_u64;
         while let Some(row) = rows.next()? {
             // A NULL or unexpectedly typed cell costs one row, never the whole database:
             // `parent_id` below already read tolerantly, and a strict read here threw
@@ -131,6 +135,7 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                 let mut statement = connection.prepare(&query)?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
+                    messages_read += 1;
                     let (Some(session_id), Some(message_type), Some(milliseconds)) = (
                         sqlite_text(row, 0),
                         sqlite_text(row, 1),
@@ -172,6 +177,7 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                 )?;
                 let mut rows = statement.query([])?;
                 while let Some(row) = rows.next()? {
+                    messages_read += 1;
                     // The session check comes before the other two cells on
                     // purpose: this table is the legacy mirror of
                     // `session_message`, so rows already covered there are
@@ -237,11 +243,13 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                 })
                 .collect(),
             skipped_rows,
+            messages_read,
         ))
     })();
     match parsed {
-        Ok((sessions, skipped_rows)) => {
+        Ok((sessions, skipped_rows, messages_read)) => {
             result.sessions = sessions;
+            result.records_read = messages_read;
             if skipped_rows > 0 {
                 result.diagnostics.malformed_lines += skipped_rows;
                 result.diagnostics.warn(format!(
@@ -289,6 +297,8 @@ fn json_model(encoded: &str) -> String {
 mod tests {
     use super::*;
 
+    use crate::ai::{fixture, utc};
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -406,5 +416,66 @@ mod tests {
         assert_eq!(1, parsed.sessions[0].points.len());
         assert_eq!(1, parsed.sessions[0].human_points.len());
         assert_eq!(2, parsed.diagnostics.malformed_lines);
+    }
+
+    #[test]
+    fn the_opencode_fixture_schema_parses_to_its_documented_timestamps() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("opencode.db");
+        let sql = fs::read_to_string(fixture("opencode/session.sql")).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&sql)
+            .unwrap();
+
+        let parsed = parse_opencode_database(&path);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        // Four current messages and two legacy ones.
+        assert_eq!(6, parsed.records_read);
+        assert_eq!(3, parsed.sessions.len());
+        let session = |id: &str| {
+            parsed
+                .sessions
+                .iter()
+                .find(|item| item.session_id == id)
+                .unwrap()
+        };
+
+        let current = session("current");
+        assert_eq!("/home/example/project", current.cwd);
+        assert!(!current.is_subagent);
+        assert_eq!(
+            vec![
+                utc("2026-01-01T15:00:00Z"),
+                utc("2026-01-01T15:00:20Z"),
+                utc("2026-01-01T15:05:00Z"),
+            ],
+            current
+                .points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(2, current.human_points.len());
+        assert_eq!("anthropic/model-b", current.points[1].model);
+
+        // A delegated session is activity but never a prompt.
+        let delegated = session("delegated");
+        assert!(delegated.is_subagent);
+        assert_eq!(1, delegated.points.len());
+        assert!(delegated.human_points.is_empty());
+
+        // A session `session_message` does not cover is read from the legacy table.
+        let legacy = session("legacy");
+        assert_eq!(
+            vec![utc("2026-01-01T16:00:00Z"), utc("2026-01-01T16:00:30Z")],
+            legacy
+                .points
+                .iter()
+                .map(|point| point.timestamp)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, legacy.human_points.len());
+        assert_eq!("openai/model-c", legacy.points[1].model);
     }
 }
