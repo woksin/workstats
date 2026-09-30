@@ -1444,6 +1444,7 @@ mod tests {
                 repo_exact_filter: None,
                 human_idle: String::new(),
                 review_credit: String::new(),
+                config_defaults: BTreeMap::new(),
                 cache: None,
             },
         }

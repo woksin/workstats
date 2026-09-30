@@ -83,6 +83,13 @@ pub struct Config {
     /// `allocate`. The key is a model-name prefix; see `pricing::RateOverrides`.
     #[serde(default)]
     pub model_rates: BTreeMap<String, crate::pricing::ModelRateConfig>,
+    /// Everyday flags (`dir`, `depth`, `format`, `providers`, `group_by`,
+    /// `gap_cap`, `human_idle`, `review_credit`) that apply when the flag and
+    /// its environment variable are absent. Kept as raw JSON so a bad key or
+    /// value is a hard error naming it, like `project_aliases`, rather than
+    /// the whole config being ignored with a warning.
+    #[serde(default)]
+    pub defaults: Option<serde_json::Value>,
 }
 
 impl Config {
@@ -95,6 +102,13 @@ impl Config {
     pub fn compiled_project_aliases(&self, home: &Path) -> Result<ProjectAliases> {
         ProjectAliases::compile(&self.project_aliases, home)
             .context("invalid \"project_aliases\" configuration")
+    }
+
+    pub fn config_defaults(&self, home: &Path) -> Result<crate::cli::ConfigDefaults> {
+        match &self.defaults {
+            Some(value) => crate::cli::ConfigDefaults::parse(value, home),
+            None => Ok(crate::cli::ConfigDefaults::default()),
+        }
     }
 
     pub fn compiled_model_rates(&self) -> Result<crate::pricing::RateOverrides> {
@@ -1037,7 +1051,7 @@ pub fn lossy_pi_cwd(session_dir: &Path) -> String {
     format!("/{}", inner.replace('-', "/"))
 }
 
-fn expand_path(value: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_path(value: &str, home: &Path) -> PathBuf {
     if value == "~" {
         return home.to_path_buf();
     }

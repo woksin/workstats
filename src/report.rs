@@ -174,14 +174,25 @@ pub(crate) fn run_allocation(command: AllocateArguments) -> Result<()> {
 }
 
 pub(crate) fn run(
-    arguments: ReportArguments,
+    mut arguments: ReportArguments,
     presentation: Presentation,
     allocation: Option<allocate::AllocationOptions>,
 ) -> Result<()> {
+    // The config is read first because its `defaults` decide what several of
+    // the checks below are checking: flag > environment > config > built-in.
+    let mut diagnostics = Diagnostics::default();
+    let config = load_config(arguments.config.as_deref(), &mut diagnostics);
+    let defaults = config.config_defaults(&home_dir())?;
+    let resolved = defaults.resolve(&mut arguments, presentation == Presentation::Explore);
+    let output_format = resolved.format;
     // Refused before any scanning: `workstats ui --format json` can only mean
     // the user wanted one of the two, and picking silently is how --by-repo
     // used to lose an explicit --group-by.
-    if presentation == Presentation::Explore && arguments.output_format != OutputFormat::Table {
+    if presentation == Presentation::Explore
+        && arguments
+            .output_format
+            .is_some_and(|format| format != OutputFormat::Table)
+    {
         bail!(
             "`workstats ui` is interactive and writes no machine-readable output; drop --format, or run workstats without `ui` for json or csv"
         );
@@ -193,21 +204,21 @@ pub(crate) fn run(
             "explanation flags are not available in `workstats ui`; run workstats with table or JSON output"
         );
     }
-    if arguments.output_format == OutputFormat::Csv
+    if output_format == OutputFormat::Csv
         && (arguments.explain_human_time || arguments.explain_repository_attribution)
     {
         bail!(
             "explanation flags are not available with --format csv; use table output or --format json"
         );
     }
-    let gap_cap = duration_flag("--gap-cap", &arguments.gap_cap)?;
-    let human_idle = duration_flag("--human-idle", &arguments.human_idle)?;
-    let review_credit = duration_flag("--review-credit", &arguments.review_credit)?;
+    let gap_cap = duration_flag("--gap-cap", &resolved.gap_cap)?;
+    let human_idle = duration_flag("--human-idle", &resolved.human_idle)?;
+    let review_credit = duration_flag("--review-credit", &resolved.review_credit)?;
     if review_credit > human_idle {
         bail!(
             "--review-credit ({}) must not exceed --human-idle ({})",
-            arguments.review_credit,
-            arguments.human_idle
+            resolved.review_credit,
+            resolved.human_idle
         );
     }
     let (since, until) = report_window(&arguments, Utc::now())?;
@@ -221,6 +232,7 @@ pub(crate) fn run(
     let directory = scan_directory(
         arguments.directory.as_deref(),
         env::var_os("WORKSTATS_DIR").map(PathBuf::from),
+        defaults.dir.clone(),
         env::current_dir().ok(),
     )?;
     let mut history_paths = default_history_paths();
@@ -284,8 +296,6 @@ pub(crate) fn run(
     if arguments.no_claude {
         excluded.insert("claude".to_string());
     }
-    let mut diagnostics = Diagnostics::default();
-    let config = load_config(arguments.config.as_deref(), &mut diagnostics);
     let check_updates_configured = config.check_updates.unwrap_or(false);
     let update_check_suppressed =
         arguments.no_update_check || env::var_os("WORKSTATS_NO_UPDATE_CHECK").is_some();
@@ -454,7 +464,7 @@ pub(crate) fn run(
             // Everything but the configured directory got here by being the
             // checkout of a retained session.
             let from_session = scan_root != configured_root;
-            let depth = if from_session { 0 } else { arguments.depth };
+            let depth = if from_session { 0 } else { resolved.depth };
             // Re-applying the filter to such a root would reject it: the filter
             // matched the session's own working directory, which may be deep
             // inside the repository, while the repository is described by its
@@ -620,8 +630,9 @@ pub(crate) fn run(
             co_authors: arguments.co_authors,
             repo_filter: arguments.repo,
             repo_exact_filter: arguments.repo_exact,
-            human_idle: arguments.human_idle,
-            review_credit: arguments.review_credit,
+            human_idle: resolved.human_idle,
+            review_credit: resolved.review_credit,
+            config_defaults: resolved.from_config,
             cache: transcript_cache
                 .as_ref()
                 .map(|cache| cache.path().to_string_lossy().into_owned()),
@@ -650,14 +661,14 @@ pub(crate) fn run(
         // A different presentation of the report that was just built, so the
         // numbers behind a claim are the numbers `workstats` would print.
         let allocation = allocate::build(&report.rows, &options);
-        match arguments.output_format {
+        match output_format {
             OutputFormat::Json => allocate::print_json(&allocation)?,
             OutputFormat::Csv => allocate::print_csv(&allocation)?,
             OutputFormat::Table => allocate::print_table(&allocation),
         }
         return Ok(());
     }
-    match arguments.output_format {
+    match output_format {
         OutputFormat::Json => print_json(&report)?,
         OutputFormat::Csv => print_csv(&report)?,
         OutputFormat::Table => {

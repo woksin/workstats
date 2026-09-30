@@ -656,6 +656,10 @@ pub struct Inputs {
     pub repo_exact_filter: Option<String>,
     pub human_idle: String,
     pub review_credit: String,
+    /// The settings that came from the config file's `defaults` block because
+    /// neither the flag nor its environment variable was given, as key to the
+    /// value used. Empty when nothing was taken from the config.
+    pub config_defaults: BTreeMap<String, String>,
     pub cache: Option<String>,
 }
 

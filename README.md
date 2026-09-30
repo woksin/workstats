@@ -818,9 +818,46 @@ workstats --config ./team.json  # read source roots and categories from elsewher
 
 The config file holds `source_roots`, `categories`, `category_mode`,
 `project_aliases`, `authors`, `model_rates` (list-rate overrides for
-[`allocate`](#rates-and-when-they-go-stale)), and `check_updates`. `workstats ui`'s saved views are kept beside it as
+[`allocate`](#rates-and-when-they-go-stale)), `check_updates`, and `defaults`
+(below). `workstats ui`'s saved views are kept beside it as
 `views.json` — configuration, never cache — so `--rebuild-cache` and
 `--no-cache` leave them alone.
+
+`defaults` holds the flags you would otherwise retype on every run. Each key is
+the flag's long name in snake_case, and each only fills in a flag that was not
+given: flag, then environment variable (`WORKSTATS_DIR` for `dir`), then config
+default, then the built-in default. A flag typed with its built-in value, such
+as `--depth 4`, still beats the config.
+
+```json
+{
+  "defaults": {
+    "dir": "~/code",
+    "depth": 3,
+    "format": "table",
+    "providers": ["claude", "codex"],
+    "group_by": "repo,month",
+    "gap_cap": "10m",
+    "human_idle": "90m",
+    "review_credit": "20m"
+  }
+}
+```
+
+| Key | Flag | Value |
+| --- | --- | --- |
+| `dir` | `--dir` | Directory to scan; `~` expands to your home directory |
+| `depth` | `--depth` | Whole number |
+| `format` | `--format` | Any `--format` value |
+| `providers` | `--provider` | List of provider names, or one comma-separated string |
+| `group_by` | `--group-by` | Comma-separated dimensions; ignored when `--by-repo`, `--matrix`, or `--by-dir` is given |
+| `gap_cap`, `human_idle`, `review_credit` | `--gap-cap`, `--human-idle`, `--review-credit` | Durations such as `30s`, `5m`, `1h` |
+
+An unknown key or an invalid value stops the run with a message naming it, for
+example `invalid defaults.gap_cap "soon"` or a misspelt key such as `depht`,
+rather than being ignored. `workstats ui` ignores `format`, and `allocate` ignores `group_by`,
+because each sets that itself. `--format json` lists the values taken from the
+config under `inputs.config_defaults`.
 
 `WORKSTATS_CACHE`, `WORKSTATS_CONFIG`, `WORKSTATS_EVENTS`, `WORKSTATS_VIEWS`,
 `WORKSTATS_DIR`, and `WORKSTATS_GIT` provide explicit overrides. When

@@ -1,17 +1,19 @@
 //! Command-line surface: every clap definition plus the helpers that turn the
 //! parsed flags into validated values.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::aggregate::DIMENSIONS;
 use crate::allocate;
 use crate::git::DEFAULT_AGENT_AUTHORS;
+use crate::paths::expand_path;
+use crate::sources::normalize_provider;
 use crate::timeutil::{month_span, parse_bound, parse_duration, year_span};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -177,6 +179,13 @@ pub(crate) struct RecordArguments {
 
 /// Used when neither `--group-by` nor one of its shortcut flags is given.
 pub(crate) const DEFAULT_GROUP_BY: &str = "repo";
+/// Built-in values for the flags a config `defaults` block may set. They are
+/// applied by [`ConfigDefaults::resolve`] rather than by clap, because clap
+/// cannot say whether a value was typed or defaulted.
+pub(crate) const DEFAULT_DEPTH: usize = 4;
+pub(crate) const DEFAULT_GAP_CAP: &str = "5m";
+pub(crate) const DEFAULT_HUMAN_IDLE: &str = "1h";
+pub(crate) const DEFAULT_REVIEW_CREDIT: &str = "30m";
 
 /// Everything that shapes the report itself, flattened into both the default
 /// command and `workstats ui`. Sharing one struct is what makes the explorer
@@ -187,7 +196,7 @@ pub(crate) struct ReportArguments {
         short = 'd',
         long = "dir",
         value_name = "DIR",
-        help = "Git repository or directory to scan (default: current directory)"
+        help = "Git repository or directory to scan (default: current directory; config: \"defaults.dir\")"
     )]
     pub(crate) directory: Option<PathBuf>,
     #[arg(
@@ -232,23 +241,20 @@ pub(crate) struct ReportArguments {
     pub(crate) year: Option<String>,
     #[arg(
         long,
-        default_value = "5m",
-        help = "Agent activity gap cap: 30s, 5m, 1h"
+        help = "Agent activity gap cap: 30s, 5m, 1h (default: 5m; config: \"defaults.gap_cap\")"
     )]
-    pub(crate) gap_cap: String,
+    pub(crate) gap_cap: Option<String>,
     #[arg(
         long,
-        default_value = "1h",
-        help = "Silent gap that ends a human-involvement block"
+        help = "Silent gap that ends a human-involvement block (default: 1h; config: \"defaults.human_idle\")"
     )]
-    pub(crate) human_idle: String,
+    pub(crate) human_idle: Option<String>,
     #[arg(
         long = "review-credit",
         visible_alias = "isolated-credit",
-        default_value = "30m",
-        help = "Setup and review time credited around each work block"
+        help = "Setup and review time credited around each work block (default: 30m; config: \"defaults.review_credit\")"
     )]
-    pub(crate) review_credit: String,
+    pub(crate) review_credit: Option<String>,
     #[arg(
         long,
         help = "Print or serialize the auditable human-time calculation ledger (table and JSON only)"
@@ -267,7 +273,7 @@ pub(crate) struct ReportArguments {
         long = "group-by",
         visible_alias = "by",
         conflicts_with_all = ["by_repo", "matrix", "by_dir"],
-        help = "Comma-separated grouping dimensions: root,repo,cwd,provider,model,day,month (default: repo)"
+        help = "Comma-separated grouping dimensions: root,repo,cwd,provider,model,day,month (default: repo; config: \"defaults.group_by\")"
     )]
     pub(crate) group_by: Option<String>,
     #[arg(
@@ -276,7 +282,7 @@ pub(crate) struct ReportArguments {
         help = "Append a calendar grouping to the rows; --month/--year choose the window"
     )]
     pub(crate) period: Option<String>,
-    #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append, help = "Include provider(s); repeatable/comma-separated (default: all)")]
+    #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append, help = "Include provider(s); repeatable/comma-separated (default: all; config: \"defaults.providers\")")]
     pub(crate) provider: Vec<String>,
     #[arg(long, value_delimiter = ',', action = clap::ArgAction::Append, help = "Exclude provider(s); repeatable/comma-separated")]
     pub(crate) exclude_provider: Vec<String>,
@@ -286,8 +292,15 @@ pub(crate) struct ReportArguments {
     pub(crate) events: Vec<PathBuf>,
     #[arg(long, help = "Skip the event log written by `workstats record`")]
     pub(crate) no_default_events: bool,
-    #[arg(long = "format", value_enum, default_value_t = OutputFormat::Table)]
-    pub(crate) output_format: OutputFormat,
+    // Optional rather than defaulted, like the durations and `--depth`: a
+    // config default may only fill in a flag that was not given, and a clap
+    // default is indistinguishable from `--format table` typed by hand.
+    #[arg(
+        long = "format",
+        value_enum,
+        help = "Output format (default: table; config: \"defaults.format\")"
+    )]
+    pub(crate) output_format: Option<OutputFormat>,
     #[arg(long, default_value_t = 30, help = "Maximum table rows (0 means all)")]
     pub(crate) top: usize,
     #[arg(long, help = "Skip Git history")]
@@ -322,8 +335,11 @@ pub(crate) struct ReportArguments {
     pub(crate) rebuild_cache: bool,
     #[arg(long, value_name = "REGEX=NAME", action = clap::ArgAction::Append, help = "Custom source-root rule; repeatable")]
     pub(crate) source_rule: Vec<String>,
-    #[arg(long, default_value_t = 4, help = "Git repository discovery depth")]
-    pub(crate) depth: usize,
+    #[arg(
+        long,
+        help = "Git repository discovery depth (default: 4; config: \"defaults.depth\")"
+    )]
+    pub(crate) depth: Option<usize>,
     #[arg(long, action = clap::ArgAction::Append, help = "Git file include glob; repeatable/comma-separated")]
     pub(crate) path: Vec<String>,
     #[arg(short = 'P', long, action = clap::ArgAction::Append, help = "Additional Git ignore glob")]
@@ -446,18 +462,21 @@ pub(crate) fn report_window(
     ))
 }
 
-/// The directory Git history is scanned from. It takes its candidates instead
+/// The directory Git history is scanned from: `--dir`, then `WORKSTATS_DIR`,
+/// then the config's `defaults.dir`, then the working directory. It takes its candidates instead
 /// of reading the environment itself so both the precedence and the error stay
 /// testable.
 pub(crate) fn scan_directory(
     explicit: Option<&Path>,
     from_environment: Option<PathBuf>,
+    configured: Option<PathBuf>,
     current: Option<PathBuf>,
 ) -> Result<PathBuf> {
-    let (directory, origin) = match (explicit, from_environment) {
-        (Some(path), _) => (path.to_path_buf(), "--dir"),
-        (None, Some(path)) => (path, "WORKSTATS_DIR"),
-        (None, None) => (
+    let (directory, origin) = match (explicit, from_environment, configured) {
+        (Some(path), _, _) => (path.to_path_buf(), "--dir"),
+        (None, Some(path), _) => (path, "WORKSTATS_DIR"),
+        (None, None, Some(path)) => (path, "defaults.dir"),
+        (None, None, None) => (
             current.unwrap_or_else(|| PathBuf::from(".")),
             "the current working directory",
         ),
@@ -543,6 +562,11 @@ pub(crate) fn grouping_dimensions(arguments: &ReportArguments) -> Result<Vec<Str
     {
         dimensions.push(period.clone());
     }
+    validate_dimensions(&dimensions)?;
+    Ok(dimensions)
+}
+
+fn validate_dimensions(dimensions: &[String]) -> Result<()> {
     let unique: HashSet<_> = dimensions.iter().collect();
     if dimensions.is_empty()
         || unique.len() != dimensions.len()
@@ -560,8 +584,233 @@ pub(crate) fn grouping_dimensions(arguments: &ReportArguments) -> Result<Vec<Str
     {
         bail!("day and month are alternative calendar groupings; choose one");
     }
-    Ok(dimensions)
+    Ok(())
 }
+/// The config file's `defaults` block: the everyday flags a user would rather
+/// not retype. Every key is named after its flag's long name and sits below the
+/// flag (and, where one exists, the environment variable) in precedence:
+/// flag > environment > config default > built-in default.
+///
+/// Values are kept as raw JSON until [`ConfigDefaults::parse`] so that a bad
+/// one is refused with the key it came from (`defaults.depth`) instead of
+/// serde's positionless "invalid type". Unknown keys are refused the same way:
+/// a misspelt default silently doing nothing is the failure this prevents.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawDefaults {
+    dir: Option<serde_json::Value>,
+    depth: Option<serde_json::Value>,
+    format: Option<serde_json::Value>,
+    providers: Option<serde_json::Value>,
+    group_by: Option<serde_json::Value>,
+    gap_cap: Option<serde_json::Value>,
+    human_idle: Option<serde_json::Value>,
+    review_credit: Option<serde_json::Value>,
+}
+
+/// The validated `defaults` block.
+#[derive(Debug, Default)]
+pub(crate) struct ConfigDefaults {
+    pub(crate) dir: Option<PathBuf>,
+    pub(crate) depth: Option<usize>,
+    pub(crate) format: Option<OutputFormat>,
+    pub(crate) providers: Vec<String>,
+    pub(crate) group_by: Option<String>,
+    pub(crate) gap_cap: Option<String>,
+    pub(crate) human_idle: Option<String>,
+    pub(crate) review_credit: Option<String>,
+}
+
+/// What one run's scalar flags resolved to, and which of them came from the
+/// config file (key to the value used) so the report can say so.
+#[derive(Debug)]
+pub(crate) struct ResolvedDefaults {
+    pub(crate) depth: usize,
+    pub(crate) format: OutputFormat,
+    pub(crate) gap_cap: String,
+    pub(crate) human_idle: String,
+    pub(crate) review_credit: String,
+    pub(crate) from_config: BTreeMap<String, String>,
+}
+
+fn default_string(key: &str, value: &serde_json::Value) -> Result<String> {
+    match value.as_str() {
+        Some(text) if !text.trim().is_empty() => Ok(text.trim().to_string()),
+        _ => bail!("defaults.{key} must be a non-empty string"),
+    }
+}
+
+impl ConfigDefaults {
+    pub(crate) fn parse(value: &serde_json::Value, home: &Path) -> Result<Self> {
+        let raw: RawDefaults =
+            serde_json::from_value(value.clone()).context("invalid \"defaults\" configuration")?;
+        let mut defaults = Self::default();
+        if let Some(value) = &raw.dir {
+            defaults.dir = Some(expand_path(&default_string("dir", value)?, home));
+        }
+        if let Some(value) = &raw.depth {
+            let depth = value
+                .as_u64()
+                .and_then(|depth| usize::try_from(depth).ok())
+                .with_context(|| "defaults.depth must be a whole number of at least 0")?;
+            defaults.depth = Some(depth);
+        }
+        if let Some(value) = &raw.format {
+            let name = default_string("format", value)?;
+            defaults.format = Some(OutputFormat::from_str(&name, true).map_err(|_| {
+                anyhow::anyhow!(
+                    "defaults.format {name:?} is not a format; expected one of {}",
+                    OutputFormat::value_variants()
+                        .iter()
+                        .filter_map(|variant| variant.to_possible_value())
+                        .map(|variant| variant.get_name().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?);
+        }
+        if let Some(value) = &raw.providers {
+            // A list, or one comma-separated string like `--provider`.
+            let names: Vec<String> = match value {
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .map(|item| default_string("providers", item))
+                    .collect::<Result<_>>()?,
+                serde_json::Value::String(text) => text.split(',').map(str::to_string).collect(),
+                _ => bail!("defaults.providers must be a list of provider names"),
+            };
+            for name in names
+                .iter()
+                .flat_map(|name| name.split(','))
+                .map(normalize_provider)
+                .filter(|name| !name.is_empty())
+            {
+                if !valid_provider_identifier(&name, true) {
+                    bail!(
+                        "defaults.providers {name:?} must use letters, numbers, '.', '/', or '-'"
+                    );
+                }
+                defaults.providers.push(name);
+            }
+        }
+        if let Some(value) = &raw.group_by {
+            let text = default_string("group_by", value)?;
+            let dimensions: Vec<String> = text
+                .split(',')
+                .map(str::trim)
+                .filter(|piece| !piece.is_empty())
+                .map(str::to_string)
+                .collect();
+            validate_dimensions(&dimensions).context("invalid defaults.group_by")?;
+            defaults.group_by = Some(text);
+        }
+        for (key, slot, value) in [
+            ("gap_cap", &mut defaults.gap_cap, &raw.gap_cap),
+            ("human_idle", &mut defaults.human_idle, &raw.human_idle),
+            (
+                "review_credit",
+                &mut defaults.review_credit,
+                &raw.review_credit,
+            ),
+        ] {
+            if let Some(value) = value {
+                let text = default_string(key, value)?;
+                duration_flag(&format!("defaults.{key}"), &text)?;
+                *slot = Some(text);
+            }
+        }
+        Ok(defaults)
+    }
+
+    /// Fills in whatever the command line left unsaid. `arguments` holds only
+    /// what the user typed (the flags have no clap default), so a flag given
+    /// with the built-in value still beats the config. `explore` is `workstats
+    /// ui`, which has no machine-readable output and therefore ignores
+    /// `defaults.format`; `providers` and `group_by` are written back into
+    /// `arguments` because they are already optional there.
+    pub(crate) fn resolve(
+        &self,
+        arguments: &mut ReportArguments,
+        explore: bool,
+    ) -> ResolvedDefaults {
+        let mut from_config = BTreeMap::new();
+        if arguments.provider.is_empty() && !self.providers.is_empty() {
+            arguments.provider = self.providers.clone();
+            from_config.insert("providers".to_string(), self.providers.join(","));
+        }
+        if arguments.group_by.is_none()
+            && !grouping_is_overridden(arguments)
+            && let Some(group_by) = &self.group_by
+        {
+            arguments.group_by = Some(group_by.clone());
+            from_config.insert("group_by".to_string(), group_by.clone());
+        }
+        let mut pick = |key: &str,
+                        flag: &Option<String>,
+                        config: &Option<String>,
+                        built_in: &str| match (flag, config) {
+            (Some(value), _) => value.clone(),
+            (None, Some(value)) => {
+                from_config.insert(key.to_string(), value.clone());
+                value.clone()
+            }
+            (None, None) => built_in.to_string(),
+        };
+        let gap_cap = pick(
+            "gap_cap",
+            &arguments.gap_cap,
+            &self.gap_cap,
+            DEFAULT_GAP_CAP,
+        );
+        let human_idle = pick(
+            "human_idle",
+            &arguments.human_idle,
+            &self.human_idle,
+            DEFAULT_HUMAN_IDLE,
+        );
+        let review_credit = pick(
+            "review_credit",
+            &arguments.review_credit,
+            &self.review_credit,
+            DEFAULT_REVIEW_CREDIT,
+        );
+        let depth = match (arguments.depth, self.depth) {
+            (Some(depth), _) => depth,
+            (None, Some(depth)) => {
+                from_config.insert("depth".to_string(), depth.to_string());
+                depth
+            }
+            (None, None) => DEFAULT_DEPTH,
+        };
+        let format = match (arguments.output_format, self.format) {
+            (Some(format), _) => format,
+            (None, Some(format)) if !explore => {
+                let name = format
+                    .to_possible_value()
+                    .map(|value| value.get_name().to_string())
+                    .unwrap_or_default();
+                from_config.insert("format".to_string(), name);
+                format
+            }
+            _ => OutputFormat::Table,
+        };
+        ResolvedDefaults {
+            depth,
+            format,
+            gap_cap,
+            human_idle,
+            review_credit,
+            from_config,
+        }
+    }
+}
+
+/// The grouping shortcut flags, which `--group-by` conflicts with; a config
+/// `group_by` must not compete with them either.
+fn grouping_is_overridden(arguments: &ReportArguments) -> bool {
+    arguments.by_repo || arguments.matrix || arguments.by_dir
+}
+
 pub(crate) fn valid_provider_identifier(provider: &str, allow_all: bool) -> bool {
     !provider.is_empty()
         && (allow_all || provider != "all")
@@ -907,7 +1156,7 @@ mod tests {
         let missing = temporary.path().join("nope");
         assert_eq!(
             temporary.path().to_path_buf(),
-            scan_directory(Some(temporary.path()), None, None).unwrap()
+            scan_directory(Some(temporary.path()), None, None, None).unwrap()
         );
         // An explicit --dir wins over both fallbacks, so its own absence is
         // what gets reported.
@@ -915,6 +1164,7 @@ mod tests {
             "{:#}",
             scan_directory(
                 Some(&missing),
+                Some(temporary.path().to_path_buf()),
                 Some(temporary.path().to_path_buf()),
                 Some(temporary.path().to_path_buf())
             )
@@ -924,14 +1174,168 @@ mod tests {
         assert!(error.contains("nope"), "{error}");
         let error = format!(
             "{:#}",
-            scan_directory(None, Some(missing.clone()), None).unwrap_err()
+            scan_directory(None, Some(missing.clone()), None, None).unwrap_err()
         );
         assert!(error.contains("WORKSTATS_DIR"), "{error}");
         let error = format!(
             "{:#}",
-            scan_directory(None, None, Some(missing)).unwrap_err()
+            scan_directory(None, None, Some(missing.clone()), None).unwrap_err()
+        );
+        assert!(error.contains("defaults.dir"), "{error}");
+        let error = format!(
+            "{:#}",
+            scan_directory(None, None, None, Some(missing)).unwrap_err()
         );
         assert!(error.contains("current working directory"), "{error}");
+        // Precedence: the environment beats the config, the config beats the
+        // working directory.
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(
+            temporary.path().to_path_buf(),
+            scan_directory(
+                None,
+                Some(temporary.path().to_path_buf()),
+                Some(other.path().to_path_buf()),
+                None
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            other.path().to_path_buf(),
+            scan_directory(
+                None,
+                None,
+                Some(other.path().to_path_buf()),
+                Some(temporary.path().to_path_buf())
+            )
+            .unwrap()
+        );
+    }
+
+    fn defaults(json: &str) -> Result<ConfigDefaults> {
+        ConfigDefaults::parse(&serde_json::from_str(json).unwrap(), Path::new("/home/ada"))
+    }
+
+    #[test]
+    fn a_defaults_block_parses_every_supported_key() {
+        let parsed = defaults(
+            r#"{"dir": "~/code", "depth": 2, "format": "json", "providers": ["Claude_Code", "codex"],
+                "group_by": "repo,month", "gap_cap": "10m", "human_idle": "2h", "review_credit": "15m"}"#,
+        )
+        .unwrap();
+        assert_eq!(Some(PathBuf::from("/home/ada/code")), parsed.dir);
+        assert_eq!(Some(2), parsed.depth);
+        assert_eq!(Some(OutputFormat::Json), parsed.format);
+        assert_eq!(vec!["claude", "codex"], parsed.providers);
+        assert_eq!(Some("repo,month".to_string()), parsed.group_by);
+        assert_eq!(Some("10m".to_string()), parsed.gap_cap);
+        assert_eq!(Some("2h".to_string()), parsed.human_idle);
+        assert_eq!(Some("15m".to_string()), parsed.review_credit);
+        // A comma list works as it does for --provider.
+        assert_eq!(
+            vec!["claude", "pi"],
+            defaults(r#"{"providers": "claude,pi"}"#).unwrap().providers
+        );
+    }
+
+    #[test]
+    fn a_defaults_block_refuses_unknown_keys_and_bad_values_naming_them() {
+        let error = format!("{:#}", defaults(r#"{"depht": 2}"#).unwrap_err());
+        assert!(
+            error.contains("defaults") && error.contains("depht"),
+            "{error}"
+        );
+        for (json, key) in [
+            (r#"{"gap_cap": "soon"}"#, "defaults.gap_cap"),
+            (r#"{"human_idle": "x"}"#, "defaults.human_idle"),
+            (r#"{"review_credit": 5}"#, "defaults.review_credit"),
+            (r#"{"format": "xml"}"#, "defaults.format"),
+            (r#"{"depth": "deep"}"#, "defaults.depth"),
+            (r#"{"depth": -1}"#, "defaults.depth"),
+            (r#"{"group_by": "repo,repo"}"#, "defaults.group_by"),
+            (r#"{"providers": ["bad name"]}"#, "defaults.providers"),
+            (r#"{"providers": 3}"#, "defaults.providers"),
+            (r#"{"dir": ""}"#, "defaults.dir"),
+        ] {
+            let error = format!("{:#}", defaults(json).unwrap_err());
+            assert!(error.contains(key), "{json}: {error}");
+        }
+    }
+
+    /// The point of the exercise: a flag typed with the built-in value is still
+    /// the user's word and must beat the config.
+    #[test]
+    fn a_config_default_never_overrides_an_explicit_flag_even_at_the_built_in_value() {
+        let configured = defaults(
+            r#"{"depth": 1, "format": "json", "gap_cap": "10m", "human_idle": "2h",
+                "review_credit": "15m", "group_by": "month", "providers": ["codex"]}"#,
+        )
+        .unwrap();
+
+        let mut bare = report_arguments(&[]);
+        let resolved = configured.resolve(&mut bare, false);
+        assert_eq!(1, resolved.depth);
+        assert_eq!(OutputFormat::Json, resolved.format);
+        assert_eq!("10m", resolved.gap_cap);
+        assert_eq!("2h", resolved.human_idle);
+        assert_eq!("15m", resolved.review_credit);
+        assert_eq!(Some("month"), bare.group_by.as_deref());
+        assert_eq!(vec!["codex"], bare.provider);
+        assert_eq!(7, resolved.from_config.len());
+
+        let mut typed = report_arguments(&[
+            "--depth",
+            "4",
+            "--format",
+            "table",
+            "--gap-cap",
+            "5m",
+            "--human-idle",
+            "1h",
+            "--review-credit",
+            "30m",
+            "--group-by",
+            "repo",
+            "--provider",
+            "claude",
+        ]);
+        let resolved = configured.resolve(&mut typed, false);
+        assert_eq!(DEFAULT_DEPTH, resolved.depth);
+        assert_eq!(OutputFormat::Table, resolved.format);
+        assert_eq!(DEFAULT_GAP_CAP, resolved.gap_cap);
+        assert_eq!(DEFAULT_HUMAN_IDLE, resolved.human_idle);
+        assert_eq!(DEFAULT_REVIEW_CREDIT, resolved.review_credit);
+        assert_eq!(Some("repo"), typed.group_by.as_deref());
+        assert_eq!(vec!["claude"], typed.provider);
+        assert!(resolved.from_config.is_empty());
+
+        // The shortcut flags own the grouping, so the config must not add a
+        // --group-by that would conflict with them.
+        let mut shortcut = report_arguments(&["--by-dir"]);
+        configured.resolve(&mut shortcut, false);
+        assert_eq!(None, shortcut.group_by);
+        assert_eq!(vec!["cwd"], grouping_dimensions(&shortcut).unwrap());
+
+        // Nothing configured: the built-ins.
+        let mut none = report_arguments(&[]);
+        let resolved = ConfigDefaults::default().resolve(&mut none, false);
+        assert_eq!(
+            (DEFAULT_DEPTH, OutputFormat::Table, "5m", "1h", "30m"),
+            (
+                resolved.depth,
+                resolved.format,
+                resolved.gap_cap.as_str(),
+                resolved.human_idle.as_str(),
+                resolved.review_credit.as_str()
+            )
+        );
+
+        // `ui` has no machine-readable output, so a configured format is moot.
+        let mut explore = report_arguments(&[]);
+        assert_eq!(
+            OutputFormat::Table,
+            configured.resolve(&mut explore, true).format
+        );
     }
 
     /// Nothing happens unless the run asks for it, and asking for it with a

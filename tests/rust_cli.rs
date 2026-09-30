@@ -1643,3 +1643,144 @@ fn allocate_refuses_invalid_rate_overrides_naming_the_key() {
         "got {stderr}"
     );
 }
+
+/// Runs a report against a config file holding `config`, with the
+/// environment variables that would otherwise leak into precedence removed.
+fn run_with_defaults(directory: &Path, config: &str, arguments: &[&str]) -> Output {
+    let config_file = directory.join("config.json");
+    fs::write(&config_file, config).unwrap();
+    Command::new(binary())
+        .args([
+            "--no-ai",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--config",
+            config_file.to_str().unwrap(),
+        ])
+        .args(arguments)
+        .env_remove("WORKSTATS_DIR")
+        .env_remove("WORKSTATS_AUTHOR")
+        .output()
+        .unwrap()
+}
+
+fn json_stdout(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// `defaults` fills in flags that were not given, and a flag given with the
+/// very value the built-in default has still wins over the config.
+#[test]
+fn config_defaults_fill_unset_flags_and_never_override_explicit_ones() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"defaults": {"format": "json", "human_idle": "45m", "review_credit": "10m"}}"#;
+
+    let report = json_stdout(&run_with_defaults(directory.path(), config, &[]));
+    assert_eq!("45m", report["inputs"]["human_idle"]);
+    assert_eq!("10m", report["inputs"]["review_credit"]);
+    assert_eq!(
+        serde_json::json!({"format": "json", "human_idle": "45m", "review_credit": "10m"}),
+        report["inputs"]["config_defaults"]
+    );
+
+    // --human-idle 1h is the built-in value; it must still beat the config.
+    let report = json_stdout(&run_with_defaults(
+        directory.path(),
+        config,
+        &["--human-idle", "1h", "--format", "json"],
+    ));
+    assert_eq!("1h", report["inputs"]["human_idle"]);
+    assert_eq!("10m", report["inputs"]["review_credit"]);
+    assert_eq!(
+        serde_json::json!({"review_credit": "10m"}),
+        report["inputs"]["config_defaults"]
+    );
+
+    // --format table is the built-in value too: the output must not be JSON.
+    let table = run_with_defaults(directory.path(), config, &["--format", "table"]);
+    assert!(table.status.success());
+    assert!(serde_json::from_slice::<Value>(&table.stdout).is_err());
+}
+
+#[test]
+fn config_default_dir_sits_between_the_environment_and_the_working_directory() {
+    let directory = tempdir().unwrap();
+    let configured = tempdir().unwrap();
+    let environment = tempdir().unwrap();
+    let flagged = tempdir().unwrap();
+    let config = format!(
+        r#"{{"defaults": {{"format": "json", "dir": {:?}}}}}"#,
+        configured.path().to_str().unwrap()
+    );
+
+    let root = |output: &Output| json_stdout(output)["inputs"]["git_root"].clone();
+    assert_eq!(
+        configured.path().to_str().unwrap(),
+        root(&run_with_defaults(directory.path(), &config, &[]))
+            .as_str()
+            .unwrap()
+    );
+
+    let config_file = directory.path().join("config.json");
+    let with_environment = Command::new(binary())
+        .args([
+            "--no-ai",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--config",
+        ])
+        .arg(&config_file)
+        .env("WORKSTATS_DIR", environment.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        environment.path().to_str().unwrap(),
+        root(&with_environment).as_str().unwrap()
+    );
+
+    let with_flag = Command::new(binary())
+        .args([
+            "--no-ai",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--config",
+        ])
+        .arg(&config_file)
+        .arg("--dir")
+        .arg(flagged.path())
+        .env("WORKSTATS_DIR", environment.path())
+        .output()
+        .unwrap();
+    assert_eq!(
+        flagged.path().to_str().unwrap(),
+        root(&with_flag).as_str().unwrap()
+    );
+}
+
+#[test]
+fn config_defaults_refuse_unknown_keys_and_bad_values_naming_them() {
+    let directory = tempdir().unwrap();
+    for (config, expected) in [
+        (r#"{"defaults": {"depht": 2}}"#, "depht"),
+        (r#"{"defaults": {"gap_cap": "soon"}}"#, "defaults.gap_cap"),
+        (r#"{"defaults": {"format": "xml"}}"#, "defaults.format"),
+        (r#"{"defaults": {"depth": "deep"}}"#, "defaults.depth"),
+        (
+            r#"{"defaults": {"dir": "/nonexistent/workstats"}}"#,
+            "defaults.dir",
+        ),
+    ] {
+        let output = run_with_defaults(directory.path(), config, &[]);
+        assert_eq!(Some(2), output.status.code(), "{config}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{config}: {stderr}");
+    }
+}
