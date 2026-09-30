@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::aggregate::DIMENSIONS;
 use crate::allocate;
 use crate::git::DEFAULT_AGENT_AUTHORS;
-use crate::timeutil::{month_span, parse_bound, parse_duration, year_span};
+use crate::timeutil::{month_span, parse_bound, parse_duration, week_span, year_span};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum OutputFormat {
@@ -214,13 +214,13 @@ pub(crate) struct ReportArguments {
     pub(crate) until: Option<String>,
     // These pick the window the report covers; --group-by month and --period
     // month split the rows inside whatever window is already picked. The words
-    // are otherwise identical, so all four help lines say which one they are.
+    // are otherwise identical, so all the help lines say which one they are.
     // The conflicts are the AUDIT V shape again: --month with --since could
     // only mean one of the two, and silently picking is what --by-repo used to
     // do to --group-by.
     #[arg(
         long,
-        conflicts_with_all = ["year", "since", "until"],
+        conflicts_with_all = ["year", "week", "since", "until"],
         help = "Filter to one calendar month: YYYY-MM, current (this), or last (previous)"
     )]
     pub(crate) month: Option<String>,
@@ -230,6 +230,12 @@ pub(crate) struct ReportArguments {
         help = "Filter to one calendar year: YYYY, current (this), or last (previous)"
     )]
     pub(crate) year: Option<String>,
+    #[arg(
+        long,
+        conflicts_with_all = ["month", "year", "since", "until"],
+        help = "Filter to one ISO week (Monday start): YYYY-Www, current (this), or last (previous)"
+    )]
+    pub(crate) week: Option<String>,
     #[arg(
         long,
         default_value = "5m",
@@ -267,12 +273,12 @@ pub(crate) struct ReportArguments {
         long = "group-by",
         visible_alias = "by",
         conflicts_with_all = ["by_repo", "matrix", "by_dir"],
-        help = "Comma-separated grouping dimensions: root,repo,cwd,provider,model,day,month (default: repo)"
+        help = "Comma-separated grouping dimensions: root,repo,cwd,provider,model,day,week,month (default: repo)"
     )]
     pub(crate) group_by: Option<String>,
     #[arg(
         long,
-        value_parser = ["day", "month"],
+        value_parser = ["day", "week", "month"],
         help = "Append a calendar grouping to the rows; --month/--year choose the window"
     )]
     pub(crate) period: Option<String>,
@@ -422,9 +428,9 @@ pub(crate) fn bound_flag(
 /// end means unbounded there.
 pub(crate) type ReportWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
-/// `--month` and `--year` are shorthand for the whole window, and clap has
-/// already refused them alongside `--since`/`--until`, so whichever is present
-/// decides both ends. The reference instant is taken as an argument rather than
+/// `--month`, `--year` and `--week` are shorthand for the whole window, and clap
+/// has already refused them alongside `--since`/`--until`, so whichever is
+/// present decides both ends. The reference instant is taken as an argument rather than
 /// read from the clock so `current` and `last` stay testable.
 pub(crate) fn report_window(
     arguments: &ReportArguments,
@@ -438,6 +444,11 @@ pub(crate) fn report_window(
     if let Some(value) = arguments.year.as_deref() {
         let (since, until) =
             year_span(value, reference).with_context(|| format!("invalid --year {value:?}"))?;
+        return Ok((Some(since), Some(until)));
+    }
+    if let Some(value) = arguments.week.as_deref() {
+        let (since, until) =
+            week_span(value, reference).with_context(|| format!("invalid --week {value:?}"))?;
         return Ok((Some(since), Some(until)));
     }
     Ok((
@@ -556,9 +567,15 @@ pub(crate) fn grouping_dimensions(arguments: &ReportArguments) -> Result<Vec<Str
             values.join(", ")
         });
     }
-    if dimensions.iter().any(|name| name == "day") && dimensions.iter().any(|name| name == "month")
+    // A row sits in one calendar bucket, and a week straddles months, so any
+    // two of these would describe a bucket that does not exist.
+    if ["day", "week", "month"]
+        .iter()
+        .filter(|calendar| dimensions.iter().any(|name| name == *calendar))
+        .count()
+        > 1
     {
-        bail!("day and month are alternative calendar groupings; choose one");
+        bail!("day, week and month are alternative calendar groupings; choose one");
     }
     Ok(dimensions)
 }
@@ -856,6 +873,10 @@ mod tests {
             ["--month", "2026-08", "--until", "2026-12"],
             ["--year", "2026", "--since", "2026-01"],
             ["--year", "2026", "--until", "2026-12"],
+            ["--week", "2026-W09", "--month", "2026-08"],
+            ["--week", "2026-W09", "--year", "2026"],
+            ["--week", "2026-W09", "--since", "2026-01"],
+            ["--week", "2026-W09", "--until", "2026-12"],
         ] {
             let mut command = vec!["workstats"];
             command.extend_from_slice(&flags);
@@ -872,12 +893,94 @@ mod tests {
             // A filter and a grouping are orthogonal, so these must coexist.
             vec!["--month", "current", "--group-by", "repo"],
             vec!["--year", "last", "--period", "month"],
+            vec!["--week", "2026-W09"],
+            vec!["--week", "last", "--period", "week"],
         ] {
             let mut command = vec!["workstats"];
             command.extend_from_slice(&flags);
             assert!(
                 Arguments::try_parse_from(command).is_ok(),
                 "{flags:?} should parse"
+            );
+        }
+    }
+
+    /// `--week` is the ISO week as a half-open Monday-to-Monday window, so the
+    /// first week of 2026 starts in December 2025 and the last of 2026 ends in
+    /// January 2027. It has to equal the `--since`/`--until` pair it stands for.
+    #[test]
+    fn the_week_shorthand_is_an_iso_monday_to_sunday_window() {
+        assert_eq!(
+            longhand("2025-12-29", "2026-01-04"),
+            window(&["--week", "2026-W01"])
+        );
+        assert_eq!(
+            longhand("2026-02-23", "2026-03-01"),
+            window(&["--week", "2026-W09"])
+        );
+        assert_eq!(
+            longhand("2026-12-28", "2027-01-03"),
+            window(&["--week", "2026-W53"])
+        );
+        // Reference is Thursday 2026-01-15, in 2026-W03.
+        for value in ["current", "this"] {
+            assert_eq!(
+                longhand("2026-01-12", "2026-01-18"),
+                window(&["--week", value])
+            );
+        }
+        for value in ["last", "previous"] {
+            assert_eq!(
+                longhand("2026-01-05", "2026-01-11"),
+                window(&["--week", value])
+            );
+        }
+        // Sunday night belongs to the week, Monday 00:00 to the next one.
+        assert!(covers(
+            &["--week", "2026-W01"],
+            local_moment(2026, 1, 4, 23, 59)
+        ));
+        assert!(!covers(
+            &["--week", "2026-W01"],
+            local_moment(2026, 1, 5, 0, 0)
+        ));
+        assert!(covers(
+            &["--week", "2026-W01"],
+            local_moment(2025, 12, 29, 0, 0)
+        ));
+    }
+
+    #[test]
+    fn a_bad_week_names_the_flag_and_the_value() {
+        // 2025 has no week 53.
+        for value in ["2025-W53", "2026-09", "nope"] {
+            let error = format!(
+                "{:#}",
+                report_window(&report_arguments(&["--week", value]), reference()).unwrap_err()
+            );
+            assert!(error.contains("--week"), "{error}");
+            assert!(error.contains(value), "{error}");
+        }
+    }
+
+    #[test]
+    fn week_is_a_calendar_grouping_that_excludes_day_and_month() {
+        assert_eq!(
+            vec!["repo", "week"],
+            grouping_dimensions(&report_arguments(&["--period", "week"])).unwrap()
+        );
+        assert_eq!(
+            vec!["week", "repo"],
+            grouping_dimensions(&report_arguments(&["--group-by", "week,repo"])).unwrap()
+        );
+        for flags in [
+            vec!["--group-by", "week,month"],
+            vec!["--group-by", "day,week"],
+            vec!["--by-repo", "--period", "week"],
+        ] {
+            assert!(
+                grouping_dimensions(&report_arguments(&flags)).is_err(),
+                "{flags:?} should be refused"
             );
         }
     }

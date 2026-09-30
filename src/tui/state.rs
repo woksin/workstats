@@ -20,7 +20,7 @@ use crate::classify::{CategoryTally, active_registry};
 use crate::model::{GitCommit, Report};
 use crate::output::number;
 use crate::paths::{default_config_path, home_dir};
-use crate::timeutil::{local_date, local_month};
+use crate::timeutil::{local_date, local_month, local_week};
 
 /// Saved views are user-written configuration, so they are bounded the same way
 /// the config file is rather than trusted because they happen to be local.
@@ -103,6 +103,8 @@ pub enum Grain {
     #[default]
     Month,
     Day,
+    /// ISO 8601 week, labelled `2026-W09`.
+    Week,
 }
 
 impl Grain {
@@ -110,13 +112,17 @@ impl Grain {
         match self {
             Self::Month => "month",
             Self::Day => "day",
+            Self::Week => "week",
         }
     }
 
+    /// The next grain in the cycle. Day stays second so a single press still
+    /// goes month to day as it did before weeks existed.
     pub const fn toggled(self) -> Self {
         match self {
             Self::Month => Self::Day,
-            Self::Day => Self::Month,
+            Self::Day => Self::Week,
+            Self::Week => Self::Month,
         }
     }
 }
@@ -319,7 +325,7 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
     ),
     ("[ / ]", "previous / next sort column"),
     ("o", "reverse the sort order"),
-    ("p", "switch the period between month and day"),
+    ("p", "cycle the period through month, day and ISO week"),
     ("w", "save the current view"),
     ("v", "open the saved views"),
     ("d", "delete the highlighted saved view"),
@@ -462,6 +468,7 @@ pub struct CommitRecord {
     pub short_sha: String,
     pub timestamp: DateTime<Utc>,
     pub day: String,
+    pub week: String,
     pub month: String,
     /// Logical repository identity used for drill-down scope.
     pub repo_key: String,
@@ -482,6 +489,7 @@ impl CommitRecord {
         match grain {
             Grain::Month => &self.month,
             Grain::Day => &self.day,
+            Grain::Week => &self.week,
         }
     }
 }
@@ -570,6 +578,7 @@ impl Dataset {
                 sha: commit.sha,
                 timestamp: commit.timestamp,
                 day: local_date(commit.timestamp),
+                week: local_week(commit.timestamp),
                 month: local_month(commit.timestamp),
                 repo_key: commit.repo_id,
                 cwd: commit.cwd,

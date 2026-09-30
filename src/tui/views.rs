@@ -445,7 +445,7 @@ fn empty_state(app: &App) -> Paragraph<'static> {
             ),
             LevelKind::Repo => (
                 "No commits are recorded for this repository.".to_string(),
-                "Switch the period between month and day with p.".to_string(),
+                "Cycle the period through month, day and week with p.".to_string(),
             ),
             LevelKind::Period => (
                 "Nothing was categorised in this period.".to_string(),
