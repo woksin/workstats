@@ -49,7 +49,7 @@ workstats --config ./team.json  # read source roots and categories from elsewher
 ```
 
 The config file holds `source_roots`, `categories`, `category_mode`,
-`project_aliases`, `authors`, `model_rates` (list-rate overrides for
+`project_aliases`, `authors` (a string for one identity, or a list), `model_rates` (list-rate overrides for
 [`allocate`](allocate.md#rates-and-when-they-go-stale)), `check_updates`, and `defaults`
 (below). `workstats ui`'s saved views are kept beside it as
 `views.json` — configuration, never cache — so `--rebuild-cache` and
@@ -90,8 +90,10 @@ example `invalid defaults.gap_cap "soon"` or a misspelt key such as `depht`,
 rather than being ignored. `workstats ui` ignores `format`, and `allocate` ignores `group_by`,
 because each sets that itself. `--format json` lists the values taken from the
 config under `inputs.config_defaults` (including `dir` when the config's
-directory was the one scanned), and the table, Markdown, HTML and `allocate`
-outputs end their notes with a one-line `Config defaults: …` when any applied.
+directory was the one scanned), and `allocate --format json` carries the same map as
+`config_defaults`. The table, Markdown, HTML and `allocate` outputs end their notes with
+a one-line `Config defaults: …` when any applied; `allocate --format csv` has no
+place for it and omits it.
 A refusal caused by a configured format, such as `--compare` with
 `defaults.format "csv"`, names the config and suggests `--format table` or
 `--format json`.

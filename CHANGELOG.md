@@ -41,7 +41,8 @@ tag are the generated list of pull requests.
   then the built-in default, so a flag typed with its built-in value still wins.
   An unknown key or invalid value stops the run naming it, and `--format json`
   lists what was taken from the config under `inputs.config_defaults`, and the
-  table, Markdown, HTML and `allocate` outputs note which defaults applied. A
+  table, Markdown, HTML and `allocate` outputs note which defaults applied, and
+  `allocate --format json` carries them as `config_defaults`. A
   calendar `group_by` yields to an explicit `--period`, and `model_rates`
   entries are validated one by one, so a misspelt field is an error naming the
   entry rather than the whole config being ignored with a warning.
@@ -57,7 +58,8 @@ tag are the generated list of pull requests.
   object. `--compare` refuses CSV, `workstats ui` and `workstats allocate`,
   because their shapes cannot carry a second window. The selected window's
   report, including the Git checkouts it reads, is the one it would print
-  without `--compare`.
+  without `--compare`, and so is the baseline's: each window is built by the
+  same code path a run of that window alone uses, one after the other.
 
 - The documentation moved out of the README into `docs/`: install, usage,
   configuration, how the estimate works, `allocate`, privacy, and development.
@@ -253,13 +255,14 @@ tag are the generated list of pull requests.
   fully qualified name is the form to use: Homebrew 5.1.15 and newer will not
   load a formula from a third-party tap until it is trusted, and naming the tap
   in full trusts that one formula rather than everything in it.
-- `--author` is repeatable, and the config file takes an `authors` list, for
+- `--author` is repeatable, and the config file takes an `authors` list (or a
+  single string, for one identity; any other type is an error naming `authors`), for
   anyone who commits under more than one identity — a work address, a personal
   one, an old name. Git ORs them into one developer, so a report no longer
   undercounts you because a single pattern could only name one of them. The
   first source that names any wins and sources do not combine: `--author`
-  flags, then `WORKSTATS_AUTHOR`, then the config file's `authors`, then Git's
-  own `user.name`. JSON output gains `inputs.authors`, listing each identity;
+  flags, then `WORKSTATS_AUTHOR`, then the config file's `authors`, then the
+  global Git identity (`user.email`, else `user.name`). JSON output gains `inputs.authors`, listing each identity;
   `inputs.author` joins them with `, `.
 - `workstats allocate` warns when its built-in list rates are more than 90 days
   old, because vendors reprice and a weighting drawn from a stale table quietly
