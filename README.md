@@ -793,7 +793,8 @@ workstats --config ./team.json  # read source roots and categories from elsewher
 ```
 
 The config file holds `source_roots`, `categories`, `category_mode`,
-`project_aliases`, and `check_updates`. `workstats ui`'s saved views are kept beside it as
+`project_aliases`, `model_rates` (list-rate overrides for
+[`allocate`](#rates-and-when-they-go-stale)), and `check_updates`. `workstats ui`'s saved views are kept beside it as
 `views.json` — configuration, never cache — so `--rebuild-cache` and
 `--no-cache` leave them alone.
 
@@ -908,6 +909,74 @@ Models are weighed by published list rate, so a million Opus tokens and a
 million Haiku tokens are not equal claims on a plan. List value is a ceiling
 and a weighting — it is what the usage would have cost per-token, which is
 precisely what a subscription holder does not pay.
+
+### Rates, and when they go stale
+
+The list rates behind the `value` basis and the per-model list values are a
+table compiled into the binary. The table's date is printed on the `MODELS`
+line (`rates as of 2026-09-02`), and once it is more than 90 days old against
+today's date, `allocate` adds a warning saying how old it is:
+
+```
+  WARNINGS
+   ! built-in list rates are dated 2026-09-02 (121 days old, past the 90-day
+     limit) and vendors may have repriced since; set current prices under
+     "model_rates" in the config file, or upgrade workstats for a refreshed table
+```
+
+Only `allocate` uses rates; ordinary reports carry no list value, so they never
+show this warning. It is also left out when every priced model in the run took
+its rate from your own `model_rates`, since nothing built-in was relied on.
+
+To correct a price, or to price a model the table has never heard of (which is
+otherwise `← unpriced` and drops out of the `value` basis), add `model_rates`
+to the config file. Rates are USD per million tokens, like the built-in table,
+and all four are required:
+
+```json
+{
+  "model_rates": {
+    "claude-opus-5": { "input": 5, "cache_write": 6.25, "cache_read": 0.5, "output": 25 },
+    "acme-coder":    { "input": 1, "cache_write": 1.25, "cache_read": 0.1, "output": 8,
+                       "family": "openai" }
+  }
+}
+```
+
+- **Matching** is the built-in table's: the key is a model-name prefix, compared
+  case-insensitively with `.` and `-` treated alike, and the longest matching
+  key wins. `claude-opus-5` therefore also prices `claude-opus-5-20260101`, and
+  `gpt-5.5-pro` beats `gpt-5.5` for a Pro model. There are no wildcards.
+- **Precedence**: any matching override beats the built-in table, whatever the
+  length of the built-in prefix. Models no override matches keep their built-in
+  rate.
+- **`family`** (optional) is the subscription pool the model draws on: `claude`,
+  `openai`, `google`, or an alias such as `codex`. Without it the model keeps
+  its built-in family, or else the one its name implies (`claude-*`, `gpt-*`,
+  `gemini-*`). Set it for a model whose name says nothing, or it is excluded
+  from every pool. Clients that bill on their own seat, such as Copilot, stay
+  in their own pool regardless.
+- **Validation** happens before anything is scanned. A negative or non-numeric
+  rate, a missing rate, an unknown `family`, a blank key, or two keys that match
+  the same models (`gpt-5.5` and `gpt-5-5`) stops the run with an error naming
+  the key, for example `invalid "model_rates" configuration: model rate
+  "acme-coder": "output" must be a non-negative number of USD per million
+  tokens, got -3`.
+
+When an override priced a model in the run, the output says so beside the
+rates-as-of line, so the numbers can be audited:
+
+```
+  MODELS  (rates as of 2026-09-02; overridden by model_rates: acme-coder)
+  model                      family    project        pool    share   list value
+  ──────────────────────────────────────────────────────────────────────────────
+  acme-coder-1               openai       1.0M        10.0M    10.0%         $8  ← override
+```
+
+`--format json` carries the same facts as `rate_overrides` (the keys that were
+applied) and a `rate_source` of `override`, `built-in`, or `none` on each model.
+Overrides change only the weighting and the stated list values, never a
+measured quantity.
 
 ### Missing history is not zero usage
 

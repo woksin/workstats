@@ -727,6 +727,9 @@ fn run_allocation(command: AllocateArguments) -> Result<()> {
             currency,
             basis,
             gap_policy,
+            // Filled in by `run`, which owns the loaded config.
+            rate_overrides: pricing::RateOverrides::default(),
+            today: Utc::now().date_naive(),
         }),
     )
 }
@@ -865,6 +868,7 @@ fn run(
     classify::install(config.category_registry()?)?;
     let rules = configured_rules(&config, &arguments.source_rule)?;
     let aliases = config.compiled_project_aliases(&home_dir())?;
+    let rate_overrides = config.compiled_model_rates()?;
     let cache_path = arguments.cache.clone().unwrap_or_else(default_cache_path);
     if arguments.rebuild_cache {
         progress.set("Rebuilding transcript index");
@@ -1198,7 +1202,8 @@ fn run(
         // the per-commit detail the report itself aggregates away.
         return tui::run(&report, commits);
     }
-    if let Some(options) = allocation {
+    if let Some(mut options) = allocation {
+        options.rate_overrides = rate_overrides;
         // A different presentation of the report that was just built, so the
         // numbers behind a claim are the numbers `workstats` would print.
         let allocation = allocate::build(&report.rows, &options);
