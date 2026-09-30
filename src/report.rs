@@ -1045,43 +1045,28 @@ fn inferred_repository_roots<'a>(sessions: impl IntoIterator<Item = &'a Session>
 }
 
 /// How many of the baseline pass's warnings the selected window did not
-/// already show.
+/// already show: a lower bound that never blames the baseline for a warning
+/// the report has.
 ///
-/// While the selected window stored every message, the texts can be compared
-/// one by one, and the baseline's textless overflow counts only as far as the
-/// baseline raised more warnings than the report did. Once the selected window hit the storage cap,
-/// its dropped texts cannot be compared either, and shared warnings are
-/// exactly what fills the cap, so the count falls back to how many more
-/// warnings the baseline raised than the selected window did. That can miss a
-/// baseline-only warning hidden behind a flood the report already reports,
-/// which is the better failure than a line blaming the baseline for the flood.
+/// Only stored texts can be compared, so only they count, each by whether the
+/// selected window showed the same text; a shared text the baseline repeats
+/// is still the report's. Counts are not compared at all, because a
+/// difference in counts cannot tell a warning of the baseline's own from a
+/// shared one raised more often. Past the storage cap the texts are gone:
+/// the baseline's overflow is never counted, and once the selected window
+/// itself hit the cap its dropped texts might be any baseline text, so
+/// nothing is counted. A report already showing that many warnings gains
+/// nothing from one more line, and an undercount there is the better failure
+/// than a line sending the reader to a run that finds nothing new.
 fn baseline_only_warnings(selected: &Diagnostics, baseline: &Diagnostics) -> u64 {
-    let selected_complete = selected.warning_count == selected.messages.len() as u64;
-    if !selected_complete {
-        return baseline
-            .warning_count
-            .saturating_sub(selected.warning_count);
+    if selected.warning_count > selected.messages.len() as u64 {
+        return 0;
     }
-    let unseen = baseline
+    baseline
         .messages
         .iter()
         .filter(|message| !selected.messages.contains(message))
-        .count() as u64;
-    // With every baseline text stored the comparison above is exact; an
-    // excess in count could only be a shared text raised twice.
-    let baseline_complete = baseline.warning_count == baseline.messages.len() as u64;
-    if baseline_complete {
-        return unseen;
-    }
-    // The baseline's overflow past the cap has no texts. It may hold shared
-    // warnings pushed out by the baseline's own earlier ones, so it is not
-    // all new; what is certainly new is either a text the report never
-    // showed or an excess over the report's own count, whichever is larger.
-    unseen.max(
-        baseline
-            .warning_count
-            .saturating_sub(selected.warning_count),
-    )
+        .count() as u64
 }
 
 #[cfg(test)]
@@ -1120,13 +1105,19 @@ mod tests {
         let flood: Vec<&str> = flood.iter().map(String::as_str).collect();
         let selected = warned(&flood);
         assert_eq!(0, baseline_only_warnings(&selected, &warned(&flood)));
-        // With the selected window capped, only an excess can be attributed.
+        // With the selected window capped nothing can be attributed safely.
         let mut more = flood.clone();
         more.push("own");
-        assert_eq!(1, baseline_only_warnings(&selected, &warned(&more)));
+        assert_eq!(0, baseline_only_warnings(&selected, &warned(&more)));
         // When the report stored everything it raised, the baseline's
-        // overflow past the cap counts too, text or no text.
-        assert_eq!(120, baseline_only_warnings(&warned(&[]), &warned(&flood)));
+        // stored texts count and its textless overflow does not.
+        assert_eq!(100, baseline_only_warnings(&warned(&[]), &warned(&flood)));
+        // A shared text repeated past the cap is still the report's.
+        let repeated = vec!["a"; crate::model::MAX_STORED_MESSAGES + 50];
+        assert_eq!(
+            0,
+            baseline_only_warnings(&warned(&["a"]), &warned(&repeated))
+        );
         // Own warnings first push shared ones into the baseline's overflow;
         // those are still the report's, so only the five own ones count.
         let shared: Vec<&str> = flood[..100].to_vec();
