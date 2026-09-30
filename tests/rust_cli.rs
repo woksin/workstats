@@ -2372,12 +2372,13 @@ fn html_report_is_one_self_contained_static_page() {
 /// The working directory of an event is an arbitrary string, which makes it the
 /// cross-platform way to put hostile text in a row label — a directory called
 /// `<script>` cannot exist on Windows, and `record --model` refuses the
-/// characters that matter here.
+/// characters that matter here. The hostile part carries no slash, so it
+/// survives each platform's normalisation of the path around it unchanged.
 #[test]
 fn hostile_row_labels_are_escaped_in_markdown_and_html() {
     let directory = tempdir().unwrap();
     let events = directory.path().join("events.jsonl");
-    let hostile = "/x/<script>alert(1)</script>&\"x\"|`y`";
+    let hostile = "/x/<img src=x onerror=alert(1)>&\"x\"|`y`";
     let line = serde_json::json!({
         "timestamp": "2026-01-01T00:00:00+00:00",
         "provider": "cursor",
@@ -2412,12 +2413,15 @@ fn hostile_row_labels_are_escaped_in_markdown_and_html() {
     };
 
     let html = render("html");
-    assert!(!html.contains("<script"), "{html}");
-    assert!(html.contains("/x/&lt;script&gt;alert(1)&lt;/script&gt;&amp;&quot;x&quot;|`y`"));
+    assert!(!html.contains("<img"), "{html}");
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(1)&gt;&amp;&quot;x&quot;|`y`"),
+        "{html}"
+    );
 
     let markdown = render("markdown");
     assert!(
-        markdown.contains(r#"| /x/\<script\>alert(1)\</script\>\&"x"\|\`y\` |"#),
+        markdown.contains(r#"\<img src=x onerror=alert(1)\>\&"x"\|\`y\` |"#),
         "{markdown}"
     );
     // The row stayed one row: the pipe did not add a column.
