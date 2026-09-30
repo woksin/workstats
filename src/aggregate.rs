@@ -10,10 +10,12 @@ use crate::model::{
 };
 use crate::timeutil::{
     build_session_intervals, calculate_human_time, calendar_days, clip_interval, local_date,
-    local_month, split_interval, union_seconds,
+    local_month, local_week, split_interval, union_seconds,
 };
 
-pub const DIMENSIONS: &[&str] = &["repo", "root", "cwd", "provider", "model", "day", "month"];
+pub const DIMENSIONS: &[&str] = &[
+    "repo", "root", "cwd", "provider", "model", "day", "week", "month",
+];
 
 type SessionKey = (String, String);
 type CommitIdentity = (String, String);
@@ -456,9 +458,7 @@ pub fn build_report_with_human_time_explanation(
             }
         })
         .collect();
-    let calendar = dimensions
-        .iter()
-        .any(|name| name == "day" || name == "month");
+    let calendar = dimensions.iter().any(|name| is_calendar(name));
     rows.sort_by(|left, right| {
         let compare_number =
             |left: f64, right: f64| left.partial_cmp(&right).unwrap_or(Ordering::Equal);
@@ -466,12 +466,14 @@ pub fn build_report_with_human_time_explanation(
             let left_calendar = left
                 .key
                 .get("month")
+                .or_else(|| left.key.get("week"))
                 .or_else(|| left.key.get("day"))
                 .map(String::as_str)
                 .unwrap_or("");
             let right_calendar = right
                 .key
                 .get("month")
+                .or_else(|| right.key.get("week"))
                 .or_else(|| right.key.get("day"))
                 .map(String::as_str)
                 .unwrap_or("");
@@ -917,13 +919,18 @@ fn dimension_keys(
     (group_key, key)
 }
 
+/// The groupings that cut time into buckets. A run may use at most one of them
+/// (the CLI enforces that), which is what lets an interval be split on "the"
+/// calendar dimension.
+fn is_calendar(dimension: &str) -> bool {
+    matches!(dimension, "day" | "week" | "month")
+}
+
 fn keys_for_interval(
     interval: &Interval,
     dimensions: &[String],
 ) -> Vec<(Vec<String>, Vec<String>, Interval)> {
-    let calendar = dimensions
-        .iter()
-        .find(|name| name.as_str() == "day" || name.as_str() == "month");
+    let calendar = dimensions.iter().find(|name| is_calendar(name));
     let pieces = calendar.map_or_else(
         || vec![(String::new(), interval.clone())],
         |dimension| split_interval(interval, dimension),
@@ -946,6 +953,7 @@ fn interval_values(interval: &Interval, calendar_key: &str) -> HashMap<String, S
         ("provider".into(), interval.provider.clone()),
         ("model".into(), interval.model.clone()),
         ("day".into(), calendar_key.to_string()),
+        ("week".into(), calendar_key.to_string()),
         ("month".into(), calendar_key.to_string()),
     ])
 }
@@ -958,6 +966,7 @@ fn signal_values(signal: &HumanSignal) -> HashMap<String, String> {
         ("provider".into(), signal.provider.clone()),
         ("model".into(), signal.model.clone()),
         ("day".into(), local_date(signal.timestamp)),
+        ("week".into(), local_week(signal.timestamp)),
         ("month".into(), local_month(signal.timestamp)),
     ])
 }
@@ -970,6 +979,7 @@ fn session_values(session: &Session, model: &str, first: DateTime<Utc>) -> HashM
         ("provider".into(), session.provider.clone()),
         ("model".into(), model.to_string()),
         ("day".into(), local_date(first)),
+        ("week".into(), local_week(first)),
         ("month".into(), local_month(first)),
     ])
 }
@@ -992,6 +1002,7 @@ fn commit_value(commit: &GitCommit, dimension: &str) -> String {
         // A commit records no model, whoever wrote it.
         "model" => "—".to_string(),
         "day" => local_date(commit.timestamp),
+        "week" => local_week(commit.timestamp),
         "month" => local_month(commit.timestamp),
         _ => String::new(),
     }
@@ -1016,6 +1027,7 @@ fn token_value(token: &TokenRecord, dimension: &str) -> String {
         "provider" => token.provider.clone(),
         "model" => token.model.clone(),
         "day" => local_date(token.timestamp),
+        "week" => local_week(token.timestamp),
         "month" => local_month(token.timestamp),
         _ => String::new(),
     }
@@ -1374,6 +1386,34 @@ mod tests {
             Some(&"2026-05".to_string()),
             report.rows[0].key.get("month")
         );
+    }
+
+    /// 2025-12-27 is in the last week of 2025 and 2026-01-01 in the first of
+    /// 2026; both are a whole day clear of a Monday boundary, so the answer does
+    /// not depend on the timezone the suite runs in.
+    #[test]
+    fn week_rows_cross_a_year_boundary_and_are_sorted_newest_first() {
+        let sessions = vec![
+            session("old", "a", vec![], vec![point("2025-12-27T12:00:00Z")]),
+            session("new", "b", vec![], vec![point("2026-01-01T12:00:00Z")]),
+        ];
+        let report = build_report(
+            &sessions,
+            &[],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &["week".into(), "repo".into()],
+            Duration::minutes(15),
+            Duration::minutes(5),
+        );
+        let weeks: Vec<_> = report
+            .rows
+            .iter()
+            .map(|row| row.key["week"].as_str())
+            .collect();
+        assert_eq!(vec!["2026-W01", "2025-W52"], weeks);
     }
 
     #[test]

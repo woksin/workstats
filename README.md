@@ -258,8 +258,10 @@ workstats ui                               # explore the same report interactive
 workstats --dir ~/projects                 # discover repositories below a directory
 workstats --group-by month,repo            # recent work by month and repo
 workstats --period day --group-by root     # daily trend by source root
+workstats --period week                    # ISO-week trend (2026-W09)
 workstats --since 2026-07 --until 2026-08  # inclusive local calendar bounds
 workstats --month 2026-07                  # filter to one calendar month
+workstats --week last                      # filter to the previous ISO week
 workstats --year last                      # filter to the previous calendar year
 workstats --provider codex,gemini --group-by model
 workstats --exclude-provider copilot
@@ -276,7 +278,7 @@ root, `--depth N` (default 4) bounds how far below it repositories are
 discovered. Retained AI history is always machine-wide, because that is how the
 tools store it: a run in one checkout still sees sessions from everywhere unless
 you narrow it with `--repo`, `--repo-exact`, `--since`/`--until`,
-`--month`/`--year`, or `--provider`. That asymmetry is deliberate and it is why
+`--month`/`--year`/`--week`, or `--provider`. That asymmetry is deliberate and it is why
 *committed output* counts only sessions in repositories Git actually scanned.
 
 `--dir` and `WORKSTATS_DIR` must name a directory that exists. A path that does
@@ -287,8 +289,8 @@ detached checkout still counts — not only the branch you have checked out. A
 commit reachable from several branches or worktrees is counted once.
 Remote-tracking branches are not read, so a `git fetch` never changes a report.
 
-**The author date decides the window.** `--since`, `--until`, `--month` and
-`--year` select commits by when they were *authored*, not when they were last
+**The author date decides the window.** `--since`, `--until`, `--month`,
+`--year` and `--week` select commits by when they were *authored*, not when they were last
 committed, so a commit written in March and rebased or amended in May is still
 March work. (Git's own `--since`/`--until` use the committer date; workstats
 only gives Git a widened lower bound to keep the history walk short and applies
@@ -327,7 +329,7 @@ report flags, but they go **after** the subcommand — `workstats ui --dir .`, n
 Drill down with `Enter`, back out with `Esc`:
 
 ```text
-overview → repository → month or day → file area → commit → changed file → diff
+overview → repository → month, day or week → file area → commit → changed file → diff
 ```
 
 Two levels behave less literally than they look, on purpose. A **commit** lists
@@ -350,7 +352,7 @@ breadcrumb, because "when else did this change?" is the next question. Pressing
 | `s` | fuzzy search repositories, files, and commits |
 | `1`–`9` | sort by that column, numbered in `?` for the level on screen; press again to reverse |
 | `[` `]` / `o` | previous / next sort column; reverse the order |
-| `p` | switch the period between month and day |
+| `p` | cycle the period through month, day and ISO week |
 | `w` / `v` / `d` | save the current view / open saved views / delete the highlighted one in that list |
 | `?` | show or hide the key map and this level's sort keys |
 | `q` / `Ctrl-C` | quit |
@@ -1107,7 +1109,17 @@ Pools with no plan declared take no part in the split at all.
 ## Grouping and filtering
 
 Dimensions can be composed: `root`, `repo`, `cwd`, `provider`, `model`, `day`,
-and `month`. The default is `repo`.
+`week`, and `month`. The default is `repo`. `day`, `week` and `month` cut time
+into buckets, so a run uses at most one of them.
+
+`week` is an ISO 8601 week: it starts on Monday and is labelled `2026-W09`. The
+year in the label is the ISO week-numbering year, which is not always the
+calendar year — Monday 29 December 2025 is in `2026-W01`, and 1 January 2027 is
+still in `2026-W53` (2026 has 53 weeks; most years have 52). Labels are
+zero-padded so they sort chronologically as text, in table, JSON and CSV output
+alike. Like `day` and `month`, weeks are cut on the local calendar, so a
+session that runs across Sunday midnight is split at local Monday 00:00, and a
+week containing a daylight-saving change is simply an hour longer or shorter.
 
 `repo` means the logical Git repository, not the checkout folder. Linked
 worktrees share their Git common directory, and separately named clones that
@@ -1165,11 +1177,13 @@ Three shortcuts exist for the groupings people ask for most: `--by-repo`
 explicit `--group-by`, and combining them is an error rather than one of them
 silently winning.
 
-`--month` and `--year` narrow the window a report covers, exactly as `--since`
-and `--until` do. `--month 2026-07` and `--year 2026` name one outright; both
-also accept `current` (or `this`) and `last` (or `previous`), resolved against
-the local calendar. They cannot be combined with each other or with
-`--since`/`--until`.
+`--month`, `--year` and `--week` narrow the window a report covers, exactly as
+`--since` and `--until` do. `--month 2026-07`, `--year 2026` and
+`--week 2026-W09` name one outright; all three also accept `current` (or `this`)
+and `last` (or `previous`), resolved against the local calendar. A week runs
+Monday to Sunday, and naming one that does not exist (`2025-W53`) is an error
+rather than a neighbouring week. They cannot be combined with each other or
+with `--since`/`--until`.
 
 They are filters, not groupings. `--group-by` and `--period` decide how the rows
 *inside* that window are split, so the two compose rather than compete.
@@ -1178,6 +1192,8 @@ They are filters, not groupings. `--group-by` and `--period` decide how the rows
 workstats --month last                     # the previous calendar month
 workstats --month 2026-07 --group-by repo  # July, one row per repository
 workstats --year 2026 --period month       # 2026, with a month column per row
+workstats --week 2026-W09 --period day     # one ISO week, a row per day
+workstats --month last --period week       # last month's weeks; the edge weeks are partial
 ```
 
 `--depth N` (default 4) bounds Git repository discovery below the scan root.

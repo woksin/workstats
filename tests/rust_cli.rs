@@ -1477,6 +1477,123 @@ fn the_window_is_the_author_date_not_the_committer_date() {
     assert_eq!(3, everything["summary"]["commit_count"]);
 }
 
+/// Dates a whole day clear of any Monday boundary, so the expected ISO weeks
+/// hold in whatever timezone the suite runs in: 27 December 2025 is in the last
+/// week of 2025, 1 and 2 January 2026 are in the first week of 2026.
+#[test]
+fn period_week_groups_by_iso_week_across_a_year_boundary() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "weeks");
+    for (file, authored) in [
+        ("december.rs", "2025-12-27T12:00:00Z"),
+        ("january-a.rs", "2026-01-01T12:00:00Z"),
+        ("january-b.rs", "2026-01-02T12:00:00Z"),
+    ] {
+        fs::write(Path::new(&path).join(file), "line\n").unwrap();
+        assert!(git(&["-C", &path, "add", "."]).status.success());
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &path,
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com",
+                "commit",
+                "-q",
+                "-m",
+                file,
+            ])
+            .env("GIT_AUTHOR_DATE", authored)
+            .env("GIT_COMMITTER_DATE", authored)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let author = ["--author", "fixture@example.com"];
+
+    let weekly = git_report(&path, &[author.as_slice(), &["--period", "week"]].concat());
+    let weeks: Vec<(&str, u64)> = weekly["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["key"]["week"].as_str().unwrap(),
+                row["commit_count"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    // Newest first, like every calendar grouping.
+    assert_eq!(vec![("2026-W01", 2), ("2025-W52", 1)], weeks);
+
+    let first_week = git_report(
+        &path,
+        &[author.as_slice(), &["--week", "2026-W01"]].concat(),
+    );
+    assert_eq!(2, first_week["summary"]["commit_count"]);
+    let last_week = git_report(
+        &path,
+        &[author.as_slice(), &["--week", "2025-W52"]].concat(),
+    );
+    assert_eq!(1, last_week["summary"]["commit_count"]);
+
+    // The same window, asked for with --group-by, renders in the table and CSV.
+    let csv = run(&[
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--group-by",
+        "week",
+        "--format",
+        "csv",
+    ]);
+    assert!(csv.status.success());
+    let csv = String::from_utf8_lossy(&csv.stdout);
+    assert!(
+        csv.lines()
+            .next()
+            .unwrap()
+            .split(',')
+            .any(|name| name == "week")
+    );
+    assert!(csv.contains("2026-W01"), "{csv}");
+    assert!(csv.contains("2025-W52"), "{csv}");
+
+    let table = run(&[
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--period",
+        "week",
+    ]);
+    assert!(table.status.success());
+    assert!(String::from_utf8_lossy(&table.stdout).contains("2026-W01"));
+
+    // A week that does not exist is refused, and so is mixing calendars.
+    let missing = run(&["--no-ai", "--no-git", "--week", "2025-W53"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--week"));
+    let mixed = run(&["--no-ai", "--no-git", "--group-by", "week,month"]);
+    assert_eq!(Some(2), mixed.status.code());
+    let conflicting = run(&[
+        "--no-ai", "--no-git", "--week", "2026-W01", "--month", "2026-01",
+    ]);
+    assert_eq!(Some(2), conflicting.status.code());
+}
+
 #[test]
 fn several_author_identities_are_one_developer() {
     let temporary = tempdir().unwrap();

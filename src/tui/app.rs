@@ -843,6 +843,22 @@ mod tests {
     }
 
     #[test]
+    fn the_period_grain_cycles_through_week_and_back_to_month() {
+        let (mut app, _directory) = app();
+        assert_eq!(Grain::Month, app.grain());
+        app.apply(Action::ToggleGrain);
+        assert_eq!(Grain::Day, app.grain());
+        app.apply(Action::ToggleGrain);
+        assert_eq!(Grain::Week, app.grain());
+        app.apply(Action::Descend);
+        assert_eq!(LevelKind::Repo, app.level());
+        app.apply(Action::Descend);
+        assert_eq!(LevelKind::Period, app.level());
+        app.apply(Action::ToggleGrain);
+        assert_eq!(Grain::Month, app.grain());
+    }
+
+    #[test]
     fn a_saved_view_round_trips_through_the_config_directory() {
         let (mut app, _directory) = app();
         app.apply(Action::Descend);

@@ -583,7 +583,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             counted((report.rows.len() - top) as u64, "more row", "more rows")
         );
     }
-    if let Some(calendar) = ["day", "month"]
+    if let Some(calendar) = ["day", "week", "month"]
         .into_iter()
         .find(|name| report.group_by.iter().any(|dimension| dimension == name))
         && !rows.is_empty()
