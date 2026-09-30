@@ -20,6 +20,12 @@ use crate::timeutil::parse_epoch_milliseconds;
 /// the one workspace that is used daily — an ordinary long-running session, not an
 /// outlier. Recorded as a constant so the ceiling below is checked against evidence
 /// rather than against itself.
+// Rust 1.88 does not count the compile-time assertion below as a use, so outside tests
+// it reports the constant unused; newer compilers do count it.
+#[allow(
+    dead_code,
+    reason = "used by the const assertion below, which 1.88 does not count"
+)]
 pub const LARGEST_OBSERVED_VSCODE_CHAT_BYTES: u64 = 17_853_291;
 
 /// A VS Code chat session is one JSON document too, so the line-bounded discipline the
