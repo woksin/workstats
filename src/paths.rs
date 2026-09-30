@@ -79,6 +79,10 @@ pub struct Config {
     /// The map key is the stable grouping id; `label` is display-only.
     #[serde(default)]
     pub project_aliases: BTreeMap<String, ProjectAliasConfig>,
+    /// Per-model list rates that override the built-in table used by
+    /// `allocate`. The key is a model-name prefix; see `pricing::RateOverrides`.
+    #[serde(default)]
+    pub model_rates: BTreeMap<String, crate::pricing::ModelRateConfig>,
 }
 
 impl Config {
@@ -91,6 +95,11 @@ impl Config {
     pub fn compiled_project_aliases(&self, home: &Path) -> Result<ProjectAliases> {
         ProjectAliases::compile(&self.project_aliases, home)
             .context("invalid \"project_aliases\" configuration")
+    }
+
+    pub fn compiled_model_rates(&self) -> Result<crate::pricing::RateOverrides> {
+        crate::pricing::RateOverrides::from_config(&self.model_rates)
+            .context("invalid \"model_rates\" configuration")
     }
 }
 

@@ -1536,3 +1536,110 @@ fn several_author_identities_are_one_developer() {
     assert_eq!(1, count(&from_flag));
     assert_eq!("c@example.com", from_flag["inputs"]["author"]);
 }
+
+fn allocate_with_config(directory: &Path, config: &str, format: &str) -> Output {
+    let ada = directory.join("ada");
+    let other = directory.join("other");
+    fs::create_dir_all(&ada).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    let history = directory.join("pi-sessions");
+    // A model the built-in table has never heard of, ten times the tokens.
+    pi_session(&history, "a1", &ada, "acme-coder-1", 10);
+    pi_session(&history, "a2", &other, "claude-opus-5", 90);
+    let config_file = directory.join("config.json");
+    fs::write(&config_file, config).unwrap();
+    run(&[
+        "allocate",
+        "-p",
+        "ada",
+        "--sub",
+        "claude=1",
+        "--basis",
+        "value",
+        "--month",
+        "2026-03",
+        "--no-git",
+        "--provider",
+        "pi",
+        "--history",
+        &format!("pi={}", history.display()),
+        "--config",
+        config_file.to_str().unwrap(),
+        "--format",
+        format,
+    ])
+}
+
+/// A model the table lacks is "unpriced" and drops out of the value basis;
+/// a `model_rates` entry prices it, and the output says whose rate was used.
+#[test]
+fn allocate_prices_unknown_models_from_config_rate_overrides() {
+    let directory = tempdir().unwrap();
+    let config = r#"{"model_rates": {"acme-coder": {
+        "input": 0, "cache_write": 0, "cache_read": 0, "output": 25, "family": "claude"}}}"#;
+    let output = allocate_with_config(directory.path(), config, "json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let allocation: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    // Ada's 10 output tokens at $25 against 90 of Opus at $25: a 10% claim
+    // (give or take the one input token the fixture adds). Unpriced, Ada would
+    // have had no value at all.
+    let share = allocation["effective_share"].as_f64().unwrap();
+    assert!((share - 0.1).abs() < 1e-3, "got {share}");
+    assert_eq!(
+        serde_json::json!(["acme-coder"]),
+        allocation["rate_overrides"]
+    );
+    let acme = allocation["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["model"] == "acme-coder-1")
+        .unwrap();
+    assert_eq!("override", acme["rate_source"]);
+    assert_eq!(true, acme["priced"]);
+
+    let table = allocate_with_config(directory.path(), config, "table");
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(
+        text.contains("overridden by model_rates: acme-coder"),
+        "the override must be visible beside the rates-as-of line, got {text}"
+    );
+}
+
+/// A bad override is refused by name rather than silently priced at nonsense.
+#[test]
+fn allocate_refuses_invalid_rate_overrides_naming_the_key() {
+    let directory = tempdir().unwrap();
+    let output = allocate_with_config(
+        directory.path(),
+        r#"{"model_rates": {"acme-coder": {
+            "input": 1, "cache_write": 1, "cache_read": 1, "output": -3}}}"#,
+        "json",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("model_rates")
+            && stderr.contains("acme-coder")
+            && stderr.contains("output"),
+        "got {stderr}"
+    );
+
+    let output = allocate_with_config(
+        directory.path(),
+        r#"{"model_rates": {"acme-coder": {
+            "input": 1, "cache_write": 1, "cache_read": 1, "output": 3, "family": "bedrock"}}}"#,
+        "json",
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("acme-coder") && stderr.contains("bedrock"),
+        "got {stderr}"
+    );
+}
