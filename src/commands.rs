@@ -81,6 +81,12 @@ pub(crate) fn print_sources(arguments: &SourcesArguments) -> Result<()> {
             }
             writer.flush()?;
         }
+        OutputFormat::Markdown | OutputFormat::Html => {
+            bail!(
+                "--format {} is not available for `workstats sources`; use table, json, or csv",
+                arguments.output_format.name()
+            )
+        }
         OutputFormat::Table => {
             println!("AI HISTORY SOURCES\n");
             // Widths hold the longest value each column can carry today —
@@ -145,6 +151,12 @@ pub(crate) fn classify_paths(
                 writer.serialize(item)?;
             }
             writer.flush()?;
+        }
+        OutputFormat::Markdown | OutputFormat::Html => {
+            bail!(
+                "--format {} is not available for `workstats classify`; use table, json, or csv",
+                arguments.output_format.name()
+            )
         }
         OutputFormat::Table => {
             println!("{:<52} {:<10} {:<18} MATCHED", "PATH", "CATEGORY", "RULE");

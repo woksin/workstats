@@ -1,5 +1,5 @@
 //! The report pipeline: reads AI histories and Git, aggregates, and presents
-//! the result as a table, JSON, CSV, the interactive explorer, or an
+//! the result as a table, JSON, CSV, Markdown, HTML, the interactive explorer, or an
 //! allocation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -25,7 +25,7 @@ use crate::cli::{
 };
 use crate::git::{default_git_author, read_agent_commits, read_git_commits};
 use crate::model::{self, Diagnostics, Inputs, Report, Session};
-use crate::output::{print_csv, print_json, print_table};
+use crate::output::{print_csv, print_html, print_json, print_markdown, print_table};
 use crate::paths::{
     PathResolver, configured_rules, default_cache_path, default_update_check_path,
     disambiguated_repository_label, home_dir, load_config,
@@ -194,7 +194,7 @@ pub(crate) fn run(
             .is_some_and(|format| format != OutputFormat::Table)
     {
         bail!(
-            "`workstats ui` is interactive and writes no machine-readable output; drop --format, or run workstats without `ui` for json or csv"
+            "`workstats ui` is interactive and writes no machine-readable output; drop --format, or run workstats without `ui` for json, csv, markdown, or html"
         );
     }
     if presentation == Presentation::Explore
@@ -204,11 +204,16 @@ pub(crate) fn run(
             "explanation flags are not available in `workstats ui`; run workstats with table or JSON output"
         );
     }
-    if output_format == OutputFormat::Csv
-        && (arguments.explain_human_time || arguments.explain_repository_attribution)
+    // A ledger is one-to-many relative to a row, which CSV cannot hold, and the
+    // Markdown and HTML documents deliberately mirror only the report itself.
+    if matches!(
+        output_format,
+        OutputFormat::Csv | OutputFormat::Markdown | OutputFormat::Html
+    ) && (arguments.explain_human_time || arguments.explain_repository_attribution)
     {
         bail!(
-            "explanation flags are not available with --format csv; use table output or --format json"
+            "explanation flags are not available with --format {}; use table output or --format json",
+            output_format.name()
         );
     }
     let gap_cap = duration_flag("--gap-cap", &resolved.gap_cap)?;
@@ -665,12 +670,21 @@ pub(crate) fn run(
             OutputFormat::Json => allocate::print_json(&allocation)?,
             OutputFormat::Csv => allocate::print_csv(&allocation)?,
             OutputFormat::Table => allocate::print_table(&allocation),
+            OutputFormat::Markdown => allocate::print_markdown(&allocation),
+            OutputFormat::Html => allocate::print_html(&allocation),
         }
         return Ok(());
     }
     match output_format {
         OutputFormat::Json => print_json(&report)?,
         OutputFormat::Csv => print_csv(&report)?,
+        // Like json and csv, and unlike the table: no update notice. A document
+        // is going into a file, a PR, or a pipe, and a "new version available"
+        // line would end up published with it.
+        OutputFormat::Markdown => {
+            print_markdown(&report, &diagnostics, arguments.top, arguments.raw)
+        }
+        OutputFormat::Html => print_html(&report, &diagnostics, arguments.top, arguments.raw),
         OutputFormat::Table => {
             print_table(&report, &diagnostics, arguments.top, arguments.raw);
             let update_notice =

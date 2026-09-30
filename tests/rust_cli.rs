@@ -1901,3 +1901,242 @@ fn config_defaults_refuse_unknown_keys_and_bad_values_naming_them() {
         assert!(stderr.contains(expected), "{config}: {stderr}");
     }
 }
+
+/// A one-commit repository to render the report from, plus the flags that
+/// select it alone: no AI history, no cache, no progress line.
+fn document_fixture(temporary: &Path) -> (String, Vec<String>) {
+    let project = temporary.join("project");
+    fs::create_dir_all(&project).unwrap();
+    let path = project.to_str().unwrap().to_string();
+    assert!(git(&["init", "-q", &path]).status.success());
+    commit_as(
+        &path,
+        "src/lib.rs",
+        "one\ntwo\nthree\n",
+        "Fixture <fixture@example.com>",
+        &["areas"],
+    );
+    let arguments = [
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    (path, arguments)
+}
+
+fn run_with_format(base: &[String], format: &str) -> Output {
+    let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+    arguments.extend(["--format", format]);
+    run(&arguments)
+}
+
+#[test]
+fn markdown_report_mirrors_the_table_sections_and_figures() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = document_fixture(temporary.path());
+    let table = run_with_format(&base, "table");
+    let markdown = run_with_format(&base, "markdown");
+    assert!(markdown.status.success());
+    // Nothing but the document on either stream.
+    assert!(markdown.stderr.is_empty());
+    let table = String::from_utf8_lossy(&table.stdout);
+    let markdown = String::from_utf8(markdown.stdout).unwrap();
+
+    assert!(markdown.starts_with("# WORKSTATS\n"), "{markdown}");
+    for heading in [
+        "## Summary",
+        "## Work composition",
+        "## By repo",
+        "## Notes",
+    ] {
+        assert!(markdown.contains(heading), "missing {heading}\n{markdown}");
+    }
+    assert!(markdown.contains("| Measure | Value |\n| --- | --- |"));
+    assert!(
+        markdown
+            .contains("| Work area | Human | Days | Avg/day | Commits | AI wall | Agent work |")
+    );
+    assert!(markdown.contains("| --- | ---: | ---: | ---: | ---: | ---: | ---: |"));
+    // The same formatted figure appears in both views.
+    let human = markdown
+        .lines()
+        .find_map(|line| line.strip_prefix("| Estimated human work | "))
+        .unwrap()
+        .trim_end_matches(" |");
+    assert!(
+        table.contains(&format!("Estimated human work  {human}")),
+        "{table}"
+    );
+    assert!(markdown.contains("| Git lines | +3 / -0 |"));
+    // No update notice, which the table may print after the report.
+    assert!(!markdown.contains("is available"));
+}
+
+#[test]
+fn html_report_is_one_self_contained_static_page() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = document_fixture(temporary.path());
+    let output = run_with_format(&base, "html");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let html = String::from_utf8(output.stdout).unwrap();
+
+    assert!(html.starts_with("<!doctype html>"), "{html}");
+    assert!(html.ends_with("</html>\n"));
+    assert!(html.contains("<style>"));
+    assert!(html.contains("prefers-color-scheme"));
+    assert!(html.contains("<h2>Summary</h2>"));
+    assert!(html.contains("<td class=\"num\">"));
+    // Offline by construction: no script, nothing referenced, nothing fetched.
+    for forbidden in [
+        "http://", "https://", "<script", "<link", "<img", "<iframe", "@import", "url(", " src=",
+        " href=",
+    ] {
+        assert!(!html.contains(forbidden), "found {forbidden}\n{html}");
+    }
+}
+
+/// The working directory of an event is an arbitrary string, which makes it the
+/// cross-platform way to put hostile text in a row label — a directory called
+/// `<script>` cannot exist on Windows, and `record --model` refuses the
+/// characters that matter here.
+#[test]
+fn hostile_row_labels_are_escaped_in_markdown_and_html() {
+    let directory = tempdir().unwrap();
+    let events = directory.path().join("events.jsonl");
+    let hostile = "/x/<script>alert(1)</script>&\"x\"|`y`";
+    let line = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "provider": "cursor",
+        "session_id": "one",
+        "cwd": hostile,
+        "model": "abc",
+        "event": "prompt",
+        "role": "foreground",
+    });
+    fs::write(&events, format!("{line}\n")).unwrap();
+    let render = |format: &str| {
+        let output = run(&[
+            "--no-git",
+            "--provider",
+            "cursor",
+            "--events",
+            events.to_str().unwrap(),
+            "--no-default-events",
+            "--no-cache",
+            "--no-progress",
+            "--group-by",
+            "cwd",
+            "--format",
+            format,
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let html = render("html");
+    assert!(!html.contains("<script"), "{html}");
+    assert!(html.contains("/x/&lt;script&gt;alert(1)&lt;/script&gt;&amp;&quot;x&quot;|`y`"));
+
+    let markdown = render("markdown");
+    assert!(
+        markdown.contains(r#"| /x/\<script\>alert(1)\</script\>\&"x"\|\`y\` |"#),
+        "{markdown}"
+    );
+    // The row stayed one row: the pipe did not add a column.
+    let row = markdown
+        .lines()
+        .find(|line| line.contains("alert(1)"))
+        .unwrap();
+    assert_eq!(8, row.matches('|').count() - row.matches("\\|").count());
+}
+
+#[test]
+fn allocate_renders_markdown_and_html() {
+    let directory = tempdir().unwrap();
+    let ada = directory.path().join("ada");
+    fs::create_dir_all(&ada).unwrap();
+    let history = directory.path().join("pi-sessions");
+    pi_session(&history, "a1", &ada, "claude-opus-5", 60);
+    let render = |format: &str| {
+        let output = run(&[
+            "allocate",
+            "-p",
+            "ada",
+            "--sub",
+            "claude=2",
+            "--price",
+            "200",
+            "--month",
+            "2026-03",
+            "--no-git",
+            "--no-cache",
+            "--no-progress",
+            "--provider",
+            "pi",
+            "--history",
+            &format!("pi={}", history.display()),
+            "--format",
+            format,
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let markdown = render("markdown");
+    assert!(markdown.starts_with("# Allocation\n"), "{markdown}");
+    assert!(markdown.contains("Project: ada"));
+    assert!(
+        markdown
+            .contains("| Month | Family | Subs | Plan/mo | Project | Pool | Share | Owed | Note |")
+    );
+    assert!(markdown.contains("| **Attributable** |"));
+    assert!(markdown.contains("## Cross-check"));
+
+    let html = render("html");
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("<tfoot>"));
+    assert!(!html.contains("<script"), "{html}");
+    assert!(!html.contains("http://") && !html.contains("https://"));
+}
+
+#[test]
+fn markdown_and_html_are_refused_where_they_have_no_meaning() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = document_fixture(temporary.path());
+    for format in ["markdown", "html"] {
+        let sources = run(&["sources", "--format", format]);
+        assert!(!sources.status.success());
+        assert!(
+            String::from_utf8_lossy(&sources.stderr)
+                .contains("not available for `workstats sources`")
+        );
+        let classify = run(&["classify", "src/lib.rs", "--format", format]);
+        assert!(!classify.status.success());
+
+        let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+        arguments.extend(["--explain-human-time", "--format", format]);
+        let explained = run(&arguments);
+        assert!(!explained.status.success());
+        assert!(
+            String::from_utf8_lossy(&explained.stderr)
+                .contains(&format!("not available with --format {format}"))
+        );
+        let ui = run(&["ui", "--format", format]);
+        assert!(!ui.status.success());
+    }
+}

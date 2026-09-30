@@ -372,7 +372,7 @@ error.
 
 The explorer needs an interactive terminal. When stdout is redirected or piped,
 or under `TERM=dumb`, `workstats ui` says so and exits rather than emitting
-escape codes, and `workstats ui --format json|csv` is refused before any
+escape codes, and `workstats ui --format json|csv|markdown|html` is refused before any
 scanning — use `workstats --format json` for machine-readable output.
 
 ### Add any tool or API
@@ -451,20 +451,34 @@ workstats --explain-human-time                     # readable calculation ledger
 workstats --format json --explain-human-time \
   | jq '.human_time_explanation.blocks'            # structured calculation ledger
 workstats --group-by month,repo --format csv > workstats.csv
+workstats --format markdown > workstats.md         # tables for a PR, issue, or wiki
+workstats --format html > workstats.html           # one self-contained page
+workstats allocate -p Ada --sub claude=2 --month 2026-08 --format markdown
 ```
 
 The animated status line lives on stderr and appears only in a real terminal.
 It disables itself when redirected, in CI, or under `TERM=dumb`, so stdout stays
 machine-readable. Use `--no-progress`, `WORKSTATS_NO_PROGRESS=1`, `--no-color`,
 or `NO_COLOR` when you want explicit control. `workstats ui` is interactive
-only — it writes no machine-readable output and refuses `--format json|csv`
-rather than pretending otherwise.
+only — it writes no machine-readable output and refuses `--format
+json|csv|markdown|html` rather than pretending otherwise.
 
 CSV columns for the file areas follow the
 [category registry](#make-the-areas-your-own), so read them by header name.
+`--format markdown` prints GitHub-flavoured tables with the same sections and
+figures as the table view — summary, grouped rows, the agent-authored section,
+notes and warnings — and escapes `|`, backticks, `<` and the other characters
+Markdown acts on in repository names and paths. `--format html` prints one
+static page to stdout: inline CSS only, no JavaScript, no fonts, images or
+links, and a `Content-Security-Policy` of `default-src 'none'`, so it opens
+identically offline and never phones home. It follows the reader's light or
+dark setting, and every value is HTML-escaped. Both work for `workstats` and
+`workstats allocate`; `sources` and `classify` stay table, JSON, or CSV. Like
+JSON and CSV they print no update notice, and progress stays on stderr.
+
 A calculation ledger is one-to-many relative to CSV's grouped rows, so
 `--explain-human-time` supports table and JSON output and deliberately rejects
-`--format csv` rather than silently omitting detail.
+`--format csv`, `markdown`, and `html` rather than silently omitting detail.
 
 ## Why it is fast
 

@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 
 use crate::classify::active_registry;
+use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
 use crate::model::{
     CompositionEntry, Diagnostics, HumanTimeExplanation, MAX_STORED_MESSAGES, Report, ReportRow,
 };
@@ -679,17 +680,32 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             attribution.unresolved_checkouts
         );
     }
-    println!(
-        "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
-        compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
-        compact_number(report.methodology.review_credit_seconds / 60.0)
-    );
-    println!(
-        "Session edges add bounded setup/review time; autonomous AI output does not imply continuous human presence."
-    );
-    println!(
-        "AI wall removes overlap within each row; rows can overlap each other. Agent work sums parallel sessions."
-    );
+    for line in footer_notes(report, diagnostics) {
+        println!("{line}");
+    }
+    // Without these a mistyped --history or --events path produces a clean
+    // looking report with silently missing data.
+    for line in warning_lines(diagnostics) {
+        println!("{line}");
+    }
+}
+
+/// The closing notes of the report, one string per line: how the estimate was
+/// made, what it does not see, and what the run skipped or could not link.
+///
+/// Shared by the table and by the Markdown and HTML documents, so a caveat
+/// cannot be reworded in one and forgotten in the others.
+fn footer_notes(report: &Report, diagnostics: &Diagnostics) -> Vec<String> {
+    let summary = &report.summary;
+    let mut notes = vec![
+        format!(
+            "Human estimate: prompts + foreground session edges + commits; {}m idle ends a block; each block receives {}m setup/review credit.",
+            compact_number(report.methodology.human_idle_threshold_seconds / 60.0),
+            compact_number(report.methodology.review_credit_seconds / 60.0)
+        ),
+        "Session edges add bounded setup/review time; autonomous AI output does not imply continuous human presence.".to_string(),
+        "AI wall removes overlap within each row; rows can overlap each other. Agent work sums parallel sessions.".to_string(),
+    ];
     // Printed whenever the run asked for either pass, even if neither found
     // anything: a reader who turned the flag on needs to know what the report
     // would have done with a match, and a zero is an answer to that question.
@@ -699,24 +715,18 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         || !report.inputs.agent_authors.is_empty()
         || report.inputs.co_authors
     {
-        println!(
-            "Agent-authored commits are output, never attendance: they add no human time, no work blocks, and no active work days. A Co-authored-by trailer describes a commit you already wrote — it never adds one."
-        );
+        notes.push("Agent-authored commits are output, never attendance: they add no human time, no work blocks, and no active work days. A Co-authored-by trailer describes a commit you already wrote — it never adds one.".to_string());
     }
     if report.inputs.repo_filter.is_some() || report.inputs.repo_exact_filter.is_some() {
-        println!(
-            "Scope note: work blocks are recomputed from the selected repositories, so filtered totals can differ from an all-repo row."
-        );
+        notes.push("Scope note: work blocks are recomputed from the selected repositories, so filtered totals can differ from an all-repo row.".to_string());
     }
-    println!(
-        "Local retained history only. Missing/pruned transcripts and work on other machines are not visible."
-    );
+    notes.push("Local retained history only. Missing/pruned transcripts and work on other machines are not visible.".to_string());
     if diagnostics.malformed_lines != 0
         || diagnostics.unreadable_files != 0
         || diagnostics.git_errors != 0
         || diagnostics.approximate_cwds != 0
     {
-        println!(
+        notes.push(format!(
             "Diagnostics: {}, {}, {}, {}.",
             counted(
                 diagnostics.malformed_lines,
@@ -734,7 +744,7 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                 "approximate working directory",
                 "approximate working directories"
             ),
-        );
+        ));
     }
     if diagnostics.content_rejections != 0 {
         // "directories" above and "record" here are the same rule: the noun
@@ -744,16 +754,16 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         } else {
             ("records", "were")
         };
-        println!(
+        notes.push(format!(
             "Privacy: {} {records} carrying prompt or response text {verb} skipped, as designed.",
             number(diagnostics.content_rejections)
-        );
+        ));
     }
     if let Some(note) = repository_conflict_note(diagnostics.repository_conflicts) {
-        println!("{note}");
+        notes.push(note);
     }
     if diagnostics.unresolved_repository_cwds != 0 {
-        println!(
+        notes.push(format!(
             "Repository attribution: {} could not be linked{}; use --explain-repository-attribution.",
             counted(
                 diagnostics.unresolved_repository_cwds,
@@ -768,16 +778,467 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
                     diagnostics.repository_history_ambiguities
                 )
             }
-        );
+        ));
     }
-    // Without these a mistyped --history or --events path produces a clean
-    // looking report with silently missing data.
-    for message in diagnostics.messages.iter().take(MAX_PRINTED_MESSAGES) {
-        println!("Warning: {}", safe_message(message));
+    notes
+}
+
+/// The warnings the table prints, each already prefixed and made safe to draw,
+/// with the footer that says how many were left out.
+fn warning_lines(diagnostics: &Diagnostics) -> Vec<String> {
+    let mut lines: Vec<String> = diagnostics
+        .messages
+        .iter()
+        .take(MAX_PRINTED_MESSAGES)
+        .map(|message| format!("Warning: {}", safe_message(message)))
+        .collect();
+    lines.extend(hidden_messages_note(diagnostics.warning_count));
+    lines
+}
+
+/// The report as a `Document`, for the Markdown and HTML renderers.
+///
+/// It mirrors the sections `print_table` prints, in the same order and under
+/// the same headings, and takes every figure from the same fields through the
+/// same formatters — `hours`, `number`, `counted`, `compact_tokens` — so a
+/// number pasted into a PR is the number the terminal showed. Two deliberate
+/// differences: a row label is not clipped to 38 columns, because a document
+/// has no column to protect, and the explanation ledgers are absent, which
+/// `run` refuses up front rather than dropping them here.
+fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) -> Document {
+    let summary = &report.summary;
+    let mut blocks = vec![
+        Block::Paragraph("Human involvement across local projects".to_string()),
+        Block::Section("Summary".to_string()),
+    ];
+
+    let mut facts = vec![
+        (
+            "Estimated human work".to_string(),
+            hours(summary.human_estimated_seconds),
+        ),
+        (
+            "Active work days".to_string(),
+            number(summary.human_active_days),
+        ),
+        (
+            "Average / active day".to_string(),
+            hours(summary.average_human_seconds_per_active_day),
+        ),
+        (
+            "Work blocks".to_string(),
+            format!(
+                "{} ({} + {} + {})",
+                number(summary.work_block_count),
+                counted(
+                    summary.foreground_session_edge_signal_count as u64,
+                    "foreground session edge",
+                    "foreground session edges"
+                ),
+                counted(summary.prompt_signal_count as u64, "prompt", "prompts"),
+                counted(summary.commit_signal_count as u64, "commit", "commits")
+            ),
+        ),
+        ("Git commits".to_string(), number(summary.commit_count)),
+        (
+            "Git lines".to_string(),
+            format!(
+                "+{} / -{}",
+                number(summary.additions),
+                number(summary.deletions)
+            ),
+        ),
+    ];
+    if summary.ignored_additions != 0 || summary.ignored_deletions != 0 {
+        facts.push((
+            "Ignored Git lines".to_string(),
+            format!(
+                "+{} / -{}",
+                number(summary.ignored_additions),
+                number(summary.ignored_deletions)
+            ),
+        ));
     }
-    if let Some(note) = hidden_messages_note(diagnostics.warning_count) {
-        println!("{note}");
+    if summary.agent_commit_count != 0 {
+        facts.push((
+            "Agent-authored".to_string(),
+            format!(
+                "{}, +{} / -{} (output only — no human time)",
+                counted(summary.agent_commit_count as u64, "commit", "commits"),
+                number(summary.agent_additions),
+                number(summary.agent_deletions)
+            ),
+        ));
     }
+    if summary.ai_assisted_commit_count != 0 || summary.autofix_assisted_commit_count != 0 {
+        let autofix = if summary.autofix_assisted_commit_count == 0 {
+            String::new()
+        } else {
+            format!(
+                " (+ {} Copilot Autofix)",
+                number(summary.autofix_assisted_commit_count)
+            )
+        };
+        facts.push((
+            "Co-authored by AI".to_string(),
+            format!(
+                "{} of the {} above{autofix}",
+                number(summary.ai_assisted_commit_count),
+                counted(summary.commit_count as u64, "commit", "commits")
+            ),
+        ));
+    }
+    if let Some(first) = &report.observed.first_seen {
+        let last = report.observed.last_seen.as_deref().unwrap_or(first);
+        facts.push((
+            "Observed".to_string(),
+            format!("{} → {}", local_date(first), local_date(last)),
+        ));
+    }
+    blocks.push(Block::Facts(facts));
+
+    if summary.session_count != 0 {
+        let concurrency = if summary.agent_wall_seconds == 0.0 {
+            0.0
+        } else {
+            summary.parallel_agent_seconds / summary.agent_wall_seconds
+        };
+        blocks.push(Block::Section(
+            "AI activity (context only — these are not human hours)".to_string(),
+        ));
+        let mut facts = vec![
+            (
+                "Agent wall clock".to_string(),
+                format!(
+                    "{} (any agent active, overlap removed)",
+                    hours(summary.agent_wall_seconds)
+                ),
+            ),
+            (
+                "Parallel agent work".to_string(),
+                format!(
+                    "{} ({concurrency:.1}× concurrency)",
+                    hours(summary.parallel_agent_seconds)
+                ),
+            ),
+            (
+                "Sessions".to_string(),
+                format!(
+                    "{} ({} foreground, {})",
+                    number(summary.session_count),
+                    number(summary.foreground_session_count),
+                    counted(
+                        summary.subagent_session_count as u64,
+                        "subagent",
+                        "subagents"
+                    )
+                ),
+            ),
+        ];
+        if summary.total_tokens != 0 {
+            facts.push((
+                "Tokens".to_string(),
+                format!(
+                    "{} ({} in, {} out, {} cached)",
+                    compact_tokens(summary.total_tokens),
+                    compact_tokens(summary.input_tokens),
+                    compact_tokens(summary.output_tokens),
+                    compact_tokens(summary.cache_read_tokens + summary.cache_creation_tokens)
+                ),
+            ));
+        }
+        let comparable_sessions =
+            summary.foreground_sessions_with_commits + summary.foreground_sessions_without_commits;
+        if comparable_sessions != 0 {
+            let without = if summary.foreground_sessions_without_commits == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; {} left no commit — reading, review, or uncommitted work",
+                    number(summary.foreground_sessions_without_commits)
+                )
+            };
+            facts.push((
+                "Committed output".to_string(),
+                format!(
+                    "{} of {} in repos with visible commits{without}",
+                    number(summary.foreground_sessions_with_commits),
+                    counted(
+                        comparable_sessions as u64,
+                        "foreground session",
+                        "foreground sessions"
+                    )
+                ),
+            ));
+        }
+        blocks.push(Block::Facts(facts));
+        if raw {
+            push_raw_lists(&mut blocks, summary);
+        }
+    }
+
+    if !summary.composition.is_empty() {
+        blocks.push(Block::Section(
+            "Work composition (changed Git lines by file area)".to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Area"),
+                Column::number("Files"),
+                Column::number("Added"),
+                Column::number("Removed"),
+                Column::number("Share"),
+            ],
+            summary
+                .composition
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.category.clone(),
+                        number(entry.files),
+                        format!("+{}", number(entry.additions)),
+                        format!("-{}", number(entry.deletions)),
+                        percent(entry.share_of_changed_lines),
+                    ]
+                })
+                .collect(),
+        )));
+        if let Some(ratio) = test_to_source_ratio(&summary.composition) {
+            blocks.push(Block::Paragraph(format!(
+                "Test lines per source line: {ratio:.2}"
+            )));
+        }
+    }
+
+    if !summary.change_shapes.is_empty() {
+        blocks.push(Block::Section(
+            "Change shapes (from diff composition only — commit messages are never read)"
+                .to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Shape"),
+                Column::number("Commits"),
+                Column::number("Share"),
+            ],
+            summary
+                .change_shapes
+                .iter()
+                .map(|entry| {
+                    vec![
+                        entry.shape.to_string(),
+                        number(entry.commits),
+                        percent(entry.share_of_classified_commits),
+                    ]
+                })
+                .collect(),
+        )));
+    }
+
+    let show_tokens = report.rows.iter().any(|row| row.total_tokens != 0);
+    blocks.push(Block::Section(format!(
+        "By {} (human involvement first; AI wall clock shown as context)",
+        report.group_by.join(" × ")
+    )));
+    let mut columns = vec![
+        Column::text("Work area"),
+        Column::number("Human"),
+        Column::number("Days"),
+        Column::number("Avg/day"),
+        Column::number("Commits"),
+        Column::number("AI wall"),
+        Column::number("Agent work"),
+    ];
+    if show_tokens {
+        columns.push(Column::number("Tokens"));
+    }
+    let rows = if top == 0 {
+        &report.rows[..]
+    } else {
+        &report.rows[..report.rows.len().min(top)]
+    };
+    blocks.push(Block::Table(Table::new(
+        columns,
+        rows.iter()
+            .map(|row| {
+                let mut cells = vec![
+                    label(row, &report.group_by),
+                    hours(row.human_estimated_seconds),
+                    number(row.human_active_days),
+                    hours(row.average_human_seconds_per_active_day),
+                    number(row.commit_count),
+                    hours(row.ai_wall_seconds),
+                    hours(row.parallel_agent_seconds),
+                ];
+                if show_tokens {
+                    cells.push(compact_tokens(row.total_tokens));
+                }
+                cells
+            })
+            .collect(),
+    )));
+    if top != 0 && report.rows.len() > top {
+        blocks.push(Block::Paragraph(format!(
+            "… {}; use --top 0",
+            counted((report.rows.len() - top) as u64, "more row", "more rows")
+        )));
+    }
+    if let Some(calendar) = ["day", "month"]
+        .into_iter()
+        .find(|name| report.group_by.iter().any(|dimension| dimension == name))
+        && !rows.is_empty()
+    {
+        let scope = if rows.len() < report.rows.len() {
+            format!(
+                "the {} above only, oldest → newest",
+                counted(rows.len() as u64, "row", "rows")
+            )
+        } else {
+            "oldest → newest".to_string()
+        };
+        blocks.push(Block::Paragraph(format!(
+            "Human-work trend {} ({scope}; the table lists rows newest first)",
+            spark(&trend_totals(rows, calendar))
+        )));
+    }
+
+    let agent_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.agent_commit_count != 0)
+        .collect();
+    if !agent_rows.is_empty() {
+        blocks.push(Block::Section(
+            "Agent-authored Git output (landed code you did not type — no human time, no work blocks)"
+                .to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Work area"),
+                Column::number("Commits"),
+                Column::number("Added"),
+                Column::number("Removed"),
+            ],
+            agent_rows
+                .iter()
+                .map(|row| {
+                    vec![
+                        label(row, &report.group_by),
+                        number(row.agent_commit_count),
+                        format!("+{}", number(row.agent_additions)),
+                        format!("-{}", number(row.agent_deletions)),
+                    ]
+                })
+                .collect(),
+        )));
+        let shown: usize = agent_rows.iter().map(|row| row.agent_commit_count).sum();
+        if let Some(hidden) = summary
+            .agent_commit_count
+            .checked_sub(shown)
+            .filter(|hidden| *hidden != 0)
+        {
+            blocks.push(Block::Paragraph(format!(
+                "… {hidden} more in rows not shown; use --top 0"
+            )));
+        }
+    }
+
+    blocks.push(Block::Section("Notes".to_string()));
+    blocks.push(Block::List(footer_notes(report, diagnostics)));
+    let warnings = warning_lines(diagnostics);
+    if !warnings.is_empty() {
+        blocks.push(Block::Section("Warnings".to_string()));
+        blocks.push(Block::List(warnings));
+    }
+
+    Document {
+        title: "WORKSTATS".to_string(),
+        blocks,
+    }
+}
+
+/// The `--raw` provider and model lists, as the tables the table view draws as
+/// indented columns.
+fn push_raw_lists(blocks: &mut Vec<Block>, summary: &crate::model::Summary) {
+    if !summary.provider_seconds.is_empty() {
+        blocks.push(Block::Section(
+            "Parallel agent work by provider (may overlap)".to_string(),
+        ));
+        blocks.push(Block::Table(Table::new(
+            vec![Column::text("Provider"), Column::number("Agent work")],
+            summary
+                .provider_seconds
+                .iter()
+                .map(|(provider, seconds)| vec![provider.clone(), hours(*seconds)])
+                .collect(),
+        )));
+    }
+    if !summary.model_seconds.is_empty() {
+        blocks.push(Block::Section(
+            "Parallel agent work by model (all providers together)".to_string(),
+        ));
+        let (models, omitted) = ranked_models(&summary.model_seconds, f64::total_cmp);
+        blocks.push(Block::Table(Table::new(
+            vec![Column::text("Model"), Column::number("Agent work")],
+            models
+                .into_iter()
+                .map(|(model, seconds)| vec![model, hours(seconds)])
+                .collect(),
+        )));
+        push_omitted_models(blocks, omitted);
+    }
+    if summary.total_tokens != 0 {
+        if !summary.provider_tokens.is_empty() {
+            blocks.push(Block::Section("Tokens by provider".to_string()));
+            blocks.push(Block::Table(Table::new(
+                vec![Column::text("Provider"), Column::number("Tokens")],
+                summary
+                    .provider_tokens
+                    .iter()
+                    .map(|(provider, tokens)| vec![provider.clone(), compact_tokens(*tokens)])
+                    .collect(),
+            )));
+        }
+        if !summary.model_tokens.is_empty() {
+            blocks.push(Block::Section(
+                "Tokens by model (all providers together)".to_string(),
+            ));
+            let (models, omitted) = ranked_models(&summary.model_tokens, u64::cmp);
+            blocks.push(Block::Table(Table::new(
+                vec![Column::text("Model"), Column::number("Tokens")],
+                models
+                    .into_iter()
+                    .map(|(model, tokens)| vec![model, compact_tokens(tokens)])
+                    .collect(),
+            )));
+            push_omitted_models(blocks, omitted);
+        }
+    }
+}
+
+fn push_omitted_models(blocks: &mut Vec<Block>, omitted: usize) {
+    if omitted != 0 {
+        blocks.push(Block::Paragraph(format!(
+            "… {}; use --format json for all of them.",
+            counted(omitted as u64, "more model", "more models")
+        )));
+    }
+}
+
+/// `--format markdown`: the report as GitHub-flavoured Markdown, for a PR, an
+/// issue, or a wiki page.
+pub fn print_markdown(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
+    print!(
+        "{}",
+        render_markdown(&report_document(report, diagnostics, top, raw))
+    );
+}
+
+/// `--format html`: the report as one self-contained static page.
+pub fn print_html(report: &Report, diagnostics: &Diagnostics, top: usize, raw: bool) {
+    print!(
+        "{}",
+        render_html(&report_document(report, diagnostics, top, raw))
+    );
 }
 
 /// One line for every Copilot session whose stored repository slug disagreed
@@ -877,7 +1338,7 @@ const REPLACEMENT: char = '·';
 ///
 /// Each replacement is one character wide, so a caller that has already counted
 /// a column's width still gets the number of cells it counted.
-fn safe_text(value: &str) -> String {
+pub(crate) fn safe_text(value: &str) -> String {
     value
         .chars()
         .map(|character| {
@@ -1210,6 +1671,7 @@ fn spark(values: &[f64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::escape_markdown;
     use crate::model::{Inputs, Methodology, Observed, Summary};
 
     #[test]
@@ -1729,6 +2191,79 @@ mod tests {
         // `--top 2` hides the tall March row, so its bar goes too.
         assert_eq!(vec![30.0, 60.0], trend_totals(&rows[..2], "month"));
         assert_eq!("▄█", spark(&trend_totals(&rows[..2], "month")));
+    }
+
+    fn hostile_report() -> Report {
+        let mut report = report_with(vec!["repo".to_string()]);
+        let mut row = row_with(Vec::new());
+        row.key
+            .insert("repo".to_string(), "<script>&\"x\"|y".to_string());
+        row.agent_commit_count = 2;
+        report.summary.agent_commit_count = 2;
+        report.rows.push(row);
+        report
+            .diagnostics
+            .messages
+            .push("bad <b>path</b>\n| x".to_string());
+        report.diagnostics.warning_count = 1;
+        report
+    }
+
+    #[test]
+    fn a_hostile_repository_name_is_escaped_in_the_html_document() {
+        let report = hostile_report();
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(html.contains("&lt;script&gt;&amp;&quot;x&quot;|y"));
+        assert!(html.contains("Warning: bad &lt;b&gt;path&lt;/b&gt;·| x"));
+    }
+
+    #[test]
+    fn a_hostile_repository_name_cannot_break_a_markdown_table() {
+        let report = hostile_report();
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        // Once in the work table and once in the agent-authored section.
+        assert_eq!(
+            2,
+            markdown.matches("| \\<script\\>\\&\"x\"\\|y |").count(),
+            "{markdown}"
+        );
+        // The newline in the warning became a character, not a new line.
+        assert!(markdown.contains("- Warning: bad \\<b\\>path\\</b\\>·\\| x\n"));
+    }
+
+    #[test]
+    fn the_document_has_the_sections_the_table_has() {
+        let mut report = hostile_report();
+        report.summary.session_count = 1;
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        for heading in [
+            "## Summary",
+            "## AI activity (context only — these are not human hours)",
+            "## By repo (human involvement first; AI wall clock shown as context)",
+            "## Agent-authored Git output",
+            "## Notes",
+            "## Warnings",
+        ] {
+            assert!(markdown.contains(heading), "missing {heading}\n{markdown}");
+        }
+        // The notes are the same sentences the table prints.
+        for note in footer_notes(&report, &report.diagnostics) {
+            assert!(markdown.contains(&escape_markdown(&note)), "missing {note}");
+        }
+    }
+
+    #[test]
+    fn top_limits_the_document_rows_and_says_so() {
+        let mut report = hostile_report();
+        report.rows.push(row_with(Vec::new()));
+        report.rows.push(row_with(Vec::new()));
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 1, false));
+        assert!(
+            markdown.contains("… 2 more rows; use --top 0"),
+            "{markdown}"
+        );
     }
 
     fn calendar_row(month: &str, human_estimated_seconds: f64) -> ReportRow {

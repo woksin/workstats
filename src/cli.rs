@@ -21,6 +21,25 @@ pub(crate) enum OutputFormat {
     Table,
     Json,
     Csv,
+    /// GitHub-flavoured tables for a PR, issue, or wiki. The report and
+    /// `allocate` only: `sources` and `classify` print records, not reports.
+    Markdown,
+    /// One self-contained static page: inline CSS, no script, nothing fetched.
+    /// The report and `allocate` only.
+    Html,
+}
+
+impl OutputFormat {
+    /// The spelling `--format` takes, for messages that name the flag.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Markdown => "markdown",
+            Self::Html => "html",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Serialize)]

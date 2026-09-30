@@ -26,6 +26,7 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use serde::Serialize;
 
+use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
 use crate::model::ReportRow;
 use crate::output::number;
 use crate::pricing::{self, RATES_AS_OF, RateOverrides, RateSource};
@@ -1025,6 +1026,288 @@ fn print_breakdown(allocation: &Allocation) {
         }
     }
     println!();
+}
+
+/// The allocation as a `Document` for the Markdown and HTML renderers.
+///
+/// Mirrors `print_table` and `print_breakdown` section for section and formats
+/// every figure with the same helpers (`money`, `metric_short`,
+/// `tokens_short`), so an amount pasted into an invoice note is the amount the
+/// terminal printed. Names are not truncated: a document has no column to keep
+/// aligned.
+fn allocation_document(allocation: &Allocation) -> Document {
+    let window = match allocation.months.as_slice() {
+        [] => "no data".to_string(),
+        [only] => only.clone(),
+        [first, .., last] => format!("{first} → {last}"),
+    };
+    let total: u32 = allocation
+        .subscriptions
+        .values()
+        .map(|plan| plan.count)
+        .sum();
+    let tax = if allocation.vat_percent > 0.0 {
+        format!(" incl. {}% tax", trim_percent(allocation.vat_percent))
+    } else {
+        String::new()
+    };
+    let currency = allocation.currency.as_str();
+    let mut blocks = vec![
+        Block::Paragraph(format!(
+            "Project: {}",
+            if allocation.projects.is_empty() {
+                "every project".to_string()
+            } else {
+                allocation.projects.join(", ")
+            }
+        )),
+        Block::Paragraph(format!(
+            "{window} · {} subscription{} · {} billed{tax} · basis: {}",
+            total,
+            if total == 1 { "" } else { "s" },
+            money(allocation.billed, currency),
+            allocation.basis.label()
+        )),
+    ];
+
+    if allocation.breakdown.is_empty() {
+        push_period_blocks(&mut blocks, allocation);
+    } else {
+        push_breakdown_blocks(&mut blocks, allocation);
+    }
+
+    if !allocation.warnings.is_empty() {
+        blocks.push(Block::Section("Warnings".to_string()));
+        blocks.push(Block::List(allocation.warnings.clone()));
+    }
+    if allocation.breakdown.is_empty() {
+        blocks.push(Block::Paragraph(
+            "List value is the pay-per-token price of this usage, shown as a ceiling and as the weight between models. It is not an amount owed: a subscription is what you paid.".to_string(),
+        ));
+    }
+
+    Document {
+        title: "Allocation".to_string(),
+        blocks,
+    }
+}
+
+fn push_period_blocks(blocks: &mut Vec<Block>, allocation: &Allocation) {
+    let currency = allocation.currency.as_str();
+    blocks.push(Block::Section("Subscription spend by month".to_string()));
+    let mut periods = Table::new(
+        vec![
+            Column::text("Month"),
+            Column::text("Family"),
+            Column::number("Subs"),
+            Column::number("Plan/mo"),
+            Column::number("Project"),
+            Column::number("Pool"),
+            Column::number("Share"),
+            Column::number("Owed"),
+            Column::text("Note"),
+        ],
+        allocation
+            .periods
+            .iter()
+            .map(|period| {
+                vec![
+                    period.month.clone(),
+                    period.family.clone(),
+                    period.subscriptions.to_string(),
+                    money(period.plan_price, currency),
+                    metric_short(period.project_metric, allocation.basis, currency),
+                    metric_short(period.pool_metric, allocation.basis, currency),
+                    format!("{:.1}%", period.share * 100.0),
+                    money(period.amount, currency),
+                    period.note.to_string(),
+                ]
+            })
+            .collect(),
+    );
+    periods.total = Some(vec![
+        "Attributable".to_string(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        format!("{:.1}%", allocation.effective_share * 100.0),
+        money(allocation.attributable, currency),
+        String::new(),
+    ]);
+    blocks.push(Block::Table(periods));
+    if allocation.documented < allocation.billed {
+        blocks.push(Block::Paragraph(format!(
+            "of {} documented — {} of {} billed has no surviving history",
+            money(allocation.documented, currency),
+            money(allocation.billed - allocation.documented, currency),
+            money(allocation.billed, currency)
+        )));
+    }
+
+    let models: Vec<Vec<String>> = allocation
+        .models
+        .iter()
+        .filter(|model| model.project_tokens != 0 || model.pool_tokens != 0)
+        .map(|model| {
+            vec![
+                model.model.clone(),
+                model.family.clone(),
+                tokens_short(model.project_tokens),
+                tokens_short(model.pool_tokens),
+                format!("{:.1}%", model.share * 100.0),
+                money(model.project_list_value, currency),
+                match model.rate_source {
+                    "override" => "override",
+                    "none" => "unpriced",
+                    _ => "",
+                }
+                .to_string(),
+            ]
+        })
+        .collect();
+    if !allocation.models.is_empty() {
+        blocks.push(Block::Section(format!(
+            "Models ({})",
+            rates_note(allocation)
+        )));
+        blocks.push(Block::Table(Table::new(
+            vec![
+                Column::text("Model"),
+                Column::text("Family"),
+                Column::number("Project"),
+                Column::number("Pool"),
+                Column::number("Share"),
+                Column::number("List value"),
+                Column::text("Rate"),
+            ],
+            models,
+        )));
+    }
+
+    blocks.push(Block::Section(
+        "Cross-check (same window, every basis)".to_string(),
+    ));
+    let mut ordered: Vec<&CrossCheckRow> = allocation.cross_check.iter().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .share
+            .partial_cmp(&left.share)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    blocks.push(Block::Table(Table::new(
+        vec![
+            Column::text("Basis"),
+            Column::number("Share"),
+            Column::number("Amount"),
+            Column::text("Note"),
+        ],
+        ordered
+            .into_iter()
+            .map(|row| {
+                let mut notes = Vec::new();
+                if !row.measured {
+                    notes.push("estimated, not provider-recorded");
+                }
+                if row.basis == allocation.basis {
+                    notes.push("selected basis");
+                }
+                vec![
+                    row.label.to_string(),
+                    format!("{:.1}%", row.share * 100.0),
+                    money(row.amount, currency),
+                    notes.join("; "),
+                ]
+            })
+            .collect(),
+    )));
+}
+
+fn push_breakdown_blocks(blocks: &mut Vec<Block>, allocation: &Allocation) {
+    let currency = allocation.currency.as_str();
+    let pools: Vec<&String> = allocation.subscriptions.keys().collect();
+    let mut columns = vec![Column::text("Project")];
+    columns.extend(pools.iter().map(|pool| Column::number(pool.as_str())));
+    columns.extend([
+        Column::number("Total"),
+        Column::number("%"),
+        Column::number("Output tokens"),
+        Column::number("Tokens"),
+    ]);
+
+    let shown = if allocation.top == 0 {
+        allocation.breakdown.len()
+    } else {
+        allocation.top.min(allocation.breakdown.len())
+    };
+    let mut rows: Vec<Vec<String>> =
+        allocation.breakdown[..shown]
+            .iter()
+            .map(|project| {
+                let mut cells = vec![project.project.clone()];
+                cells.extend(pools.iter().map(|pool| {
+                    money(project.amounts.get(*pool).copied().unwrap_or(0.0), currency)
+                }));
+                cells.extend([
+                    money(project.total, currency),
+                    format!("{:.1}%", project.share_of_billed * 100.0),
+                    tokens_short(project.output_tokens),
+                    tokens_short(project.total_tokens),
+                ]);
+                cells
+            })
+            .collect();
+    if shown < allocation.breakdown.len() {
+        let rest = &allocation.breakdown[shown..];
+        let total: f64 = rest.iter().map(|project| project.total).sum();
+        let mut cells = vec![format!("({} smaller projects)", rest.len())];
+        cells.extend(pools.iter().map(|_| String::new()));
+        cells.extend([
+            money(total, currency),
+            format!("{:.1}%", total / allocation.billed * 100.0),
+            String::new(),
+            String::new(),
+        ]);
+        rows.push(cells);
+    }
+    let mut totals = vec!["Total".to_string()];
+    totals.extend(pools.iter().map(|pool| {
+        let sum: f64 = allocation
+            .breakdown
+            .iter()
+            .map(|project| project.amounts.get(*pool).copied().unwrap_or(0.0))
+            .sum();
+        money(sum, currency)
+    }));
+    totals.extend([
+        money(allocation.billed, currency),
+        format!("{:.1}%", 100.0),
+        String::new(),
+        String::new(),
+    ]);
+    let mut table = Table::new(columns, rows);
+    table.total = Some(totals);
+    blocks.push(Block::Section("Projects".to_string()));
+    blocks.push(Block::Table(table));
+    // The models table is not shown here, so this is the only place the
+    // breakdown says whose rates the list-price numbers rest on.
+    if !allocation.rate_overrides.is_empty() {
+        blocks.push(Block::Paragraph(format!(
+            "Rates: {}",
+            rates_note(allocation)
+        )));
+    }
+}
+
+/// `--format markdown` for `allocate`.
+pub fn print_markdown(allocation: &Allocation) {
+    print!("{}", render_markdown(&allocation_document(allocation)));
+}
+
+/// `--format html` for `allocate`.
+pub fn print_html(allocation: &Allocation) {
+    print!("{}", render_html(&allocation_document(allocation)));
 }
 
 pub fn print_json(allocation: &Allocation) -> Result<()> {
