@@ -569,8 +569,13 @@ mod tests {
         assert_eq!(0, parsed.diagnostics.malformed_lines);
         assert_eq!(1, parsed.sessions.len());
         let session = &parsed.sessions[0];
+        // The id carries the path relative to the history root, written with
+        // the platform's own separator.
         assert_eq!(
-            "claude-fixture:-home-example-project/session.jsonl",
+            format!(
+                "claude-fixture:-home-example-project{}session.jsonl",
+                std::path::MAIN_SEPARATOR
+            ),
             session.session_id
         );
         assert_eq!("/home/example/project", session.cwd);
