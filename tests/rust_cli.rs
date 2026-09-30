@@ -1410,6 +1410,151 @@ fn commits_on_other_local_branches_are_counted_once() {
     assert_eq!(3, report["summary"]["commit_count"]);
 }
 
+/// Git is asked for `--numstat` only for the commits inside the window. A
+/// wrapper around the real Git, named through `WORKSTATS_GIT`, records what
+/// reaches the diff phase on its standard input.
+#[cfg(unix)]
+#[test]
+fn only_in_window_commits_are_diffed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "history");
+    commit_on(&path, "src/jan.rs", "1\n", "2026-01-10");
+    commit_on(&path, "src/feb.rs", "1\n2\n", "2026-02-10");
+    commit_on(&path, "src/mar.rs", "1\n2\n3\n", "2026-03-10");
+    // A later commit and a rebase-style one: authored in February, committed in
+    // April. It belongs to February, so it must be diffed for February.
+    fs::write(Path::new(&path).join("src/rebased.rs"), "1\n").unwrap();
+    assert!(git(&["-C", &path, "add", "."]).status.success());
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &path,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "rebased",
+            "--author=Fixture <fixture@example.com>",
+        ])
+        .env("GIT_AUTHOR_DATE", "2026-02-20T12:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-04-01T12:00:00Z")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let shas = |extra: &[&str]| -> Vec<String> {
+        let mut arguments = vec!["-C", path.as_str(), "log", "--all", "--format=%H %s"];
+        arguments.extend(extra);
+        String::from_utf8(git(&arguments).stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+    let all = shas(&[]);
+    let sha_of = |subject: &str| {
+        all.iter()
+            .find_map(|line| line.strip_suffix(&format!(" {subject}")))
+            .unwrap()
+            .to_string()
+    };
+
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let log = temporary.path().join("stdin.log");
+    let wrapper = temporary.path().join("git-wrapper");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *--stdin*) tee -a \"{log}\" | exec \"{real}\" \"$@\" ;;\n  *) exec \"{real}\" \"$@\" ;;\nesac\n",
+            log = log.display(),
+            real = real.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let february = report_with_env(
+        &path,
+        &["--author", "fixture@example.com", "--month", "2026-02"],
+        &[("WORKSTATS_GIT", wrapper.to_str().unwrap())],
+    );
+    // Feb and the rebased commit, counted with their lines.
+    assert_eq!(2, february["summary"]["commit_count"]);
+    assert_eq!(3, february["summary"]["additions"]);
+
+    let diffed: std::collections::BTreeSet<String> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        std::collections::BTreeSet::from([sha_of("src/feb.rs"), sha_of("rebased")]),
+        diffed,
+        "only the commits authored in February may reach the diff phase"
+    );
+    // The January and March commits were listed and never diffed.
+    for other in ["src/jan.rs", "src/mar.rs"] {
+        assert!(!diffed.contains(&sha_of(other)), "{other}");
+    }
+}
+
+#[test]
+fn merge_commits_are_not_counted_and_their_branches_commits_are() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "merged");
+    commit_on(&path, "src/base.rs", "1\n", "2026-03-01");
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "-b", "side"])
+            .status
+            .success()
+    );
+    commit_on(&path, "src/side.rs", "1\n2\n", "2026-03-02");
+    assert!(
+        git(&["-C", &path, "checkout", "-q", "main"])
+            .status
+            .success()
+    );
+    commit_on(&path, "src/main.rs", "1\n2\n3\n", "2026-03-03");
+    let merge = Command::new("git")
+        .args([
+            "-C",
+            &path,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "merge",
+            "-q",
+            "--no-ff",
+            "-m",
+            "merge side",
+            "side",
+        ])
+        .env("GIT_AUTHOR_DATE", "2026-03-04T12:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-03-04T12:00:00Z")
+        .output()
+        .unwrap();
+    assert!(merge.status.success());
+
+    let report = git_report(
+        &path,
+        &["--author", "fixture@example.com", "--month", "2026-03"],
+    );
+    assert_eq!(3, report["summary"]["commit_count"]);
+    assert_eq!(6, report["summary"]["additions"]);
+}
+
 #[test]
 fn the_window_is_the_author_date_not_the_committer_date() {
     let temporary = tempdir().unwrap();

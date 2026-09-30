@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
+use std::thread::{self, JoinHandle};
 
 use chrono::{DateTime, Utc};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
@@ -324,6 +325,13 @@ pub fn read_agent_commits(
     )
 }
 
+/// Reads one pass's commits from every repository under `base`, in two Git
+/// invocations per repository: a cheap listing of the author's commits with
+/// their author dates, then `--numstat` only for those inside the window. The
+/// reasoning is at the call sites below; the short version is that Git's own
+/// date bounds compare the committer date, so the window has to be applied in
+/// Rust, and applying it after the diffs are computed made historical windows
+/// pay for every commit since.
 #[allow(clippy::too_many_arguments)]
 fn collect_commits(
     base: &Path,
@@ -386,56 +394,53 @@ fn collect_commits(
         }) {
             continue;
         }
-        let mut command = Command::new(&git);
-        command
-            .arg("--no-pager")
-            .arg("-C")
-            .arg(&repo_path)
-            // Inert as long as `-z` is on, because Git only escapes a name
-            // when the record terminator is a newline. It stays because a
-            // reader added later that reads newline-terminated output would
-            // otherwise silently start octal-escaping every non-ASCII path,
-            // which breaks extension detection and the ignore globs.
-            .arg("-c")
-            .arg("core.quotePath=false")
-            .arg("log")
-            .arg("--regexp-ignore-case")
-            .arg("--no-merges")
-            .arg("--date=iso-strict")
-            .arg(if pass.co_authors {
-                COMMIT_HEADER_WITH_CO_AUTHORS
-            } else {
-                COMMIT_HEADER
-            })
-            .arg("--numstat")
-            // NUL-separated fields let a path hold any byte and make a rename
-            // a stated fact rather than a guess at text; see `parse_git_log`.
-            // Rename detection itself stays on — `--no-renames` would turn
-            // every large move into thousands of phantom added and deleted
-            // lines.
-            .arg("-z");
-        // Git ORs repeated `--author` arguments, which is how one pass asks for
-        // several identities without any alternation syntax to get wrong.
-        for pattern in pass.authors {
-            command.arg(format!("--author={pattern}"));
-        }
-        // Git's `--since` and `--until` compare the *committer* date, but the
-        // report windows on the *author* date (`%aI`), so the two bounds cannot
-        // be handed to Git as they are. A commit authored in March and rebased
-        // or amended in May has a May committer date: `--until` at the end of
-        // March dropped it from the March report it belongs to. `--until` is
-        // therefore never passed; the exact author-date window is applied below,
-        // once the commits are parsed.
+        // Two phases, because Git cannot be told the report's window. Its
+        // `--since` and `--until` compare the *committer* date, while the
+        // report windows on the *author* date (`%aI`): a commit authored in
+        // March and rebased or amended in May has a May committer date, so
+        // `--until` at the end of March dropped it from the March report it
+        // belongs to. `--until` is therefore never passed, and the exact
+        // author-date window is applied here, in Rust.
         //
-        // `--since` stays as a cheap bound on the walk, because Git stops
-        // following a line of history at the first commit older than it and
-        // without it every run reads every repository's whole past. It is
+        // What that costs is the trouble with a single pass. Without `--until`,
+        // Git computes `--numstat` (a diff per commit, by far the expensive
+        // part) for everything from `--since` to today, so asking about last
+        // March diffed every commit made since. So:
+        //
+        //  (a) a listing, `sha<TAB>author date` and nothing else: no diff, no
+        //      message. It carries the author filter and the widened `--since`
+        //      and covers the same refs a single pass would.
+        //  (b) the diffs, for exactly the commits of (a) that fall in the
+        //      window and were not already counted: their SHAs go to
+        //      `git log --no-walk --stdin` on standard input, which walks
+        //      nothing and prints the same header and `--numstat` records the
+        //      parser has always read. The SHAs are non-merges already, so a
+        //      merge cannot appear; `--no-walk` orders by commit date like the
+        //      walk did, and nothing downstream depends on the order of ties.
+        //
+        // `--since` stays in (a) as a cheap bound on the walk, because Git
+        // stops following a line of history at the first commit older than it
+        // and without it every run reads every repository's whole past. It is
         // widened by `COMMITTER_DATE_SKEW` because the committer date is almost
         // always the *later* of the two — a rebase only moves it forward — so
         // the only commits it could wrongly hide are ones whose committer clock
         // ran behind their author date, and a generous margin covers that.
+        let mut listing = Command::new(&git);
+        listing
+            .arg("--no-pager")
+            .arg("-C")
+            .arg(&repo_path)
+            .arg("log")
+            .arg("--regexp-ignore-case")
+            .arg("--no-merges")
+            .arg("--format=%H%x09%aI");
+        // Git ORs repeated `--author` arguments, which is how one pass asks for
+        // several identities without any alternation syntax to get wrong.
+        for pattern in pass.authors {
+            listing.arg(format!("--author={pattern}"));
+        }
         if let Some(since) = since {
-            command.arg(format!("--since={}", iso(since - COMMITTER_DATE_SKEW)));
+            listing.arg(format!("--since={}", iso(since - COMMITTER_DATE_SKEW)));
         }
         // Every local branch, plus HEAD, rather than only what HEAD reaches: a
         // clone routinely holds work on branches that are not checked out, and
@@ -452,50 +457,76 @@ fn collect_commits(
         // hard error that would also throw away the branches that do have
         // history.
         if head_resolves(&git, &repo_path) {
-            command.arg("HEAD");
+            listing.arg("HEAD");
         }
-        command.arg("--branches");
-        let mut errors = match tempfile() {
-            Ok(file) => file,
-            Err(error) => {
-                diagnostics.git_errors += 1;
-                diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
-                continue;
-            }
-        };
-        let stderr = match errors.try_clone() {
-            Ok(file) => file,
-            Err(error) => {
-                diagnostics.git_errors += 1;
-                diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
-                continue;
-            }
-        };
-        let mut child = match command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(stderr))
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                diagnostics.git_errors += 1;
-                diagnostics.warn(format!(
-                    "Git unavailable for {}: {error}",
-                    repo_path.display()
-                ));
-                continue;
-            }
-        };
-        let Some(stdout) = child.stdout.take() else {
-            diagnostics.git_errors += 1;
-            diagnostics.warn(format!(
-                "Git stdout unavailable for {}",
-                repo_path.display()
-            ));
+        listing.arg("--branches");
+
+        let Some((run, stdout)) = start_git(&mut listing, None, &repo_path, diagnostics) else {
             continue;
         };
+        let listed = parse_commit_listing(BufReader::new(stdout));
+        if !run.finish(&repo_path, diagnostics) {
+            continue;
+        }
+        // The exact window, on the same author date and with the same
+        // half-open bounds `aggregate.rs` applies, because Git was only given
+        // a widened lower bound. Doing it here rather than only in the report
+        // means every consumer of these commits, the explorer included, sees
+        // one window. A commit an earlier checkout of the same repository
+        // already yielded is skipped before its diff is computed, not after.
         let empty_seen = HashSet::new();
         let member_seen = seen.get(&repo_member_id).unwrap_or(&empty_seen);
+        let selected: Vec<&str> = listed
+            .iter()
+            .filter(|(sha, timestamp)| {
+                !since.is_some_and(|bound| *timestamp < bound)
+                    && !until.is_some_and(|bound| *timestamp >= bound)
+                    && !member_seen.contains(sha)
+            })
+            .map(|(sha, _)| sha.as_str())
+            .collect();
+        if selected.is_empty() {
+            continue;
+        }
+
+        let mut command = Command::new(&git);
+        command
+            .arg("--no-pager")
+            .arg("-C")
+            .arg(&repo_path)
+            // Inert as long as `-z` is on, because Git only escapes a name
+            // when the record terminator is a newline. It stays because a
+            // reader added later that reads newline-terminated output would
+            // otherwise silently start octal-escaping every non-ASCII path,
+            // which breaks extension detection and the ignore globs.
+            .arg("-c")
+            .arg("core.quotePath=false")
+            .arg("log")
+            .arg("--no-walk")
+            .arg("--stdin")
+            .arg("--no-merges")
+            .arg("--date=iso-strict")
+            .arg(if pass.co_authors {
+                COMMIT_HEADER_WITH_CO_AUTHORS
+            } else {
+                COMMIT_HEADER
+            })
+            .arg("--numstat")
+            // NUL-separated fields let a path hold any byte and make a rename
+            // a stated fact rather than a guess at text; see `parse_git_log`.
+            // Rename detection itself stays on — `--no-renames` would turn
+            // every large move into thousands of phantom added and deleted
+            // lines.
+            .arg("-z");
+        let input = selected.join("\n") + "\n";
+        let Some((run, stdout)) = start_git(
+            &mut command,
+            Some(input.into_bytes()),
+            &repo_path,
+            diagnostics,
+        ) else {
+            continue;
+        };
         let repo_commits = parse_git_log(
             BufReader::new(stdout),
             pass,
@@ -508,30 +539,114 @@ fn collect_commits(
             ignores.as_ref(),
             member_seen,
         );
-        let status = child.wait();
-        let _ = errors.seek(SeekFrom::Start(0));
-        let mut error_text = String::new();
-        let _ = errors.take(1000).read_to_string(&mut error_text);
-        match status {
-            Ok(status) if status.success() => {
-                for commit in repo_commits {
-                    // The exact window, on the same author date and with the
-                    // same half-open bounds `aggregate.rs` applies, because Git
-                    // was only given a widened lower bound. Doing it here
-                    // rather than only in the report means every consumer of
-                    // these commits, the explorer included, sees one window.
-                    if since.is_some_and(|bound| commit.timestamp < bound)
-                        || until.is_some_and(|bound| commit.timestamp >= bound)
-                    {
-                        continue;
-                    }
-                    seen.entry(commit.repo_member_id.clone())
-                        .or_default()
-                        .insert(commit.sha.clone());
-                    commits.push(commit);
-                }
+        if run.finish(&repo_path, diagnostics) {
+            for commit in repo_commits {
+                seen.entry(commit.repo_member_id.clone())
+                    .or_default()
+                    .insert(commit.sha.clone());
+                commits.push(commit);
             }
-            Ok(_) if error_text.contains("does not have any commits yet") => {}
+        }
+    }
+    commits
+}
+
+/// A running `git` whose standard error goes to a temporary file rather than a
+/// pipe, so nothing has to drain it while standard output is being parsed.
+struct GitRun {
+    child: Child,
+    errors: File,
+    /// Writes the standard input of a command that takes one, off this thread:
+    /// Git may answer before it has read everything, and neither side may wait
+    /// on the other.
+    feeder: Option<JoinHandle<()>>,
+}
+
+/// Starts `command`, feeding `input` to it if there is any. Reports the reason
+/// and returns `None` when Git cannot be started.
+fn start_git(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    repo_path: &Path,
+    diagnostics: &mut Diagnostics,
+) -> Option<(GitRun, ChildStdout)> {
+    let errors = match tempfile() {
+        Ok(file) => file,
+        Err(error) => {
+            diagnostics.git_errors += 1;
+            diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
+            return None;
+        }
+    };
+    let stderr = match errors.try_clone() {
+        Ok(file) => file,
+        Err(error) => {
+            diagnostics.git_errors += 1;
+            diagnostics.warn(format!("temporary Git diagnostics unavailable: {error}"));
+            return None;
+        }
+    };
+    let mut child = match command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            diagnostics.git_errors += 1;
+            diagnostics.warn(format!(
+                "Git unavailable for {}: {error}",
+                repo_path.display()
+            ));
+            return None;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        diagnostics.git_errors += 1;
+        diagnostics.warn(format!(
+            "Git stdout unavailable for {}",
+            repo_path.display()
+        ));
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let feeder = input.and_then(|input| {
+        let mut stdin = child.stdin.take()?;
+        Some(thread::spawn(move || {
+            // A Git that exits early closes the pipe; its status says why.
+            let _ = stdin.write_all(&input);
+        }))
+    });
+    Some((
+        GitRun {
+            child,
+            errors,
+            feeder,
+        },
+        stdout,
+    ))
+}
+
+impl GitRun {
+    /// Waits for Git and says whether its output can be trusted, reporting a
+    /// failure. A repository with no commits yet is not one.
+    fn finish(mut self, repo_path: &Path, diagnostics: &mut Diagnostics) -> bool {
+        if let Some(feeder) = self.feeder.take() {
+            let _ = feeder.join();
+        }
+        let status = self.child.wait();
+        let _ = self.errors.seek(SeekFrom::Start(0));
+        let mut error_text = String::new();
+        let _ = (&self.errors).take(1000).read_to_string(&mut error_text);
+        match status {
+            Ok(status) if status.success() => true,
+            Ok(_) if error_text.contains("does not have any commits yet") => false,
             Ok(_) => {
                 diagnostics.git_errors += 1;
                 diagnostics.warn(format!(
@@ -539,14 +654,30 @@ fn collect_commits(
                     repo_path.display(),
                     error_text.trim().chars().take(200).collect::<String>()
                 ));
+                false
             }
             Err(error) => {
                 diagnostics.git_errors += 1;
                 diagnostics.warn(format!("Git failed for {}: {error}", repo_path.display()));
+                false
             }
         }
     }
-    commits
+}
+
+/// Reads the listing phase's `sha<TAB>author date` lines. A line that does not
+/// parse is skipped: it could only cost a commit whose diff would not have
+/// parsed either.
+fn parse_commit_listing(reader: impl BufRead) -> Vec<(String, DateTime<Utc>)> {
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| {
+            let (sha, date) = line.split_once('\t')?;
+            let timestamp = DateTime::parse_from_rfc3339(date.trim()).ok()?;
+            (!sha.is_empty()).then(|| (sha.to_string(), timestamp.with_timezone(&Utc)))
+        })
+        .collect()
 }
 
 /// One commit being accumulated across its `--numstat` fields.
