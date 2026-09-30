@@ -437,7 +437,12 @@ pub(crate) fn run(
     let comparison = match compare {
         Some(plan) => {
             // The baseline's own counters and warnings describe a window the
-            // report is not about; one line says when it had trouble.
+            // report is not about; one line says when it had trouble of its
+            // own. Most warnings do not depend on the window at all — a
+            // malformed transcript, a Git failure — and the selected window
+            // has already shown them, so only the baseline's new ones count.
+            // Without that, one bad line anywhere in history would add a
+            // warning pointing at a run that finds nothing.
             let mut baseline_diagnostics = Diagnostics::default();
             let earlier = scan_window(
                 &scan,
@@ -446,10 +451,20 @@ pub(crate) fn run(
                 &mut transcript_cache,
                 &mut baseline_diagnostics,
             )?;
-            if baseline_diagnostics.warning_count > 0 {
+            let unseen = baseline_diagnostics
+                .messages
+                .iter()
+                .filter(|message| !diagnostics.messages.contains(message))
+                .count() as u64;
+            // Past the storage cap the texts are gone, so the unstored rest
+            // cannot be compared and is counted as new.
+            let unstored = baseline_diagnostics
+                .warning_count
+                .saturating_sub(baseline_diagnostics.messages.len() as u64);
+            let new_warnings = unseen + unstored;
+            if new_warnings > 0 {
                 diagnostics.warn(format!(
-                    "the comparison window raised {} warning(s); run it on its own to see them",
-                    baseline_diagnostics.warning_count
+                    "the comparison window raised {new_warnings} warning(s) of its own; run it on its own to see them"
                 ));
             }
             Some(Comparison::new(

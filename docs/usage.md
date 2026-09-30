@@ -190,7 +190,10 @@ report that window would print alone: the same sources, the same Git checkouts
 (`--dir` plus the checkout of every retained session), the same repository
 labels and `--repo-exact` matching. The transcript index keeps the second pass
 cheap. Adding `--compare` never changes the selected window's report, including
-`inputs.git_scan_roots`; in `--format json` the comparison is
+`inputs.git_scan_roots`, with one exception: when the baseline raises warnings
+the selected window did not, one extra warning says how many, so run the
+baseline on its own to read them. Warnings both windows share, such as a
+malformed transcript line, are shown once and add nothing; in `--format json` the comparison is
 an added `comparison` object with `current`, `previous` and `delta` (a `change`
 and a `percent`, which is `null` when the earlier figure is zero, per figure;
 `change_points` for shares). Table, Markdown and HTML show the same block just
@@ -262,7 +265,8 @@ Markdown acts on in repository names and paths. It also defuses what GitHub
 links from plain text: a zero-width space follows an `@` and sits between `#` or
 `GH-` and a number, so a repository called `@scope/pkg` does not mention anyone
 and `#123` does not link an issue when the report is pasted into a PR. The
-Markdown and HTML notes and warnings replace your home directory with `~`, so a
+Markdown and HTML notes, warnings and `cwd`/`root` row labels replace your
+home directory with `~`, so a
 document does not carry your username or client folder names; the table view
 shows paths as they are. A run that took values from the config ends its notes
 with `Config defaults: …`, in the table, Markdown, HTML and `allocate` outputs

@@ -31,7 +31,7 @@ tag are the generated list of pull requests.
   escaped, and light and dark themes from the reader's setting. Markdown also
   keeps `@scope/pkg` and `#123` from becoming mentions and issue links when
   pasted into a PR, and both formats replace the home directory with `~` in
-  notes and warnings. Both work for
+  notes, warnings and `cwd`/`root` row labels. Both work for
   `workstats` and `workstats allocate`, print no update notice, and are refused
   with `--explain-human-time`, like CSV.
 
@@ -59,7 +59,9 @@ tag are the generated list of pull requests.
   because their shapes cannot carry a second window. The selected window's
   report, including the Git checkouts it reads, is the one it would print
   without `--compare`, and so is the baseline's: each window is built by the
-  same code path a run of that window alone uses, one after the other.
+  same code path a run of that window alone uses, one after the other. The
+  one addition is a single warning when the baseline raised warnings the
+  selected window did not.
 
 - The documentation moved out of the README into `docs/`: install, usage,
   configuration, how the estimate works, `allocate`, privacy, and development.

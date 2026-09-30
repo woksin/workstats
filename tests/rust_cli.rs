@@ -2678,6 +2678,44 @@ fn compare_previous_puts_each_side_where_a_standalone_run_would() {
     assert_eq!(6.0, source["change_points"].as_f64().unwrap(), "{source}");
 }
 
+/// A warning that does not depend on the window — here a malformed line in a
+/// transcript both passes read — is the selected window's own and already
+/// shown, so the baseline pass must not add a line about it: the compared
+/// report's warnings are exactly the standalone run's.
+#[test]
+fn compare_adds_no_warning_for_trouble_both_windows_share() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+    let history = temporary.path().join("pi-sessions");
+    let transcript = fs::read_dir(history.join("--feb--"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut body = fs::read_to_string(&transcript).unwrap();
+    body.push_str("not json\n");
+    fs::write(&transcript, body).unwrap();
+
+    let march = report_json(&base, &["--month", "2026-03"]);
+    let compared = report_json(&base, &["--month", "2026-03", "--compare", "previous"]);
+    let messages = march["diagnostics"]["messages"].as_array().unwrap();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.as_str().unwrap().contains("malformed")),
+        "the fixture must warn: {messages:?}"
+    );
+    assert_eq!(
+        march["diagnostics"]["messages"],
+        compared["diagnostics"]["messages"]
+    );
+    assert_eq!(
+        march["diagnostics"]["warning_count"],
+        compared["diagnostics"]["warning_count"]
+    );
+}
+
 #[test]
 fn compare_scans_the_same_checkouts_as_the_standalone_runs() {
     let temporary = tempdir().unwrap();
