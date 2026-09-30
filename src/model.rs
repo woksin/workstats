@@ -676,6 +676,10 @@ pub struct Report {
     pub rows: Vec<ReportRow>,
     pub diagnostics: Diagnostics,
     pub inputs: Inputs,
+    /// Present only under `--compare`; everything above is then the selected
+    /// window's report exactly as it would be without the flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<crate::compare::Comparison>,
 }
 
 #[cfg(test)]

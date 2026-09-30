@@ -1179,6 +1179,11 @@ fn agent_authored_commits_are_reported_as_output_and_never_as_human_time() {
 /// `output` output tokens, so an allocation fixture can be described in the
 /// terms allocation actually splits on.
 fn pi_session(history: &Path, name: &str, cwd: &Path, model: &str, output: u64) {
+    pi_session_on(history, name, cwd, model, output, "2026-03-02");
+}
+
+/// The same session on another day, for tests that need history in two windows.
+fn pi_session_on(history: &Path, name: &str, cwd: &Path, model: &str, output: u64, day: &str) {
     let directory = history.join(format!("--{name}--"));
     fs::create_dir_all(&directory).unwrap();
     let usage = serde_json::json!({
@@ -1188,18 +1193,18 @@ fn pi_session(history: &Path, name: &str, cwd: &Path, model: &str, output: u64) 
     });
     let lines = [
         serde_json::json!({"type": "session", "version": 3, "id": name,
-            "timestamp": "2026-03-02T00:00:00.000Z", "cwd": cwd}),
+            "timestamp": format!("{day}T00:00:00.000Z"), "cwd": cwd}),
         serde_json::json!({"type": "message", "id": "a", "parentId": null,
-            "timestamp": "2026-03-02T00:00:10.000Z",
+            "timestamp": format!("{day}T00:00:10.000Z"),
             "message": {"role": "user", "content": [{"type": "text", "text": "go"}]}}),
         serde_json::json!({"type": "message", "id": "b", "parentId": "a",
-            "timestamp": "2026-03-02T00:01:10.000Z",
+            "timestamp": format!("{day}T00:01:10.000Z"),
             "message": {"role": "assistant", "model": model, "provider": "anthropic",
                 "stopReason": "stop", "usage": usage,
                 "content": [{"type": "text", "text": "done"}]}}),
     ];
     fs::write(
-        directory.join(format!("2026-03-02T00-00-00-000Z_{name}.jsonl")),
+        directory.join(format!("{day}T00-00-00-000Z_{name}.jsonl")),
         lines
             .iter()
             .map(std::string::ToString::to_string)
@@ -2139,4 +2144,307 @@ fn markdown_and_html_are_refused_where_they_have_no_meaning() {
         let ui = run(&["ui", "--format", format]);
         assert!(!ui.status.success());
     }
+}
+
+/// Commits `body` to `file` as the fixture developer at noon UTC on `day`, a
+/// whole half-day clear of any local midnight so the month it lands in does not
+/// depend on the timezone the suite runs in.
+fn commit_on(repo: &str, file: &str, body: &str, day: &str) {
+    fs::create_dir_all(Path::new(repo).join(file).parent().unwrap()).unwrap();
+    fs::write(Path::new(repo).join(file), body).unwrap();
+    assert!(git(&["-C", repo, "add", "."]).status.success());
+    let date = format!("{day}T12:00:00Z");
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo,
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.com",
+            "commit",
+            "-q",
+            "-m",
+            file,
+            "--author=Fixture <fixture@example.com>",
+        ])
+        .env("GIT_AUTHOR_DATE", &date)
+        .env("GIT_COMMITTER_DATE", &date)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// February has two commits (two source lines, one test line), March three
+/// (eight source lines, three test lines), and January none. Each month has one
+/// Pi session in the repository, so AI figures exist on both sides.
+fn compare_fixture(temporary: &Path) -> (String, Vec<String>) {
+    let path = repository_on_main(temporary, "compared");
+    commit_on(&path, "src/a.rs", "1\n2\n", "2026-02-10");
+    commit_on(&path, "tests/a.rs", "1\n", "2026-02-11");
+    commit_on(&path, "src/b.rs", "1\n2\n3\n", "2026-03-10");
+    commit_on(&path, "src/c.rs", "1\n2\n3\n4\n5\n", "2026-03-11");
+    commit_on(&path, "tests/b.rs", "1\n2\n3\n", "2026-03-12");
+    let history = temporary.join("pi-sessions");
+    pi_session_on(
+        &history,
+        "feb",
+        Path::new(&path),
+        "claude-opus-5",
+        10,
+        "2026-02-10",
+    );
+    pi_session_on(
+        &history,
+        "mar",
+        Path::new(&path),
+        "claude-opus-5",
+        10,
+        "2026-03-10",
+    );
+    let arguments = [
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-cache",
+        "--no-progress",
+        "--provider",
+        "pi",
+        "--history",
+        &format!("pi={}", history.display()),
+        "--format",
+        "json",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    (path, arguments)
+}
+
+fn report_json(base: &[String], extra: &[&str]) -> Value {
+    let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+    arguments.extend(extra);
+    let output = run(&arguments);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn failure(base: &[String], extra: &[&str]) -> String {
+    let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+    arguments.extend(extra);
+    let output = run(&arguments);
+    assert!(!output.status.success(), "expected {extra:?} to be refused");
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn compare_previous_puts_each_side_where_a_standalone_run_would() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    let march = report_json(&base, &["--month", "2026-03"]);
+    let february = report_json(&base, &["--month", "2026-02"]);
+    let compared = report_json(&base, &["--month", "2026-03", "--compare", "previous"]);
+
+    // The report itself is the selected window's, as if --compare were absent,
+    // and the flag adds only a `comparison` block.
+    assert!(march.get("comparison").is_none());
+    let mut without = compared.clone();
+    without.as_object_mut().unwrap().remove("comparison");
+    assert_eq!(march["summary"], without["summary"]);
+    assert_eq!(march["rows"], without["rows"]);
+    assert_eq!(
+        march["inputs"]["git_scan_roots"],
+        without["inputs"]["git_scan_roots"]
+    );
+
+    let comparison = &compared["comparison"];
+    assert_eq!("previous", comparison["basis"]);
+    assert_eq!("2026-03", comparison["current"]["label"]);
+    assert_eq!("2026-02", comparison["previous"]["label"]);
+    assert!(
+        comparison["note"]
+            .as_str()
+            .unwrap()
+            .contains("not stopwatch times")
+    );
+
+    // Both sides match the windows run on their own, figure for figure.
+    for (side, standalone) in [("current", &march), ("previous", &february)] {
+        let figures = &comparison[side]["figures"];
+        let summary = &standalone["summary"];
+        for key in [
+            "commit_count",
+            "additions",
+            "deletions",
+            "session_count",
+            "human_estimated_seconds",
+            "human_active_days",
+            "prompt_signal_count",
+            "parallel_agent_seconds",
+        ] {
+            assert_eq!(summary[key], figures[key], "{side} {key}");
+        }
+    }
+    assert_eq!(3, comparison["current"]["figures"]["commit_count"]);
+    assert_eq!(2, comparison["previous"]["figures"]["commit_count"]);
+    assert_eq!(1, comparison["current"]["figures"]["session_count"]);
+    assert_eq!(1, comparison["previous"]["figures"]["session_count"]);
+
+    let delta = &comparison["delta"];
+    assert_eq!(1.0, delta["commit_count"]["change"]);
+    assert_eq!(50.0, delta["commit_count"]["percent"]);
+    assert_eq!(8.0, delta["additions"]["change"]);
+    // Composition is compared per area in percentage points: source was 2 of 3
+    // changed lines in February and 8 of 11 in March.
+    let source = delta["composition"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|area| area["category"] == "source")
+        .unwrap();
+    // Shares are reported to three decimals (0.727 and 0.667), so the change is
+    // exactly six points rather than 6.06.
+    assert_eq!(6.0, source["change_points"].as_f64().unwrap(), "{source}");
+}
+
+#[test]
+fn compare_shows_not_available_rather_than_infinity_when_the_earlier_window_is_empty() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    // January holds nothing, so February grew from zero.
+    let compared = report_json(&base, &["--month", "2026-02", "--compare", "previous"]);
+    let comparison = &compared["comparison"];
+    assert_eq!("2026-01", comparison["previous"]["label"]);
+    assert_eq!(0, comparison["previous"]["figures"]["commit_count"]);
+    assert_eq!(2.0, comparison["delta"]["commit_count"]["change"]);
+    assert!(comparison["delta"]["commit_count"]["percent"].is_null());
+    assert!(comparison["delta"]["human_estimated_seconds"]["percent"].is_null());
+
+    // Shares have nothing to be a share of in an empty window.
+    let area = &comparison["delta"]["composition"][0];
+    assert!(area["previous"].is_null() && area["change_points"].is_null());
+
+    let table = run(&[
+        "--dir",
+        &base[1],
+        "--author",
+        "fixture@example.com",
+        "--no-ai",
+        "--no-cache",
+        "--no-progress",
+        "--month",
+        "2026-02",
+        "--compare",
+        "previous",
+    ]);
+    assert!(table.status.success());
+    let text = String::from_utf8_lossy(&table.stdout);
+    assert!(text.contains("Comparison"), "{text}");
+    assert!(text.contains("(n/a)"), "{text}");
+    assert!(text.contains("estimates"), "{text}");
+    assert!(!text.contains("inf"), "{text}");
+}
+
+#[test]
+fn compare_accepts_a_named_baseline_and_ranges_and_renders_documents() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    let named = report_json(&base, &["--month", "2026-03", "--compare", "2026-02"]);
+    assert_eq!("2026-02", named["comparison"]["basis"]);
+    assert_eq!(
+        2,
+        named["comparison"]["previous"]["figures"]["commit_count"]
+    );
+
+    // A named baseline may lie after the selected window.
+    let later = report_json(&base, &["--month", "2026-02", "--compare", "2026-03"]);
+    assert_eq!(
+        3,
+        later["comparison"]["previous"]["figures"]["commit_count"]
+    );
+    assert_eq!(2, later["comparison"]["current"]["figures"]["commit_count"]);
+
+    // A range is compared with the same number of days before it.
+    let range = report_json(
+        &base,
+        &[
+            "--since",
+            "2026-03-01",
+            "--until",
+            "2026-03-31",
+            "--compare",
+            "previous",
+        ],
+    );
+    assert_eq!("2026-02", range["comparison"]["previous"]["label"]);
+
+    for (format, marker) in [
+        ("markdown", "## Comparison"),
+        ("html", "<h2>Comparison</h2>"),
+    ] {
+        let mut arguments: Vec<&str> = base.iter().map(String::as_str).collect();
+        arguments.extend(["--month", "2026-03", "--compare", "previous"]);
+        let position = arguments.iter().position(|item| *item == "json").unwrap();
+        arguments[position] = format;
+        let output = run(&arguments);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains(marker), "{format}: {text}");
+        assert!(text.contains("Estimated human work"), "{format}: {text}");
+        assert!(text.contains("+1 (+50%)"), "{format}: {text}");
+    }
+}
+
+#[test]
+fn compare_refuses_what_it_cannot_compare_or_show() {
+    let temporary = tempdir().unwrap();
+    let (_, base) = compare_fixture(temporary.path());
+
+    for window in [
+        vec!["--compare", "previous"],
+        vec!["--since", "2026-03", "--compare", "previous"],
+    ] {
+        let error = failure(&base, &window);
+        assert!(error.contains("bounded window"), "{error}");
+    }
+    let error = failure(&base, &["--month", "2026-03", "--compare", "2026-03"]);
+    assert!(error.contains("overlaps"), "{error}");
+    let error = failure(&base, &["--month", "2026-03", "--compare", "sometime"]);
+    assert!(error.contains("--compare"), "{error}");
+
+    let mut csv = base.clone();
+    let position = csv.iter().position(|item| item == "json").unwrap();
+    csv[position] = "csv".to_string();
+    let error = failure(&csv, &["--month", "2026-03", "--compare", "previous"]);
+    assert!(error.contains("--format csv"), "{error}");
+
+    let error = failure(
+        &base,
+        &["ui", "--month", "2026-03", "--compare", "previous"],
+    );
+    assert!(error.contains("workstats ui"), "{error}");
+    let error = failure(
+        &["allocate", "--sub", "claude=1"]
+            .map(str::to_string)
+            .into_iter()
+            .chain(base.iter().cloned())
+            .collect::<Vec<_>>(),
+        &["--month", "2026-03", "--compare", "previous"],
+    );
+    assert!(error.contains("workstats allocate"), "{error}");
 }

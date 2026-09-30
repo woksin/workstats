@@ -14,7 +14,10 @@ use crate::allocate;
 use crate::git::DEFAULT_AGENT_AUTHORS;
 use crate::paths::expand_path;
 use crate::sources::normalize_provider;
-use crate::timeutil::{month_span, parse_bound, parse_duration, week_span, year_span};
+use crate::timeutil::{
+    CalendarSpan, month_span, named_span, parse_bound, parse_duration, previous_span, week_span,
+    year_span,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum OutputFormat {
@@ -264,6 +267,14 @@ pub(crate) struct ReportArguments {
         help = "Filter to one ISO week (Monday start): YYYY-Www, current (this), or last (previous)"
     )]
     pub(crate) week: Option<String>,
+    // Not a window of its own: it names a second window to report beside the
+    // one above, so it conflicts with nothing and needs one of them.
+    #[arg(
+        long,
+        value_name = "WINDOW",
+        help = "Also report an earlier window and show the change: previous (same-length span before the selected one), YYYY-MM, YYYY-Www, or YYYY; needs --month, --year, --week, or --since with --until"
+    )]
+    pub(crate) compare: Option<String>,
     #[arg(
         long,
         help = "Agent activity gap cap: 30s, 5m, 1h (default: 5m; config: \"defaults.gap_cap\")"
@@ -490,6 +501,60 @@ pub(crate) fn report_window(
         bound_flag("--since", arguments.since.as_deref(), false)?,
         bound_flag("--until", arguments.until.as_deref(), true)?,
     ))
+}
+
+/// The two windows `--compare` puts side by side, both half-open, and how the
+/// second was chosen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ComparePlan {
+    /// What `--compare` was given, as `previous` or the window it named.
+    pub(crate) basis: String,
+    pub(crate) current: CalendarSpan,
+    pub(crate) previous: CalendarSpan,
+}
+
+/// The windows behind `--compare`, or `None` when it was not given.
+///
+/// Both ends of the selected window have to be known: "the window before"
+/// something open-ended has no length to copy, and a report that quietly
+/// compared against everything would be a different question from the one
+/// asked. A named baseline may not overlap the selected window either, or the
+/// same work would be counted on both sides and every change understated.
+pub(crate) fn compare_windows(
+    arguments: &ReportArguments,
+    window: ReportWindow,
+    reference: DateTime<Utc>,
+) -> Result<Option<ComparePlan>> {
+    let Some(value) = arguments.compare.as_deref() else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let (Some(since), Some(until)) = window else {
+        bail!(
+            "--compare needs a bounded window to compare against; choose --month, --year, --week, or both --since and --until"
+        );
+    };
+    let current = (since, until);
+    if value.eq_ignore_ascii_case("previous") {
+        let previous = previous_span(since, until)
+            .with_context(|| "--compare previous cannot find the window before the selected one")?;
+        return Ok(Some(ComparePlan {
+            basis: "previous".to_string(),
+            current,
+            previous,
+        }));
+    }
+    let previous = named_span(value, reference).with_context(|| {
+        format!("invalid --compare {value:?}; expected previous, YYYY-MM, YYYY-Www or YYYY")
+    })?;
+    if previous.0 < until && since < previous.1 {
+        bail!("--compare {value} overlaps the selected window; choose a window that does not");
+    }
+    Ok(Some(ComparePlan {
+        basis: value.to_string(),
+        current,
+        previous,
+    }))
 }
 
 /// The directory Git history is scanned from: `--dir`, then `WORKSTATS_DIR`,
@@ -1229,6 +1294,96 @@ mod tests {
             assert!(error.contains("--week"), "{error}");
             assert!(error.contains(value), "{error}");
         }
+    }
+
+    fn plan(flags: &[&str]) -> Result<Option<ComparePlan>> {
+        let arguments = report_arguments(flags);
+        let window = report_window(&arguments, reference())?;
+        compare_windows(&arguments, window, reference())
+    }
+
+    #[test]
+    fn compare_previous_steps_each_window_kind_back_by_its_own_length() {
+        let plan = |flags: &[&str]| plan(flags).unwrap().unwrap();
+        // The reference is 2026-01-15, so --month last is December.
+        let january = plan(&["--month", "2026-01", "--compare", "previous"]);
+        assert_eq!("previous", january.basis);
+        assert_eq!(
+            longhand("2026-01", "2026-01"),
+            (Some(january.current.0), Some(january.current.1))
+        );
+        assert_eq!(
+            longhand("2025-12", "2025-12"),
+            (Some(january.previous.0), Some(january.previous.1))
+        );
+
+        let week = plan(&["--week", "2026-W01", "--compare", "previous"]);
+        assert_eq!(
+            window(&["--week", "2025-W52"]),
+            (Some(week.previous.0), Some(week.previous.1))
+        );
+        let year = plan(&["--year", "2026", "--compare", "previous"]);
+        assert_eq!(
+            window(&["--year", "2025"]),
+            (Some(year.previous.0), Some(year.previous.1))
+        );
+        // The same span as --month 2026-03, written as a range.
+        let range = plan(&[
+            "--since",
+            "2026-03-01",
+            "--until",
+            "2026-03-31",
+            "--compare",
+            "previous",
+        ]);
+        assert_eq!(
+            longhand("2026-02", "2026-02"),
+            (Some(range.previous.0), Some(range.previous.1))
+        );
+        let days = plan(&[
+            "--since",
+            "2026-05-10",
+            "--until",
+            "2026-05-19",
+            "--compare",
+            "PREVIOUS",
+        ]);
+        assert_eq!(
+            longhand("2026-04-30", "2026-05-09"),
+            (Some(days.previous.0), Some(days.previous.1))
+        );
+    }
+
+    #[test]
+    fn compare_needs_a_bounded_window_and_a_baseline_that_does_not_overlap_it() {
+        assert_eq!(None, plan(&["--month", "2026-01"]).unwrap());
+        for flags in [
+            vec!["--compare", "previous"],
+            vec!["--since", "2026-01", "--compare", "previous"],
+            vec!["--until", "2026-01", "--compare", "2025-12"],
+        ] {
+            let error = plan(&flags).unwrap_err().to_string();
+            assert!(error.contains("bounded window"), "{flags:?}: {error}");
+        }
+        let named = plan(&["--month", "2026-03", "--compare", "2025-W52"])
+            .unwrap()
+            .unwrap();
+        assert_eq!("2025-W52", named.basis);
+        assert_eq!(
+            window(&["--week", "2025-W52"]),
+            (Some(named.previous.0), Some(named.previous.1))
+        );
+        for flags in [
+            ["--month", "2026-03", "--compare", "2026-03"],
+            ["--year", "2026", "--compare", "2026-06"],
+        ] {
+            let error = plan(&flags).unwrap_err().to_string();
+            assert!(error.contains("overlaps"), "{flags:?}: {error}");
+        }
+        let error = plan(&["--month", "2026-03", "--compare", "last month"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--compare"), "{error}");
     }
 
     #[test]

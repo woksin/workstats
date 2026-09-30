@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::{DateTime, Local};
 
 use crate::classify::active_registry;
+use crate::compare::{Comparison, ShareChange, Unit};
 use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
 use crate::model::{
     CompositionEntry, Diagnostics, HumanTimeExplanation, MAX_STORED_MESSAGES, Report, ReportRow,
@@ -382,6 +383,10 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         );
     }
     println!();
+
+    if let Some(comparison) = &report.comparison {
+        print_comparison(comparison);
+    }
 
     if summary.session_count != 0 {
         let concurrency = if summary.agent_wall_seconds == 0.0 {
@@ -897,6 +902,10 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
     }
     blocks.push(Block::Facts(facts));
 
+    if let Some(comparison) = &report.comparison {
+        push_comparison(&mut blocks, comparison);
+    }
+
     if summary.session_count != 0 {
         let concurrency = if summary.agent_wall_seconds == 0.0 {
             0.0
@@ -1222,6 +1231,155 @@ fn push_omitted_models(blocks: &mut Vec<Block>, omitted: usize) {
             counted(omitted as u64, "more model", "more models")
         )));
     }
+}
+
+/// What the comparison block says in place of a bare "previous": the window's
+/// name and, when it was chosen by `previous`, that it was.
+fn comparison_windows(comparison: &Comparison) -> (String, String) {
+    let previous = if comparison.basis == "previous" {
+        format!("{} (the window before)", comparison.previous.label)
+    } else {
+        comparison.previous.label.clone()
+    };
+    (comparison.current.label.clone(), previous)
+}
+
+/// A figure in the unit it is measured in.
+fn compared_value(unit: Unit, value: f64) -> String {
+    match unit {
+        Unit::Seconds => hours(value),
+        Unit::Count => number(value.round().max(0.0) as u64),
+        Unit::Ratio => format!("{value:.1}×"),
+    }
+}
+
+/// `+2h 05m (+21%)`, `-3 (-50%)`, `+4 (n/a)`, or `no change`. The percentage is
+/// `n/a` when the earlier window was zero, because a change from nothing has
+/// no percentage, and an amount that rounds to nothing is no change at all
+/// rather than a signed zero.
+fn compared_change(unit: Unit, change: f64, percent: Option<f64>) -> String {
+    let rounded = match unit {
+        Unit::Seconds | Unit::Count => change.round(),
+        Unit::Ratio => (change * 10.0).round() / 10.0,
+    };
+    if rounded == 0.0 {
+        return "no change".to_string();
+    }
+    let sign = if rounded < 0.0 { '-' } else { '+' };
+    let percent = percent.map_or_else(|| "n/a".to_string(), |value| format!("{value:+.0}%"));
+    format!("{sign}{} ({percent})", compared_value(unit, rounded.abs()))
+}
+
+fn compared_share(share: Option<f64>) -> String {
+    share.map_or_else(|| "n/a".to_string(), percent)
+}
+
+fn compared_points(share: &ShareChange) -> String {
+    match share.change_points {
+        None => "n/a".to_string(),
+        Some(points) if points.round() == 0.0 => "no change".to_string(),
+        Some(points) => format!("{points:+.0} pp"),
+    }
+}
+
+/// The measure, current, previous and change cells of each compared figure.
+fn comparison_rows(comparison: &Comparison) -> Vec<Vec<String>> {
+    comparison
+        .lines()
+        .into_iter()
+        .map(|line| {
+            vec![
+                line.label.to_string(),
+                compared_value(line.unit, line.current),
+                compared_value(line.unit, line.previous),
+                compared_change(line.unit, line.change.change, line.change.percent),
+            ]
+        })
+        .collect()
+}
+
+fn comparison_share_rows(comparison: &Comparison) -> Vec<Vec<String>> {
+    comparison
+        .share_lines()
+        .into_iter()
+        .map(|line| {
+            vec![
+                line.label,
+                compared_share(line.share.current),
+                compared_share(line.share.previous),
+                compared_points(&line.share),
+            ]
+        })
+        .collect()
+}
+
+/// The `--compare` block of the table view: the headline figures of both
+/// windows side by side with the change, then the work-area shares. It sits
+/// straight after the summary it extends, so the first screen answers "how does
+/// this compare" before the grouped rows start.
+fn print_comparison(comparison: &Comparison) {
+    let (current, previous) = comparison_windows(comparison);
+    println!("Comparison  (changes are estimates — not stopwatch times)");
+    println!("  Current   {current}");
+    println!("  Previous  {previous}");
+    println!();
+    let table = |header: &str, rows: Vec<Vec<String>>| {
+        println!(
+            "  {header:<26} {:>11} {:>11}  Change",
+            "Current", "Previous"
+        );
+        println!("  {}", "─".repeat(75));
+        for row in rows {
+            println!("  {:<26} {:>11} {:>11}  {}", row[0], row[1], row[2], row[3]);
+        }
+    };
+    table("Measure", comparison_rows(comparison));
+    let shares = comparison_share_rows(comparison);
+    if !shares.is_empty() {
+        println!();
+        table("Share", shares);
+    }
+    println!();
+    // The note is a paragraph, and the table view has no column to wrap it at.
+    let mut line = String::new();
+    for word in comparison.note.split_whitespace() {
+        if !line.is_empty() && line.len() + word.len() >= 88 {
+            println!("  {line}");
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    println!("  {line}");
+    println!();
+}
+
+/// The same block for Markdown and HTML, from the same rows.
+fn push_comparison(blocks: &mut Vec<Block>, comparison: &Comparison) {
+    let (current, previous) = comparison_windows(comparison);
+    blocks.push(Block::Section("Comparison".to_string()));
+    blocks.push(Block::Paragraph(format!(
+        "Current: {current}. Previous: {previous}."
+    )));
+    let columns = |first: &str| {
+        vec![
+            Column::text(first),
+            Column::number("Current"),
+            Column::number("Previous"),
+            Column::number("Change"),
+        ]
+    };
+    blocks.push(Block::Table(Table::new(
+        columns("Measure"),
+        comparison_rows(comparison),
+    )));
+    let shares = comparison_share_rows(comparison);
+    if !shares.is_empty() {
+        blocks.push(Block::Table(Table::new(columns("Share"), shares)));
+    }
+    blocks.push(Block::Paragraph(comparison.note.to_string()));
 }
 
 /// `--format markdown`: the report as GitHub-flavoured Markdown, for a PR, an
@@ -1909,6 +2067,7 @@ mod tests {
                 config_defaults: BTreeMap::new(),
                 cache: None,
             },
+            comparison: None,
         }
     }
 

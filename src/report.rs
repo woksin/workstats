@@ -7,7 +7,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::aggregate::build_report_with_human_time_explanation;
 use crate::ai::{
@@ -19,10 +19,11 @@ use crate::allocate;
 use crate::cache::TranscriptCache;
 use crate::classify;
 use crate::cli::{
-    AllocateArguments, OutputFormat, ReportArguments, agent_author_patterns, csv_globs,
-    duration_flag, grouping_dimensions, report_window, resolve_authors, scan_directory,
+    AllocateArguments, OutputFormat, ReportArguments, agent_author_patterns, compare_windows,
+    csv_globs, duration_flag, grouping_dimensions, report_window, resolve_authors, scan_directory,
     valid_provider_identifier,
 };
+use crate::compare::{Comparison, Period};
 use crate::git::{default_git_author, read_agent_commits, read_git_commits};
 use crate::model::{self, Diagnostics, Inputs, Report, Session};
 use crate::output::{print_csv, print_html, print_json, print_markdown, print_table};
@@ -149,7 +150,7 @@ pub(crate) fn run_allocation(command: AllocateArguments) -> Result<()> {
     // the caller's to choose; --month/--since/--until still pick the window.
     if report.group_by.is_some() {
         bail!(
-            "`allocate` sets its own grouping (repo, provider, model, month); drop --group-by and use --month, --since, or --until to pick the window"
+            "`allocate` sets its own grouping (repo, provider, model, month); drop --group-by and use --month, --year, --week, or --since/--until to pick the window"
         );
     }
     report.group_by = Some("repo,provider,model,month".to_string());
@@ -216,6 +217,28 @@ pub(crate) fn run(
             output_format.name()
         );
     }
+    // A comparison is a second report beside the first. The explorer has no
+    // place for one, an allocation is a statement about a single period, and
+    // CSV is one flat table with no way to hold two windows without changing
+    // its columns — so all three are refused rather than shown half a
+    // comparison. The other formats can carry it.
+    if arguments.compare.is_some() {
+        if presentation == Presentation::Explore {
+            bail!(
+                "--compare is not available in `workstats ui`; run workstats without `ui` for table, json, markdown, or html"
+            );
+        }
+        if allocation.is_some() {
+            bail!(
+                "--compare is not available with `workstats allocate`; an allocation covers one period, so run it once per period"
+            );
+        }
+        if output_format == OutputFormat::Csv {
+            bail!(
+                "--compare is not available with --format csv, which has one row per group and nowhere to put a second window; use table, json, markdown, or html"
+            );
+        }
+    }
     let gap_cap = duration_flag("--gap-cap", &resolved.gap_cap)?;
     let human_idle = duration_flag("--human-idle", &resolved.human_idle)?;
     let review_credit = duration_flag("--review-credit", &resolved.review_credit)?;
@@ -226,7 +249,25 @@ pub(crate) fn run(
             resolved.human_idle
         );
     }
-    let (since, until) = report_window(&arguments, Utc::now())?;
+    let now = Utc::now();
+    let window = report_window(&arguments, now)?;
+    let compare = compare_windows(&arguments, window, now)?;
+    // Everything is read once, over both windows, and each window is then cut
+    // from what was read: the readers prune whole files outside their bounds
+    // and Git filters on the commit's own date, so the wider read costs only
+    // the stretch between the two windows. A named baseline may lie after the
+    // selected window, hence min and max rather than the previous window's start.
+    let (read_since, read_until) = match &compare {
+        Some(plan) => (
+            Some(plan.current.0.min(plan.previous.0)),
+            Some(plan.current.1.max(plan.previous.1)),
+        ),
+        None => window,
+    };
+    let windows: Vec<Option<(DateTime<Utc>, DateTime<Utc>)>> = match &compare {
+        Some(plan) => vec![Some(plan.current), Some(plan.previous)],
+        None => vec![None],
+    };
     let dimensions = grouping_dimensions(&arguments)?;
 
     let progress = Progress::new(
@@ -371,8 +412,8 @@ pub(crate) fn run(
                         &mut resolver,
                         &mut diagnostics,
                         transcript_cache.as_mut(),
-                        since,
-                        until,
+                        read_since,
+                        read_until,
                     ),
                     "codex" => read_codex_sessions_indexed(
                         path,
@@ -380,48 +421,48 @@ pub(crate) fn run(
                         &mut diagnostics,
                         Some(&codex_db),
                         transcript_cache.as_mut(),
-                        since,
-                        until,
+                        read_since,
+                        read_until,
                     ),
                     "copilot" => read_copilot_sessions_indexed(
                         path,
                         &mut resolver,
                         &mut diagnostics,
                         transcript_cache.as_mut(),
-                        since,
-                        until,
+                        read_since,
+                        read_until,
                     ),
                     "copilot-vscode" => read_copilot_vscode_sessions_indexed(
                         path,
                         &mut resolver,
                         &mut diagnostics,
                         transcript_cache.as_mut(),
-                        since,
-                        until,
+                        read_since,
+                        read_until,
                     ),
                     "gemini" => read_gemini_sessions_indexed(
                         path,
                         &mut resolver,
                         &mut diagnostics,
                         transcript_cache.as_mut(),
-                        since,
-                        until,
+                        read_since,
+                        read_until,
                     ),
                     "opencode" => read_opencode_sessions_indexed(
                         &resolve_opencode_database(path),
                         &mut resolver,
                         &mut diagnostics,
                         transcript_cache.as_mut(),
-                        since,
-                        until,
+                        read_since,
+                        read_until,
                     ),
                     "pi" => read_pi_sessions_indexed(
                         path,
                         &mut resolver,
                         &mut diagnostics,
                         transcript_cache.as_mut(),
-                        since,
-                        until,
+                        read_since,
+                        read_until,
                     ),
                     _ => Vec::new(),
                 };
@@ -435,8 +476,8 @@ pub(crate) fn run(
                 &mut resolver,
                 &mut diagnostics,
                 transcript_cache.as_mut(),
-                since,
-                until,
+                read_since,
+                read_until,
             ));
         }
     }
@@ -448,24 +489,50 @@ pub(crate) fn run(
     filter_sessions(&mut sessions, arguments.repo.as_deref(), None, true);
     let repo_filter = arguments.repo.as_deref();
     let agent_authors = agent_author_patterns(arguments.agent_commits.as_deref());
-    let mut git_scan_roots = Vec::new();
+    let canonical_root = |root: &Path| root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // The checkouts Git is read from for one window: `--dir`, plus the checkout
+    // of every session active in it. Sessions can belong to locally available
+    // checkouts outside `--dir`. Always scan those roots so adding or removing a
+    // repo filter cannot change which commits contribute to a retained
+    // session's report. Without `--compare` there is one window, unbounded here,
+    // and every retained session counts. With it each window takes only its own
+    // sessions' checkouts, so a checkout that only the other window's sessions
+    // point at cannot add commits to this one: each side of a comparison is the
+    // report that window would have printed alone.
+    let scan_roots_for = |window: Option<(DateTime<Utc>, DateTime<Utc>)>| -> Vec<PathBuf> {
+        let mut roots = vec![directory.clone()];
+        roots.extend(inferred_repository_roots(sessions.iter().filter(
+            |session| {
+                window.is_none_or(|(since, until)| {
+                    session
+                        .first_seen()
+                        .zip(session.last_seen())
+                        .is_some_and(|(first, last)| first < until && last >= since)
+                })
+            },
+        )));
+        let mut seen_roots = BTreeSet::new();
+        roots.retain(|root| seen_roots.insert(canonical_root(root)));
+        roots
+    };
+    let window_roots: Vec<Vec<PathBuf>> = windows
+        .iter()
+        .map(|window| scan_roots_for(*window))
+        .collect();
+    let mut git_scan_roots: Vec<PathBuf> = Vec::new();
     let mut commits = Vec::new();
     let mut agent_commits = Vec::new();
+    // Which repositories each root yielded commits for, so a window can be cut
+    // from the combined read by the repositories its own roots contain.
+    let mut root_repositories: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     if !arguments.no_git {
-        git_scan_roots.push(directory.clone());
-        // Sessions can belong to locally available checkouts outside `--dir`.
-        // Always scan those roots so adding or removing a repo filter cannot
-        // change which commits contribute to a retained session's report.
-        git_scan_roots.extend(inferred_repository_roots(&sessions));
+        git_scan_roots.extend(window_roots.iter().flatten().cloned());
         let mut seen_roots = BTreeSet::new();
-        git_scan_roots
-            .retain(|root| seen_roots.insert(root.canonicalize().unwrap_or_else(|_| root.clone())));
-        let configured_root = directory
-            .canonicalize()
-            .unwrap_or_else(|_| directory.clone());
+        git_scan_roots.retain(|root| seen_roots.insert(canonical_root(root)));
+        let configured_root = canonical_root(&directory);
         progress.set("Scanning Git repositories");
         for root in &git_scan_roots {
-            let scan_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let scan_root = canonical_root(root);
             // Everything but the configured directory got here by being the
             // checkout of a retained session.
             let from_session = scan_root != configured_root;
@@ -475,36 +542,44 @@ pub(crate) fn run(
             // inside the repository, while the repository is described by its
             // root. That defeated the inference this loop exists to perform.
             let scoped_filter = if from_session { None } else { repo_filter };
-            commits.extend(read_git_commits(
+            let human = read_git_commits(
                 root,
                 &authors,
                 &mut resolver,
                 &mut diagnostics,
                 depth,
-                since,
-                until,
+                read_since,
+                read_until,
                 scoped_filter,
                 &csv_globs(&arguments.path),
                 &csv_globs(&arguments.path_exclude),
                 arguments.no_ignore,
                 arguments.co_authors,
-            ));
+            );
             // A separate pass over the same repositories rather than a wider
             // `--author` on the one above: these commits must never reach the
             // collection the human estimate is built from.
-            agent_commits.extend(read_agent_commits(
+            let agent = read_agent_commits(
                 root,
                 &agent_authors,
                 &mut resolver,
                 &mut diagnostics,
                 depth,
-                since,
-                until,
+                read_since,
+                read_until,
                 scoped_filter,
                 &csv_globs(&arguments.path),
                 &csv_globs(&arguments.path_exclude),
                 arguments.no_ignore,
-            ));
+            );
+            root_repositories.entry(scan_root).or_default().extend(
+                human
+                    .iter()
+                    .chain(&agent)
+                    .map(|commit| commit.repo_member_id.clone()),
+            );
+            commits.extend(human);
+            agent_commits.extend(agent);
         }
         let mut seen_agent_commits = HashSet::new();
         agent_commits.retain(|commit| {
@@ -521,6 +596,20 @@ pub(crate) fn run(
             !seen_agent_commits.contains(&key) && seen_commits.insert(key)
         });
     }
+    // Only a comparison needs these: one set of repositories per window.
+    let window_repositories: Vec<Option<HashSet<String>>> = window_roots
+        .iter()
+        .map(|roots| {
+            compare.is_some().then(|| {
+                roots
+                    .iter()
+                    .filter_map(|root| root_repositories.get(&canonical_root(root)))
+                    .flatten()
+                    .cloned()
+                    .collect()
+            })
+        })
+        .collect();
     resolver.validate_project_aliases()?;
     let display_labels =
         disambiguate_repository_labels(&mut sessions, &mut commits, &mut agent_commits);
@@ -572,18 +661,48 @@ pub(crate) fn run(
     }
 
     progress.set("Estimating human involvement");
-    let built = build_report_with_human_time_explanation(
-        &sessions,
-        &commits,
-        &agent_commits,
-        gap_cap,
-        since,
-        until,
-        &dimensions,
-        human_idle,
-        review_credit,
+    let build_window = |window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+                        repositories: Option<&HashSet<String>>,
+                        explain_human_time: bool| {
+        let scoped = |items: &[model::GitCommit]| -> Vec<model::GitCommit> {
+            items
+                .iter()
+                .filter(|commit| {
+                    repositories.is_none_or(|known| known.contains(&commit.repo_member_id))
+                })
+                .cloned()
+                .collect()
+        };
+        build_report_with_human_time_explanation(
+            &sessions,
+            &scoped(&commits),
+            &scoped(&agent_commits),
+            gap_cap,
+            window.0,
+            window.1,
+            &dimensions,
+            human_idle,
+            review_credit,
+            explain_human_time,
+        )
+    };
+    let built = build_window(
+        window,
+        window_repositories[0].as_ref(),
         arguments.explain_human_time,
     );
+    let comparison = compare.map(|plan| {
+        let earlier = build_window(
+            (Some(plan.previous.0), Some(plan.previous.1)),
+            window_repositories[1].as_ref(),
+            false,
+        );
+        Comparison::new(
+            Period::new(plan.current, &built.summary),
+            Period::new(plan.previous, &earlier.summary),
+            plan.basis,
+        )
+    });
     let attribution = resolver.repository_attribution(&built.active_repository_checkouts);
     diagnostics.repository_history_hits = attribution.history_hits;
     diagnostics.repository_history_ambiguities = attribution.history_ambiguities;
@@ -600,12 +719,17 @@ pub(crate) fn run(
         group_by: built.group_by,
         rows: built.rows,
         diagnostics: diagnostics.clone(),
+        comparison,
         inputs: Inputs {
             git_root: directory.to_string_lossy().into_owned(),
-            git_scan_roots: git_scan_roots
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect(),
+            git_scan_roots: if arguments.no_git {
+                Vec::new()
+            } else {
+                window_roots[0]
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect()
+            },
             history_sources: history_paths
                 .iter()
                 .map(|(provider, paths)| {
@@ -829,7 +953,7 @@ fn disambiguate_repository_labels(
     labels
 }
 
-fn inferred_repository_roots(sessions: &[Session]) -> Vec<PathBuf> {
+fn inferred_repository_roots<'a>(sessions: impl IntoIterator<Item = &'a Session>) -> Vec<PathBuf> {
     let mut roots = BTreeSet::new();
     for session in sessions {
         let cwd = Path::new(&session.cwd);

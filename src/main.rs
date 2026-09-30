@@ -5,6 +5,7 @@ mod cache;
 mod classify;
 mod cli;
 mod commands;
+mod compare;
 mod document;
 mod git;
 mod model;

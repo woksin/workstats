@@ -2,7 +2,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
+use chrono::{
+    DateTime, Datelike, Duration, Local, LocalResult, Months, NaiveDate, TimeZone, Utc, Weekday,
+};
 use regex::Regex;
 
 use crate::model::{
@@ -268,6 +270,75 @@ pub fn week_span(value: &str, reference: DateTime<Utc>) -> Result<CalendarSpan> 
         bail!(EXPECTED);
     };
     Ok(span)
+}
+
+/// The window immediately before `[since, until)`, with the same length and
+/// the same kind: the month before a month, the week before a week, the year
+/// before a year, and for anything else the same number of days.
+///
+/// The kind is read off the two local dates rather than remembered from the
+/// flag, so `--month 2026-01` and `--since 2026-01 --until 2026-01` compare to
+/// the same December. Whole months step back by *months*: 30 days before
+/// 1 March is not February. Everything else steps back by *dates*, which is
+/// also exactly right for a week, and keeps a daylight-saving change inside the
+/// span from shifting the boundary by an hour.
+pub fn previous_span(since: DateTime<Utc>, until: DateTime<Utc>) -> Result<CalendarSpan> {
+    let first = since.with_timezone(&Local).date_naive();
+    let end = until.with_timezone(&Local).date_naive();
+    if end <= first {
+        bail!("the window is empty: it ends before it starts");
+    }
+    let whole_months = first.day() == 1 && end.day() == 1;
+    let start = if whole_months {
+        let months = (end.year() - first.year()) * 12 + end.month() as i32 - first.month() as i32;
+        first.checked_sub_months(Months::new(months as u32))
+    } else {
+        first.checked_sub_days(chrono::Days::new((end - first).num_days() as u64))
+    };
+    let Some(start) = start else {
+        bail!("the window before {first} is outside the supported calendar");
+    };
+    Ok((local_midnight(start), local_midnight(first)))
+}
+
+/// A comparison baseline named outright: `YYYY-MM`, `YYYY-Www` or `YYYY`.
+/// The shape picks the span, so the three shorthands cannot be confused.
+pub fn named_span(value: &str, reference: DateTime<Utc>) -> Result<CalendarSpan> {
+    let value = value.trim();
+    let digits = |text: &str| text.chars().all(|character| character.is_ascii_digit());
+    match value.len() {
+        4 if digits(value) => year_span(value, reference),
+        7 if value.as_bytes()[4] == b'-' && digits(&value[..4]) && digits(&value[5..]) => {
+            month_span(value, reference)
+        }
+        8 if value.as_bytes()[4] == b'-' && matches!(value.as_bytes()[5], b'W' | b'w') => {
+            week_span(value, reference)
+        }
+        _ => bail!("expected previous, YYYY-MM, YYYY-Www or YYYY"),
+    }
+}
+
+/// How a report names its window: `2026-08`, `2026-W09` or `2026` when the span
+/// is exactly that, and the first and last day otherwise. Dates are local, like
+/// every other calendar boundary here, and `until` is exclusive, so the last
+/// day is the day before it.
+pub fn window_label(since: DateTime<Utc>, until: DateTime<Utc>) -> String {
+    let first = since.with_timezone(&Local).date_naive();
+    let end = until.with_timezone(&Local).date_naive();
+    let months = (end.year() - first.year()) * 12 + end.month() as i32 - first.month() as i32;
+    if first.day() == 1 && end.day() == 1 {
+        if months == 1 {
+            return format!("{:04}-{:02}", first.year(), first.month());
+        }
+        if months == 12 && first.month() == 1 {
+            return format!("{:04}", first.year());
+        }
+    }
+    if first.weekday() == Weekday::Mon && (end - first).num_days() == 7 {
+        return iso_week_label(first);
+    }
+    let last = end.pred_opt().unwrap_or(end);
+    format!("{first} → {last}")
 }
 
 pub fn nearest_models(points: &[ActivityPoint]) -> Vec<ActivityPoint> {
@@ -1213,6 +1284,93 @@ mod tests {
                 "--week {value:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn the_previous_span_is_the_same_kind_of_window_one_step_back() {
+        let reference = local_noon(2026, 6, 15);
+        let bounds = |since: &str, until: &str| {
+            (
+                parse_bound(Some(since), false).unwrap().unwrap(),
+                parse_bound(Some(until), false).unwrap().unwrap(),
+            )
+        };
+        let before = |(since, until): CalendarSpan| previous_span(since, until).unwrap();
+
+        // January's predecessor is last year's December, and a year's is a year.
+        assert_eq!(
+            bounds("2025-12-01", "2026-01-01"),
+            before(month_span("2026-01", reference).unwrap())
+        );
+        assert_eq!(
+            bounds("2026-02-01", "2026-03-01"),
+            before(month_span("2026-03", reference).unwrap())
+        );
+        assert_eq!(
+            bounds("2025-01-01", "2026-01-01"),
+            before(year_span("2026", reference).unwrap())
+        );
+        // 2026-W01 (from 29 December) is preceded by 2025-W52; 2027-W01 (from
+        // 4 January) by 2026-W53.
+        assert_eq!(
+            week_span("2025-W52", reference).unwrap(),
+            before(week_span("2026-W01", reference).unwrap())
+        );
+        assert_eq!(
+            week_span("2026-W53", reference).unwrap(),
+            before(week_span("2027-W01", reference).unwrap())
+        );
+        // Whole months written as a range step back by months, not by days.
+        assert_eq!(
+            bounds("2025-11-01", "2026-01-01"),
+            before(bounds("2026-01-01", "2026-03-01"))
+        );
+        // Anything else is the same number of days: --since 05-10 --until 05-19
+        // is ten days, inclusive of both ends.
+        let ten_days = (
+            parse_bound(Some("2026-05-10"), false).unwrap().unwrap(),
+            parse_bound(Some("2026-05-19"), true).unwrap().unwrap(),
+        );
+        assert_eq!(bounds("2026-04-30", "2026-05-10"), before(ten_days));
+
+        assert!(previous_span(ten_days.1, ten_days.0).is_err());
+    }
+
+    #[test]
+    fn a_named_span_is_chosen_by_its_shape() {
+        let reference = local_noon(2026, 6, 15);
+        assert_eq!(
+            month_span("2026-03", reference).unwrap(),
+            named_span("2026-03", reference).unwrap()
+        );
+        assert_eq!(
+            week_span("2026-W09", reference).unwrap(),
+            named_span("2026-w09", reference).unwrap()
+        );
+        assert_eq!(
+            year_span("2025", reference).unwrap(),
+            named_span("2025", reference).unwrap()
+        );
+        for value in ["", "last", "2026-3", "2026-W9", "2026-13", "2025-W53", "26"] {
+            assert!(
+                named_span(value, reference).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_is_named_the_way_it_was_asked_for() {
+        let reference = local_noon(2026, 6, 15);
+        let label = |(since, until): CalendarSpan| window_label(since, until);
+        assert_eq!("2026-03", label(month_span("2026-03", reference).unwrap()));
+        assert_eq!("2026", label(year_span("2026", reference).unwrap()));
+        assert_eq!("2026-W01", label(week_span("2026-W01", reference).unwrap()));
+        let range = (
+            parse_bound(Some("2026-05-10"), false).unwrap().unwrap(),
+            parse_bound(Some("2026-05-19"), true).unwrap().unwrap(),
+        );
+        assert_eq!("2026-05-10 → 2026-05-19", label(range));
     }
 
     #[test]

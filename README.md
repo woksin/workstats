@@ -1210,6 +1210,62 @@ workstats --week 2026-W09 --period day     # one ISO week, a row per day
 workstats --month last --period week       # last month's weeks; the edge weeks are partial
 ```
 
+### Comparing two windows
+
+`--compare` reports the selected window and, beside it, an earlier one, with the
+change between them. `--compare previous` takes the window immediately before
+the selected one, of the same kind and length: the previous month for `--month`,
+the previous ISO week for `--week`, the previous year for `--year`, and for
+`--since`/`--until` the same number of days before `--since` (a range of whole
+months steps back by whole months). Name a baseline outright with
+`--compare 2026-06`, `--compare 2026-W09` or `--compare 2026`; it may not overlap
+the selected window. Either way the selected window must have both ends, so
+`--compare` needs `--month`, `--year`, `--week`, or `--since` with `--until`, and
+is an error without one.
+
+```bash
+workstats --month 2026-07 --compare previous    # July against June
+workstats --week last --compare previous        # last week against the one before
+workstats --month 2026-07 --compare 2026-01     # July against January
+```
+
+```text
+Comparison  (changes are estimates — not stopwatch times)
+  Current   2026-07
+  Previous  2026-06 (the window before)
+
+  Measure                        Current    Previous  Change
+  ───────────────────────────────────────────────────────────────────────────
+  Estimated human work           62h 10m     48h 30m  +13h 40m (+28%)
+  Active work days                    19          17  +2 (+12%)
+  Git commits                        112          96  +16 (+17%)
+  ...
+  Share                          Current    Previous  Change
+  ───────────────────────────────────────────────────────────────────────────
+  source lines                       61%         55%  +6 pp
+  test lines                         27%         34%  -7 pp
+```
+
+The comparison is headline-level: the estimate and active days, prompts,
+sessions (foreground and subagent), commits and changed lines, agent-authored
+output, AI co-authored commits, agent wall clock and parallel agent work, and
+each file area's share of changed lines with its change in percentage points.
+Grouped rows are not compared. The human-work and active-day figures and their
+changes are estimates, as everywhere in workstats, and the output says so. A
+change from zero has no percentage and shows `n/a`, never infinity. A quiet
+window or a pruned history reads as a drop, so check the AI sessions line before
+reading a change as a change in effort.
+
+Histories and Git are read once over both windows and each window is cut from
+what was read, so each side is the report that window would print on its own.
+The selected window's report is unchanged; in `--format json` the comparison is
+an added `comparison` object with `current`, `previous` and `delta` (a `change`
+and a `percent`, which is `null` when the earlier figure is zero, per figure;
+`change_points` for shares). Table, Markdown and HTML show the same block just
+after the summary. CSV, `workstats ui` and `workstats allocate` refuse
+`--compare` with an error: CSV is one flat table with no place for a second
+window, the explorer browses one report, and an allocation covers one period.
+
 `--depth N` (default 4) bounds Git repository discovery below the scan root.
 `--no-ignore` includes the generated and vendor paths — `node_modules/`,
 `dist/`, `build/`, lockfiles, and the rest — that are otherwise counted
