@@ -1067,6 +1067,12 @@ fn baseline_only_warnings(selected: &Diagnostics, baseline: &Diagnostics) -> u64
         .iter()
         .filter(|message| !selected.messages.contains(message))
         .count() as u64;
+    // With every baseline text stored the comparison above is exact; an
+    // excess in count could only be a shared text raised twice.
+    let baseline_complete = baseline.warning_count == baseline.messages.len() as u64;
+    if baseline_complete {
+        return unseen;
+    }
     // The baseline's overflow past the cap has no texts. It may hold shared
     // warnings pushed out by the baseline's own earlier ones, so it is not
     // all new; what is certainly new is either a text the report never
@@ -1099,6 +1105,11 @@ mod tests {
             baseline_only_warnings(&selected, &warned(&["shared", "own", "another"]))
         );
         assert_eq!(1, baseline_only_warnings(&warned(&[]), &warned(&["own"])));
+        // A shared text raised twice by the baseline is still the report's.
+        assert_eq!(
+            0,
+            baseline_only_warnings(&warned(&["a"]), &warned(&["a", "a"]))
+        );
     }
 
     #[test]
