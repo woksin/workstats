@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 
-use crate::aggregate::build_report_with_human_time_explanation;
+use crate::aggregate::{BuiltReport, build_report_with_human_time_explanation};
 use crate::ai::{
     read_claude_sessions_indexed, read_codex_sessions_indexed, read_copilot_sessions_indexed,
     read_copilot_vscode_sessions_indexed, read_event_sessions_indexed,
@@ -28,8 +28,8 @@ use crate::git::{default_git_author, read_agent_commits, read_git_commits};
 use crate::model::{self, Diagnostics, Inputs, Report, Session};
 use crate::output::{print_csv, print_html, print_json, print_markdown, print_table};
 use crate::paths::{
-    PathResolver, configured_rules, default_cache_path, default_update_check_path,
-    disambiguated_repository_label, home_dir, load_config,
+    PathResolver, ProjectAliases, SourceRule, configured_rules, default_cache_path,
+    default_update_check_path, disambiguated_repository_label, home_dir, load_config,
 };
 use crate::pricing;
 use crate::progress::Progress;
@@ -267,18 +267,6 @@ pub(crate) fn run(
     let now = Utc::now();
     let window = report_window(&arguments, now)?;
     let compare = compare_windows(&arguments, window, now)?;
-    // Everything is read once, over both windows, and each window is then cut
-    // from what was read: the readers prune whole files outside their bounds
-    // and Git filters on the commit's own date, so the wider read costs only
-    // the stretch between the two windows. A named baseline may lie after the
-    // selected window, hence min and max rather than the previous window's start.
-    let (read_since, read_until) = match &compare {
-        Some(plan) => (
-            Some(plan.current.0.min(plan.previous.0)),
-            Some(plan.current.1.max(plan.previous.1)),
-        ),
-        None => window,
-    };
     let dimensions = grouping_dimensions(&arguments)?;
 
     let progress = Progress::new(
@@ -406,267 +394,71 @@ pub(crate) fn run(
         }
     };
 
-    let repository_history = if let Some(cache) = transcript_cache.as_ref() {
-        match cache.load_repository_history() {
-            Ok(history) => history,
-            Err(error) => {
-                diagnostics.warn(format!("repository identity history ignored: {error}"));
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    let mut resolver = PathResolver::with_context(rules, aliases, repository_history, home_dir());
-
-    let mut sessions = Vec::new();
-    if !arguments.no_ai {
-        for (provider, paths) in &history_paths {
-            if !provider_enabled(provider, &included, &excluded) {
-                continue;
-            }
-            progress.set(format!("Loading {provider} activity"));
-            for path in paths {
-                let loaded = match provider.as_str() {
-                    "claude" => read_claude_sessions_indexed(
-                        path,
-                        &mut resolver,
-                        &mut diagnostics,
-                        transcript_cache.as_mut(),
-                        read_since,
-                        read_until,
-                    ),
-                    "codex" => read_codex_sessions_indexed(
-                        path,
-                        &mut resolver,
-                        &mut diagnostics,
-                        Some(&codex_db),
-                        transcript_cache.as_mut(),
-                        read_since,
-                        read_until,
-                    ),
-                    "copilot" => read_copilot_sessions_indexed(
-                        path,
-                        &mut resolver,
-                        &mut diagnostics,
-                        transcript_cache.as_mut(),
-                        read_since,
-                        read_until,
-                    ),
-                    "copilot-vscode" => read_copilot_vscode_sessions_indexed(
-                        path,
-                        &mut resolver,
-                        &mut diagnostics,
-                        transcript_cache.as_mut(),
-                        read_since,
-                        read_until,
-                    ),
-                    "gemini" => read_gemini_sessions_indexed(
-                        path,
-                        &mut resolver,
-                        &mut diagnostics,
-                        transcript_cache.as_mut(),
-                        read_since,
-                        read_until,
-                    ),
-                    "opencode" => read_opencode_sessions_indexed(
-                        &resolve_opencode_database(path),
-                        &mut resolver,
-                        &mut diagnostics,
-                        transcript_cache.as_mut(),
-                        read_since,
-                        read_until,
-                    ),
-                    "pi" => read_pi_sessions_indexed(
-                        path,
-                        &mut resolver,
-                        &mut diagnostics,
-                        transcript_cache.as_mut(),
-                        read_since,
-                        read_until,
-                    ),
-                    _ => Vec::new(),
-                };
-                sessions.extend(loaded);
-            }
-        }
-        for path in &event_paths {
-            progress.set("Loading open event activity");
-            sessions.extend(read_event_sessions_indexed(
-                path,
-                &mut resolver,
-                &mut diagnostics,
-                transcript_cache.as_mut(),
-                read_since,
-                read_until,
-            ));
-        }
-    }
-    sessions.retain(|session| provider_enabled(&session.provider, &included, &excluded));
-    // Broad substring filtering can happen immediately. Exact filtering waits
-    // until every session and Git repository has its final disambiguated label;
-    // otherwise an explicit alias and a natural repository with the same raw
-    // name are both retained even though only the alias is displayed plainly.
-    filter_sessions(&mut sessions, arguments.repo.as_deref(), None, true);
-    let repo_filter = arguments.repo.as_deref();
+    // Each window is produced by the same code a standalone run of that window
+    // uses — sources, Git, labels, filters and all — so `--compare` can only
+    // ever show what two separate runs would have. A single read over both
+    // windows would not do: the labels that tell same-named repositories apart,
+    // `--repo-exact`, the discovery bounds of some readers and the checkouts
+    // inferred from sessions all depend on which data was read. The parse cache
+    // keeps the second pass cheap.
     let agent_authors = agent_author_patterns(arguments.agent_commits.as_deref());
-    let canonical_root = |root: &Path| root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    // The checkouts Git is read from: `--dir`, plus the checkout of every
-    // retained session. Sessions can belong to locally available checkouts
-    // outside `--dir`. Always scan those roots so adding or removing a repo
-    // filter cannot change which commits contribute to a retained session's
-    // report. The roots deliberately do not depend on the window: with
-    // `--compare` the report itself must stay what the same window would have
-    // printed without it, and a standalone run scans the checkout of every
-    // retained session whatever its dates. The commits are cut to each window
-    // afterwards, so a wider root set only ever adds commits that belong there.
-    let scan_roots: Vec<PathBuf> = {
-        let mut roots = vec![directory.clone()];
-        roots.extend(inferred_repository_roots(sessions.iter()));
-        let mut seen_roots = BTreeSet::new();
-        roots.retain(|root| seen_roots.insert(canonical_root(root)));
-        roots
+    let scan = WindowScan {
+        arguments: &arguments,
+        directory: &directory,
+        depth: resolved.depth,
+        history_paths: &history_paths,
+        codex_db: &codex_db,
+        event_paths: &event_paths,
+        included: &included,
+        excluded: &excluded,
+        authors: &authors,
+        agent_authors: &agent_authors,
+        rules: &rules,
+        aliases: &aliases,
+        dimensions: &dimensions,
+        gap_cap,
+        human_idle,
+        review_credit,
+        progress: &progress,
     };
-    let mut commits = Vec::new();
-    let mut agent_commits = Vec::new();
-    if !arguments.no_git {
-        let configured_root = canonical_root(&directory);
-        progress.set("Scanning Git repositories");
-        for root in &scan_roots {
-            let scan_root = canonical_root(root);
-            // Everything but the configured directory got here by being the
-            // checkout of a retained session.
-            let from_session = scan_root != configured_root;
-            let depth = if from_session { 0 } else { resolved.depth };
-            // Re-applying the filter to such a root would reject it: the filter
-            // matched the session's own working directory, which may be deep
-            // inside the repository, while the repository is described by its
-            // root. That defeated the inference this loop exists to perform.
-            let scoped_filter = if from_session { None } else { repo_filter };
-            let human = read_git_commits(
-                root,
-                &authors,
-                &mut resolver,
-                &mut diagnostics,
-                depth,
-                read_since,
-                read_until,
-                scoped_filter,
-                &csv_globs(&arguments.path),
-                &csv_globs(&arguments.path_exclude),
-                arguments.no_ignore,
-                arguments.co_authors,
-            );
-            // A separate pass over the same repositories rather than a wider
-            // `--author` on the one above: these commits must never reach the
-            // collection the human estimate is built from.
-            let agent = read_agent_commits(
-                root,
-                &agent_authors,
-                &mut resolver,
-                &mut diagnostics,
-                depth,
-                read_since,
-                read_until,
-                scoped_filter,
-                &csv_globs(&arguments.path),
-                &csv_globs(&arguments.path_exclude),
-                arguments.no_ignore,
-            );
-            commits.extend(human);
-            agent_commits.extend(agent);
+    let WindowRun {
+        built,
+        commits,
+        scan_roots,
+        attribution,
+    } = scan_window(
+        &scan,
+        window,
+        arguments.explain_human_time,
+        &mut transcript_cache,
+        &mut diagnostics,
+    )?;
+    let comparison = match compare {
+        Some(plan) => {
+            // The baseline's own counters and warnings describe a window the
+            // report is not about; one line says when it had trouble.
+            let mut baseline_diagnostics = Diagnostics::default();
+            let earlier = scan_window(
+                &scan,
+                (Some(plan.previous.0), Some(plan.previous.1)),
+                false,
+                &mut transcript_cache,
+                &mut baseline_diagnostics,
+            )?;
+            if baseline_diagnostics.warning_count > 0 {
+                diagnostics.warn(format!(
+                    "the comparison window raised {} warning(s); run it on its own to see them",
+                    baseline_diagnostics.warning_count
+                ));
+            }
+            Some(Comparison::new(
+                Period::new(plan.current, &built.summary),
+                Period::new(plan.previous, &earlier.built.summary),
+                plan.basis,
+            ))
         }
-        let mut seen_agent_commits = HashSet::new();
-        agent_commits.retain(|commit| {
-            seen_agent_commits.insert((commit.repo_member_id.clone(), commit.sha.clone()))
-        });
-        let mut seen_commits = HashSet::new();
-        commits.retain(|commit| {
-            // An `--author` wide enough to match a bot — a developer literally
-            // named Copilot, or a deliberately broad regex — would otherwise
-            // put one commit on both sides. Agent authorship wins within the
-            // same natural repository; an alias may legitimately combine two
-            // repositories that happen to contain the same SHA.
-            let key = (commit.repo_member_id.clone(), commit.sha.clone());
-            !seen_agent_commits.contains(&key) && seen_commits.insert(key)
-        });
-    }
-    resolver.validate_project_aliases()?;
-    let display_labels =
-        disambiguate_repository_labels(&mut sessions, &mut commits, &mut agent_commits);
-    resolver.apply_display_labels(&display_labels);
-    if let Some(exact) = arguments.repo_exact.as_deref() {
-        // A final display label wins globally. Only when no label matches do
-        // final checkout folder names participate, preserving the historical
-        // path fallback without making a natural `Product` checkout shadow an
-        // explicit alias whose final label is exactly `Product`.
-        let label_matches = sessions
-            .iter()
-            .map(|item| (&item.repo, &item.repo_id))
-            .chain(
-                commits
-                    .iter()
-                    .chain(agent_commits.iter())
-                    .map(|item| (&item.repo, &item.repo_id)),
-            )
-            .any(|(repo, repo_id)| exact_repo_label(repo, repo_id, exact));
-        let allow_folder = !label_matches;
-        filter_sessions(&mut sessions, None, Some(exact), allow_folder);
-        commits.retain(|commit| {
-            exact_repo(
-                &commit.repo,
-                &commit.repo_id,
-                &commit.cwd,
-                exact,
-                allow_folder,
-            )
-        });
-        agent_commits.retain(|commit| {
-            exact_repo(
-                &commit.repo,
-                &commit.repo_id,
-                &commit.cwd,
-                exact,
-                allow_folder,
-            )
-        });
-    }
-
-    let observations = resolver.take_repository_observations();
-    if let Some(cache) = transcript_cache.as_mut()
-        && let Err(error) = cache.remember_repository_identities(&observations)
-    {
-        diagnostics.warn(format!(
-            "repository identity history write ignored: {error}"
-        ));
-    }
-
-    progress.set("Estimating human involvement");
-    let build_window = |window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
-                        explain_human_time: bool| {
-        build_report_with_human_time_explanation(
-            &sessions,
-            &commits,
-            &agent_commits,
-            gap_cap,
-            window.0,
-            window.1,
-            &dimensions,
-            human_idle,
-            review_credit,
-            explain_human_time,
-        )
+        None => None,
     };
-    let built = build_window(window, arguments.explain_human_time);
-    let comparison = compare.map(|plan| {
-        let earlier = build_window((Some(plan.previous.0), Some(plan.previous.1)), false);
-        Comparison::new(
-            Period::new(plan.current, &built.summary),
-            Period::new(plan.previous, &earlier.summary),
-            plan.basis,
-        )
-    });
-    let attribution = resolver.repository_attribution(&built.active_repository_checkouts);
     diagnostics.repository_history_hits = attribution.history_hits;
     diagnostics.repository_history_ambiguities = attribution.history_ambiguities;
     diagnostics.unresolved_repository_cwds = attribution.unresolved_checkouts as u64;
@@ -786,6 +578,321 @@ pub(crate) fn run(
         }
     }
     Ok(())
+}
+
+/// Everything a window's scan needs that does not depend on the window.
+struct WindowScan<'a> {
+    arguments: &'a ReportArguments,
+    directory: &'a Path,
+    depth: usize,
+    history_paths: &'a BTreeMap<String, Vec<PathBuf>>,
+    codex_db: &'a Path,
+    event_paths: &'a [PathBuf],
+    included: &'a BTreeSet<String>,
+    excluded: &'a BTreeSet<String>,
+    authors: &'a [String],
+    agent_authors: &'a [String],
+    rules: &'a [SourceRule],
+    aliases: &'a ProjectAliases,
+    dimensions: &'a [String],
+    gap_cap: chrono::Duration,
+    human_idle: chrono::Duration,
+    review_credit: chrono::Duration,
+    progress: &'a Progress,
+}
+
+/// What scanning one window produced.
+struct WindowRun {
+    built: BuiltReport,
+    /// The retained human commits, which the explorer lists individually.
+    commits: Vec<model::GitCommit>,
+    scan_roots: Vec<PathBuf>,
+    attribution: model::RepositoryAttribution,
+}
+
+/// Loads the sources and Git history for one window, labels and filters them,
+/// and builds that window's report. A standalone run is exactly one call, and
+/// `--compare` makes a second for the baseline, so a window is never built any
+/// other way.
+fn scan_window(
+    scan: &WindowScan,
+    window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+    explain_human_time: bool,
+    transcript_cache: &mut Option<TranscriptCache>,
+    diagnostics: &mut Diagnostics,
+) -> Result<WindowRun> {
+    let WindowScan {
+        arguments,
+        directory,
+        history_paths,
+        codex_db,
+        event_paths,
+        included,
+        excluded,
+        authors,
+        agent_authors,
+        dimensions,
+        gap_cap,
+        human_idle,
+        review_credit,
+        progress,
+        ..
+    } = *scan;
+    let repository_history = if let Some(cache) = transcript_cache.as_ref() {
+        match cache.load_repository_history() {
+            Ok(history) => history,
+            Err(error) => {
+                diagnostics.warn(format!("repository identity history ignored: {error}"));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut resolver = PathResolver::with_context(
+        scan.rules.to_vec(),
+        scan.aliases.clone(),
+        repository_history,
+        home_dir(),
+    );
+
+    let mut sessions = Vec::new();
+    if !arguments.no_ai {
+        for (provider, paths) in history_paths {
+            if !provider_enabled(provider, included, excluded) {
+                continue;
+            }
+            progress.set(format!("Loading {provider} activity"));
+            for path in paths {
+                let loaded = match provider.as_str() {
+                    "claude" => read_claude_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        diagnostics,
+                        transcript_cache.as_mut(),
+                        window.0,
+                        window.1,
+                    ),
+                    "codex" => read_codex_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        diagnostics,
+                        Some(codex_db),
+                        transcript_cache.as_mut(),
+                        window.0,
+                        window.1,
+                    ),
+                    "copilot" => read_copilot_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        diagnostics,
+                        transcript_cache.as_mut(),
+                        window.0,
+                        window.1,
+                    ),
+                    "copilot-vscode" => read_copilot_vscode_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        diagnostics,
+                        transcript_cache.as_mut(),
+                        window.0,
+                        window.1,
+                    ),
+                    "gemini" => read_gemini_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        diagnostics,
+                        transcript_cache.as_mut(),
+                        window.0,
+                        window.1,
+                    ),
+                    "opencode" => read_opencode_sessions_indexed(
+                        &resolve_opencode_database(path),
+                        &mut resolver,
+                        diagnostics,
+                        transcript_cache.as_mut(),
+                        window.0,
+                        window.1,
+                    ),
+                    "pi" => read_pi_sessions_indexed(
+                        path,
+                        &mut resolver,
+                        diagnostics,
+                        transcript_cache.as_mut(),
+                        window.0,
+                        window.1,
+                    ),
+                    _ => Vec::new(),
+                };
+                sessions.extend(loaded);
+            }
+        }
+        for path in event_paths {
+            progress.set("Loading open event activity");
+            sessions.extend(read_event_sessions_indexed(
+                path,
+                &mut resolver,
+                diagnostics,
+                transcript_cache.as_mut(),
+                window.0,
+                window.1,
+            ));
+        }
+    }
+    sessions.retain(|session| provider_enabled(&session.provider, included, excluded));
+    // Broad substring filtering can happen immediately. Exact filtering waits
+    // until every session and Git repository has its final disambiguated label;
+    // otherwise an explicit alias and a natural repository with the same raw
+    // name are both retained even though only the alias is displayed plainly.
+    filter_sessions(&mut sessions, arguments.repo.as_deref(), None, true);
+    let repo_filter = arguments.repo.as_deref();
+    let canonical_root = |root: &Path| root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    // The checkouts Git is read from: `--dir`, plus the checkout of every
+    // retained session. Sessions can belong to locally available checkouts
+    // outside `--dir`. Always scan those roots so adding or removing a repo
+    // filter cannot change which commits contribute to a retained session's
+    // report.
+    let scan_roots: Vec<PathBuf> = {
+        let mut roots = vec![directory.to_path_buf()];
+        roots.extend(inferred_repository_roots(sessions.iter()));
+        let mut seen_roots = BTreeSet::new();
+        roots.retain(|root| seen_roots.insert(canonical_root(root)));
+        roots
+    };
+    let mut commits = Vec::new();
+    let mut agent_commits = Vec::new();
+    if !arguments.no_git {
+        let configured_root = canonical_root(directory);
+        progress.set("Scanning Git repositories");
+        for root in &scan_roots {
+            let scan_root = canonical_root(root);
+            // Everything but the configured directory got here by being the
+            // checkout of a retained session.
+            let from_session = scan_root != configured_root;
+            let depth = if from_session { 0 } else { scan.depth };
+            // Re-applying the filter to such a root would reject it: the filter
+            // matched the session's own working directory, which may be deep
+            // inside the repository, while the repository is described by its
+            // root. That defeated the inference this loop exists to perform.
+            let scoped_filter = if from_session { None } else { repo_filter };
+            let human = read_git_commits(
+                root,
+                authors,
+                &mut resolver,
+                diagnostics,
+                depth,
+                window.0,
+                window.1,
+                scoped_filter,
+                &csv_globs(&arguments.path),
+                &csv_globs(&arguments.path_exclude),
+                arguments.no_ignore,
+                arguments.co_authors,
+            );
+            // A separate pass over the same repositories rather than a wider
+            // `--author` on the one above: these commits must never reach the
+            // collection the human estimate is built from.
+            let agent = read_agent_commits(
+                root,
+                agent_authors,
+                &mut resolver,
+                diagnostics,
+                depth,
+                window.0,
+                window.1,
+                scoped_filter,
+                &csv_globs(&arguments.path),
+                &csv_globs(&arguments.path_exclude),
+                arguments.no_ignore,
+            );
+            commits.extend(human);
+            agent_commits.extend(agent);
+        }
+        let mut seen_agent_commits = HashSet::new();
+        agent_commits.retain(|commit| {
+            seen_agent_commits.insert((commit.repo_member_id.clone(), commit.sha.clone()))
+        });
+        let mut seen_commits = HashSet::new();
+        commits.retain(|commit| {
+            // An `--author` wide enough to match a bot — a developer literally
+            // named Copilot, or a deliberately broad regex — would otherwise
+            // put one commit on both sides. Agent authorship wins within the
+            // same natural repository; an alias may legitimately combine two
+            // repositories that happen to contain the same SHA.
+            let key = (commit.repo_member_id.clone(), commit.sha.clone());
+            !seen_agent_commits.contains(&key) && seen_commits.insert(key)
+        });
+    }
+    resolver.validate_project_aliases()?;
+    let display_labels =
+        disambiguate_repository_labels(&mut sessions, &mut commits, &mut agent_commits);
+    resolver.apply_display_labels(&display_labels);
+    if let Some(exact) = arguments.repo_exact.as_deref() {
+        // A final display label wins globally. Only when no label matches do
+        // final checkout folder names participate, preserving the historical
+        // path fallback without making a natural `Product` checkout shadow an
+        // explicit alias whose final label is exactly `Product`.
+        let label_matches = sessions
+            .iter()
+            .map(|item| (&item.repo, &item.repo_id))
+            .chain(
+                commits
+                    .iter()
+                    .chain(agent_commits.iter())
+                    .map(|item| (&item.repo, &item.repo_id)),
+            )
+            .any(|(repo, repo_id)| exact_repo_label(repo, repo_id, exact));
+        let allow_folder = !label_matches;
+        filter_sessions(&mut sessions, None, Some(exact), allow_folder);
+        commits.retain(|commit| {
+            exact_repo(
+                &commit.repo,
+                &commit.repo_id,
+                &commit.cwd,
+                exact,
+                allow_folder,
+            )
+        });
+        agent_commits.retain(|commit| {
+            exact_repo(
+                &commit.repo,
+                &commit.repo_id,
+                &commit.cwd,
+                exact,
+                allow_folder,
+            )
+        });
+    }
+
+    let observations = resolver.take_repository_observations();
+    if let Some(cache) = transcript_cache.as_mut()
+        && let Err(error) = cache.remember_repository_identities(&observations)
+    {
+        diagnostics.warn(format!(
+            "repository identity history write ignored: {error}"
+        ));
+    }
+
+    progress.set("Estimating human involvement");
+    let built = build_report_with_human_time_explanation(
+        &sessions,
+        &commits,
+        &agent_commits,
+        gap_cap,
+        window.0,
+        window.1,
+        dimensions,
+        human_idle,
+        review_credit,
+        explain_human_time,
+    );
+    let attribution = resolver.repository_attribution(&built.active_repository_checkouts);
+    Ok(WindowRun {
+        built,
+        commits,
+        scan_roots,
+        attribution,
+    })
 }
 
 fn provider_enabled(

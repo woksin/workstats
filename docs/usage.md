@@ -184,11 +184,12 @@ change from zero has no percentage and shows `n/a`, never infinity. A quiet
 window or a pruned history reads as a drop, so check the AI sessions line before
 reading a change as a change in effort.
 
-Histories and Git are read once over both windows and each window is cut from
-what was read, so each side is the report that window would print on its own.
-Git is read from the same checkouts a run without `--compare` reads (`--dir` plus
-the checkout of every retained session), whatever the session's date, so adding
-`--compare` never changes the selected window's report, including
+Each window is built by the same code a run of that window on its own uses, once
+for the selected window and once for the baseline, so each side is exactly the
+report that window would print alone: the same sources, the same Git checkouts
+(`--dir` plus the checkout of every retained session), the same repository
+labels and `--repo-exact` matching. The transcript index keeps the second pass
+cheap. Adding `--compare` never changes the selected window's report, including
 `inputs.git_scan_roots`; in `--format json` the comparison is
 an added `comparison` object with `current`, `previous` and `delta` (a `change`
 and a `percent`, which is `null` when the earlier figure is zero, per figure;

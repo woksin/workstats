@@ -2680,6 +2680,153 @@ fn compare_scans_the_same_checkouts_as_the_standalone_runs() {
     assert_eq!(4, march["summary"]["commit_count"]);
 }
 
+/// Asserts that comparing `month` with `baseline` leaves the selected window's
+/// report exactly as a standalone run prints it, and that the baseline's
+/// figures are the ones a standalone run of that window reports.
+fn assert_compare_equals_standalone(
+    base: &[String],
+    extra: &[&str],
+    month: &str,
+    baseline: &str,
+    baseline_month: &str,
+) {
+    let mut standalone_arguments = vec!["--month", month];
+    standalone_arguments.extend(extra);
+    let standalone = report_json(base, &standalone_arguments);
+    let mut compared_arguments = standalone_arguments.clone();
+    compared_arguments.extend(["--compare", baseline]);
+    let compared = report_json(base, &compared_arguments);
+    for key in ["summary", "rows"] {
+        assert_eq!(standalone[key], compared[key], "{month} {key}");
+    }
+    assert_eq!(
+        standalone["inputs"]["git_scan_roots"], compared["inputs"]["git_scan_roots"],
+        "{month}"
+    );
+    let mut other_arguments = vec!["--month", baseline_month];
+    other_arguments.extend(extra);
+    let other = report_json(base, &other_arguments);
+    for key in ["commit_count", "additions", "deletions", "session_count"] {
+        assert_eq!(
+            other["summary"][key], compared["comparison"]["previous"]["figures"][key],
+            "{month} vs {baseline_month}: {key}"
+        );
+    }
+}
+
+#[test]
+fn compare_labels_repositories_as_the_standalone_runs_do() {
+    let temporary = tempdir().unwrap();
+    let checkouts = temporary.path().join("checkouts");
+    let mut arguments = vec!["--dir".to_string(), checkouts.to_str().unwrap().to_string()];
+    for (name, remote, day) in [
+        (
+            "one/product",
+            "https://github.com/acme/product.git",
+            "2026-03-10",
+        ),
+        (
+            "two/product",
+            "https://github.com/other/product.git",
+            "2026-02-10",
+        ),
+    ] {
+        let path = repository_on_main(&checkouts, name);
+        assert!(
+            git(&["-C", &path, "remote", "add", "origin", remote])
+                .status
+                .success()
+        );
+        commit_on(&path, "src/lib.rs", "1\n2\n", day);
+    }
+    arguments.extend(
+        [
+            "--author",
+            "fixture@example.com",
+            "--no-ai",
+            "--no-cache",
+            "--no-progress",
+            "--format",
+            "json",
+        ]
+        .map(str::to_string),
+    );
+
+    // Only one of the two same-named repositories is committed to in each
+    // window, so each window's standalone label is the plain name; the other
+    // window's repository must not turn it into `product [..]`.
+    for extra in [
+        vec!["--group-by", "repo"],
+        vec!["--group-by", "repo", "--repo-exact", "product"],
+    ] {
+        for (month, baseline, baseline_month) in [
+            ("2026-03", "previous", "2026-02"),
+            ("2026-02", "2026-03", "2026-03"),
+        ] {
+            assert_compare_equals_standalone(&arguments, &extra, month, baseline, baseline_month);
+        }
+    }
+    let march = report_json(&arguments, &["--month", "2026-03", "--group-by", "repo"]);
+    let rows = march["rows"].as_array().unwrap();
+    assert_eq!(1, rows.len(), "{rows:?}");
+    assert_eq!("product", rows[0]["key"]["repo"], "{rows:?}");
+}
+
+#[test]
+fn compare_discovers_codex_history_as_the_standalone_runs_do() {
+    let temporary = tempdir().unwrap();
+    let (_, mut base) = compare_fixture(temporary.path());
+    // A checkout outside --dir that only a March Codex rollout points at, with
+    // a February commit. A standalone February run never discovers the March
+    // rollout directory, so it never scans that checkout either.
+    let other = repository_on_main(temporary.path(), "other");
+    commit_on(&other, "src/o.rs", "1\n2\n", "2026-02-12");
+    let codex = temporary.path().join("codex");
+    let directory = codex.join("2026/03/10");
+    fs::create_dir_all(&directory).unwrap();
+    let rollout = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/rollout-2026-01-01T10-00-00-fixture.jsonl"),
+    )
+    .unwrap()
+    .replace("2026-01-01", "2026-03-10")
+    .replace("/home/example/project", &other);
+    fs::write(
+        directory.join("rollout-2026-03-10T10-00-00-fixture.jsonl"),
+        rollout,
+    )
+    .unwrap();
+    let codex_db = temporary.path().join("missing.sqlite");
+    let position = base.iter().position(|value| value == "--provider").unwrap();
+    base[position + 1] = "codex".to_string();
+    base.extend(
+        [
+            "--codex-dir",
+            codex.to_str().unwrap(),
+            "--codex-db",
+            codex_db.to_str().unwrap(),
+        ]
+        .map(str::to_string),
+    );
+
+    let february = report_json(&base, &["--month", "2026-02"]);
+    let roots = february["inputs"]["git_scan_roots"].as_array().unwrap();
+    assert!(
+        roots
+            .iter()
+            .all(|root| !root.as_str().unwrap().ends_with("other")),
+        "{roots:?}"
+    );
+    for (month, baseline, baseline_month) in [
+        ("2026-02", "2026-03", "2026-03"),
+        ("2026-03", "previous", "2026-02"),
+    ] {
+        assert_compare_equals_standalone(&base, &[], month, baseline, baseline_month);
+    }
+    let march = report_json(&base, &["--month", "2026-03"]);
+    assert_eq!(1, march["summary"]["session_count"]);
+}
+
 #[test]
 fn compare_shows_not_available_rather_than_infinity_when_the_earlier_window_is_empty() {
     let temporary = tempdir().unwrap();

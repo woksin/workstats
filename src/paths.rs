@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::classify::{CategoryMode, CategoryRegistry, CategoryRules};
 use crate::model::{Diagnostics, RawSession, Session};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SourceRule {
     replacement: String,
     compiled: Regex,
