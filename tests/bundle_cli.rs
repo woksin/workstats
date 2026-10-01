@@ -738,3 +738,165 @@ fn merge_with_local_adds_this_machines_history_to_the_bundles() {
     let alone = merged(machine.directory.path(), &[&bundle], &[]);
     assert_eq!(1, alone["summary"]["session_count"]);
 }
+
+/// The strings a bundle must never carry for a machine whose work lives under
+/// `<root>/Users/alice/work/secret-client`.
+fn forbidden_in_a_bundle(root: &Path) -> Vec<String> {
+    let root_text = root.to_string_lossy().into_owned();
+    let canonical = root.canonicalize().unwrap().to_string_lossy().into_owned();
+    let escaped = root_text.replace('\\', "\\\\");
+    vec![
+        root_text,
+        canonical,
+        escaped,
+        "alice".to_string(),
+        "-Users-".to_string(),
+        "-home-".to_string(),
+        "secret-client".to_string(),
+        "Users/".to_string(),
+        "/home/".to_string(),
+    ]
+}
+
+#[test]
+fn session_ids_in_a_bundle_are_opaque_so_no_path_leaks_through_them() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    let work = root.join("Users/alice/work/secret-client");
+    fs::create_dir_all(&work).unwrap();
+    let api = repository_on_main(&work, "api");
+    let web = repository_on_main(&work, "web");
+    commit_dated(&api, "src/lib.rs", "fn one() {}\n", "2026-03-02", "subject");
+
+    // Claude: the id is `<uuid>:<project folder>/<file>`, and that folder is
+    // the dash-encoded working directory, username and client included.
+    let claude = root.join("claude");
+    let encoded = api.replace(['/', '\\', ':'], "-");
+    let project = claude.join(&encoded);
+    fs::create_dir_all(&project).unwrap();
+    let claude_line = |kind: &str, time: &str| {
+        json!({
+            "type": kind, "timestamp": format!("2026-03-02T{time}Z"), "cwd": api,
+            "sessionId": "claude-1", "gitBranch": "feat/x",
+            "message": {"model": "claude-x", "content": "go"}
+        })
+        .to_string()
+    };
+    fs::write(
+        project.join("claude-1.jsonl"),
+        [
+            claude_line("user", "09:00:00"),
+            claude_line("assistant", "09:01:00"),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    // The open events format: the id is always `<id>:<cwd>`.
+    let events = root.join("events.jsonl");
+    let record = |time: &str, kind: &str| {
+        json!({
+            "timestamp": format!("2026-03-02T{time}Z"), "provider": "cursor",
+            "session_id": "task-1", "cwd": api, "model": "model-a", "event": kind,
+        })
+        .to_string()
+    };
+    fs::write(
+        &events,
+        [record("10:00:00", "prompt"), record("10:01:00", "activity")].join("\n"),
+    )
+    .unwrap();
+
+    // Codex: a session that moved between two checkouts is `<id>:<cwd>`.
+    let codex = root.join("codex");
+    fs::create_dir_all(&codex).unwrap();
+    let codex_line = |time: &str, kind: &str, payload: Value| {
+        json!({"timestamp": format!("2026-03-02T{time}Z"), "type": kind, "payload": payload})
+            .to_string()
+    };
+    fs::write(
+        codex.join("rollout-2026-03-02T11-00-00-codex-1.jsonl"),
+        [
+            codex_line(
+                "11:00:00",
+                "session_meta",
+                json!({"id": "codex-1", "cwd": api, "model": "gpt-x"}),
+            ),
+            codex_line(
+                "11:00:02",
+                "response_item",
+                json!({"type": "message", "role": "user"}),
+            ),
+            codex_line("11:00:30", "response_item", json!({"type": "reasoning"})),
+            codex_line(
+                "11:05:00",
+                "turn_context",
+                json!({"cwd": web, "model": "gpt-x"}),
+            ),
+            codex_line(
+                "11:05:02",
+                "response_item",
+                json!({"type": "message", "role": "user"}),
+            ),
+            codex_line("11:05:30", "response_item", json!({"type": "reasoning"})),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let config = root.join("config/config.json");
+    let bundle = root.join("out.json");
+    let history = [
+        format!("claude={}", claude.display()),
+        format!("codex={}", codex.display()),
+    ];
+    let export = run(&[
+        "export",
+        "--dir",
+        &work.to_string_lossy(),
+        "--no-progress",
+        "--no-cache",
+        "--no-default-events",
+        "--no-update-check",
+        "--provider",
+        "claude,codex,cursor",
+        "--history",
+        &history[0],
+        "--history",
+        &history[1],
+        "--events",
+        events.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--author",
+        "fixture@example.com",
+        "--month",
+        "2026-03",
+        "--output",
+        bundle.to_str().unwrap(),
+        "--label",
+        "laptop",
+        "--include-paths",
+    ]);
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let text = fs::read_to_string(&bundle).unwrap();
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    let sessions = parsed["sessions"].as_array().unwrap();
+    // Claude, the events task and both Codex checkouts.
+    assert!(sessions.len() >= 4, "{sessions:?}");
+    for session in sessions {
+        let id = session["session_id"].as_str().unwrap();
+        assert_eq!(32, id.len(), "{id}");
+        assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{id}");
+    }
+    for forbidden in forbidden_in_a_bundle(root) {
+        assert!(
+            !text.contains(&forbidden),
+            "{forbidden:?} leaked into the bundle"
+        );
+    }
+}

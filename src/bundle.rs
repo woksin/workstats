@@ -367,7 +367,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("cannot write to {}", parent.display()))?;
     file.write_all(bytes)?;
     file.flush()?;
-    file.persist(path)
+    crate::durable::persist(file, path)
         .with_context(|| format!("cannot replace {}", path.display()))?;
     Ok(())
 }
@@ -378,7 +378,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub(crate) fn run_export(arguments: ExportArguments) -> Result<()> {
     let ExportArguments {
-        report,
+        mut report,
         output,
         label,
         include_paths,
@@ -399,6 +399,8 @@ pub(crate) fn run_export(arguments: ExportArguments) -> Result<()> {
         label.as_deref(),
         environment_label(),
     )?;
+    // A bundle carries no goals.
+    report.no_goals = true;
     let collected = report::collect(report, Purpose::Query)?;
     let bundle = build_bundle(&collected_input(&collected), &machine, include_paths);
     let encoded = serde_json::to_vec(&bundle)?;
@@ -616,6 +618,25 @@ fn local_keys(machine: &Machine, labels: BTreeMap<String, String>) -> HashMap<St
     keys
 }
 
+/// The id a session carries in a bundle. Providers build their ids from the
+/// history layout (`<id>:<path relative to the history root>`, `<id>:<cwd>`),
+/// and those paths hold usernames and client directory names. A bundle exports
+/// only a hash of the provider and the id: 128 bits, so it cannot collide in
+/// practice, and stable, so the same session in a synced folder on two machines
+/// still deduplicates. Importing hashes the local ids the same way.
+fn opaque_session_id(provider: &str, session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(provider.as_bytes());
+    digest.update([0]);
+    digest.update(session_id.as_bytes());
+    digest
+        .finalize()
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn build_bundle(input: &ExportInput<'_>, machine: &Machine, include_paths: bool) -> Bundle {
     // First pass: which repositories have no portable identity, and what are
     // they called. Sessions know their repository by `repo_id`; commits by the
@@ -668,7 +689,7 @@ fn build_bundle(input: &ExportInput<'_>, machine: &Machine, include_paths: bool)
             );
             BundleSession {
                 provider: session.provider.clone(),
-                session_id: session.session_id.clone(),
+                session_id: opaque_session_id(&session.provider, &session.session_id),
                 repo: key,
                 subdir: subdir_of(&session.cwd),
                 is_subagent: session.is_subagent,
@@ -1069,17 +1090,33 @@ fn union_session(target: &mut Session, incoming: Session) {
 }
 
 /// Branch marks the way the providers bound them. A mark that breaks a bound is
-/// dropped and counted rather than trusted.
+/// dropped and counted rather than trusted. `branch_at` reads marks in time
+/// order with the `from: None` mark first, so the marks are sorted that way: a
+/// second `None` mark and a mark that repeats the branch before it are dropped
+/// and counted too, because neither changes anything and an unsorted list would
+/// put work on the wrong branch.
 fn bounded_marks(marks: Vec<BranchMark>, dropped: &mut usize) -> Vec<BranchMark> {
-    let mut kept = Vec::new();
+    let mut valid: Vec<BranchMark> = Vec::new();
     for mark in marks {
-        let valid = !mark.branch.is_empty()
+        let ok = !mark.branch.is_empty()
             && mark.branch.len() <= MAX_BRANCH_BYTES
             && !mark.branch.chars().any(char::is_control);
-        if valid && kept.len() < MAX_BRANCH_MARKS {
-            kept.push(mark);
+        if ok {
+            valid.push(mark);
         } else {
             *dropped += 1;
+        }
+    }
+    // Stable, and `None` orders before every `Some`.
+    valid.sort_by_key(|mark| mark.from);
+    let mut kept: Vec<BranchMark> = Vec::new();
+    for mark in valid {
+        let extra_start = mark.from.is_none() && !kept.is_empty();
+        let repeat = kept.last().is_some_and(|last| last.branch == mark.branch);
+        if extra_start || repeat || kept.len() >= MAX_BRANCH_MARKS {
+            *dropped += 1;
+        } else {
+            kept.push(mark);
         }
     }
     kept
@@ -1143,7 +1180,10 @@ pub(crate) fn merge_imports(
     let mut index: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (position, session) in sessions.iter().enumerate() {
         index
-            .entry((session.provider.clone(), session.session_id.clone()))
+            .entry((
+                session.provider.clone(),
+                opaque_session_id(&session.provider, &session.session_id),
+            ))
             .or_default()
             .push(position);
     }
@@ -1323,7 +1363,7 @@ pub(crate) fn merge_imports(
         }
         if dropped_marks > 0 {
             diagnostics.warn(format!(
-                "{dropped_marks} branch marks in the bundle from `{machine}` were dropped for being empty, too long or containing control characters"
+                "{dropped_marks} branch marks in the bundle from `{machine}` were dropped for being empty, too long, containing control characters, starting the session twice or repeating the branch before them"
             ));
         }
     }
@@ -1557,6 +1597,83 @@ mod tests {
 
     fn authors(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn an_exported_session_id_is_a_stable_opaque_hash_of_provider_and_id() {
+        let id = "uuid:-Users-alice-secret-client-api/uuid.jsonl";
+        let opaque = opaque_session_id("claude", id);
+        assert_eq!(32, opaque.len());
+        assert!(opaque.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!opaque.contains("alice"));
+        // The same session on another machine hashes the same; another
+        // provider's identical id, or another id, does not.
+        assert_eq!(opaque, opaque_session_id("claude", id));
+        assert_ne!(opaque, opaque_session_id("pi", id));
+        assert_ne!(opaque, opaque_session_id("claude", "uuid"));
+        // A boundary between provider and id cannot be shifted.
+        assert_ne!(opaque_session_id("ab", "c"), opaque_session_id("a", "bc"));
+    }
+
+    #[test]
+    fn a_built_bundle_exports_no_raw_session_id() {
+        let mut local = session("uuid:/Users/alice/work/api", "remote:x/api", "api", &[1, 2]);
+        local.cwd = "/Users/alice/work/api".into();
+        let bundle = build_bundle(
+            &ExportInput {
+                sessions: &[local.clone()],
+                commits: &[],
+                agent_commits: &[],
+                authors: &[],
+                window: (None, None),
+                now: at(0),
+                human_idle: Duration::hours(1),
+                review_credit: Duration::minutes(30),
+                gap_cap: Duration::minutes(5),
+            },
+            &machine('a', "laptop"),
+            false,
+        );
+        let text = serde_json::to_string(&bundle).unwrap();
+        assert!(!text.contains("alice"), "{text}");
+        assert_eq!(
+            opaque_session_id(&local.provider, &local.session_id),
+            bundle.sessions[0].session_id
+        );
+    }
+
+    fn mark(from: Option<i64>, branch: &str) -> BranchMark {
+        BranchMark {
+            from: from.map(at),
+            branch: branch.into(),
+        }
+    }
+
+    #[test]
+    fn imported_marks_are_sorted_with_one_start_and_no_repeats() {
+        let mut dropped = 0;
+        let marks = bounded_marks(
+            vec![
+                mark(Some(30), "c"),
+                mark(None, "a"),
+                mark(Some(10), "b"),
+                // A second start, a repeat of the branch before it, an invalid
+                // name: each is dropped and counted.
+                mark(None, "z"),
+                mark(Some(20), "b"),
+                mark(Some(40), ""),
+            ],
+            &mut dropped,
+        );
+        let names: Vec<&str> = marks.iter().map(|mark| mark.branch.as_str()).collect();
+        assert_eq!(vec!["a", "b", "c"], names);
+        assert_eq!(None, marks[0].from);
+        assert_eq!(3, dropped);
+        // So the branch in force follows the clock, which an unsorted list
+        // would have got wrong.
+        assert_eq!(Some("a"), crate::model::branch_at(&marks, at(5)));
+        assert_eq!(Some("b"), crate::model::branch_at(&marks, at(15)));
+        assert_eq!(Some("c"), crate::model::branch_at(&marks, at(35)));
     }
 
     #[test]
