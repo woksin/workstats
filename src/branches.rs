@@ -703,7 +703,18 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             // Resolved, so macOS's `/var` symlink does not make the test's
             // paths differ from the ones Git and the checkout lookup report.
-            let path = directory.path().canonicalize().unwrap().join("repo");
+            // Windows canonicalizes to a verbatim `\\?\C:\…` path, which
+            // `git worktree add` cannot create directories under, so the
+            // prefix is dropped; the rest of the path is unchanged.
+            let resolved = directory.path().canonicalize().unwrap();
+            let resolved = match resolved
+                .to_str()
+                .and_then(|text| text.strip_prefix(r"\\?\"))
+            {
+                Some(plain) => PathBuf::from(plain),
+                None => resolved,
+            };
+            let path = resolved.join("repo");
             fs::create_dir_all(&path).unwrap();
             let repo = Self {
                 _directory: directory,
