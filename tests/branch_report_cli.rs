@@ -326,6 +326,51 @@ fn describe_adds_commit_subjects_and_session_titles_only_when_asked() {
 }
 
 #[test]
+fn the_default_markdown_pr_block_carries_the_description() {
+    let fixture = fixture(FEATURE, None);
+    let path = fixture
+        ._directory
+        .path()
+        .join("claude/project/feature.jsonl");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push('\n');
+    text.push_str(
+        &serde_json::json!({"type": "ai-title", "sessionId": "feat1", "aiTitle": "Add the *ACME* widget"})
+            .to_string(),
+    );
+    text.push('\n');
+    text.push_str(
+        &serde_json::json!({"type": "last-prompt", "sessionId": "feat1", "lastPrompt": "SECRET PROMPT TEXT"})
+            .to_string(),
+    );
+    fs::write(&path, text).unwrap();
+
+    // No --format: the Markdown block is what `pr` prints.
+    let plain = fixture.command(&["pr", FEATURE], &[]);
+    let plain = String::from_utf8_lossy(&stdout_of(&plain)).into_owned();
+    assert!(!plain.contains("Description"), "{plain}");
+
+    let described = fixture.command(&["pr", FEATURE], &["--describe", "commits,sessions"]);
+    let text = String::from_utf8_lossy(&stdout_of(&described)).into_owned();
+    assert!(text.contains("**Effort (estimated):**"), "{text}");
+    assert!(
+        text.contains("**Description:** Add the \\*ACME\\* widget; a.txt; b.txt"),
+        "{text}"
+    );
+    assert!(!text.contains("SECRET PROMPT TEXT"), "{text}");
+}
+
+/// The stdout of a command that must have succeeded.
+fn stdout_of(output: &std::process::Output) -> Vec<u8> {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout.clone()
+}
+
+#[test]
 fn a_missing_branch_and_a_base_branch_without_a_window_are_refused() {
     let fixture = fixture(FEATURE, None);
     let output = fixture.command(&["branch", "no-such-branch"], &[]);

@@ -499,6 +499,8 @@ fn run(request: Request) -> Result<()> {
     }
     let plan = describe::Plan::parse(&describe, None, None, false)?;
     let describe_context = describe::Context::from_report(&arguments);
+    // The branch report shows no goals.
+    arguments.no_goals = true;
     let collected = collect(arguments, Purpose::Query)?;
 
     let aliases = collected
@@ -1296,6 +1298,33 @@ fn pr_block(output: &Output) -> String {
             None => String::new(),
         }
     ));
+    // `--describe` text is one bounded line per branch. One branch needs no
+    // label; several get one line each, so the reader can tell whose it is.
+    let described: Vec<&Entry> = output
+        .branches
+        .iter()
+        .filter(|entry| entry.description.is_some())
+        .collect();
+    match described.as_slice() {
+        [] => {}
+        [entry] if output.branches.len() == 1 => {
+            block.push_str(&format!(
+                "\n**Description:** {}\n",
+                escape(entry.description.as_deref().unwrap_or_default())
+            ));
+        }
+        entries => {
+            block.push_str("\n**Description:**\n");
+            for entry in entries {
+                block.push_str(&format!(
+                    "\n- {}: {}",
+                    escape(&entry.branch),
+                    escape(entry.description.as_deref().unwrap_or_default())
+                ));
+            }
+            block.push('\n');
+        }
+    }
     let mut footnote = NOTE.to_string();
     for warning in output
         .warnings
