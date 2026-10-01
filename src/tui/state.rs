@@ -307,6 +307,8 @@ pub enum Mode {
     Search,
     SaveView,
     Views,
+    /// The calendar heatmap overlay.
+    Calendar,
 }
 
 /// The `?` overlay, and the only place the key map is described to a user.
@@ -328,6 +330,10 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
     ("p", "cycle the period through month, day and ISO week"),
     ("w", "save the current view"),
     ("v", "open the saved views"),
+    (
+        "c",
+        "show the calendar heatmap of the window; ↑ ↓ change year",
+    ),
     ("d", "delete the highlighted saved view"),
     ("?", "show or hide this help"),
     ("q / Ctrl-C", "quit"),

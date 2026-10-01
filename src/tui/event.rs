@@ -35,6 +35,8 @@ pub enum Action {
     BeginSaveView,
     OpenViews,
     DeleteView,
+    /// Open the calendar heatmap, or close it again.
+    ToggleCalendar,
     Input(char),
     Backspace,
     Accept,
@@ -51,6 +53,7 @@ pub fn translate(mode: Mode, key: KeyEvent) -> Action {
     match mode {
         Mode::Normal => browsing(key, control),
         Mode::Views => picking(key),
+        Mode::Calendar => calendar(key),
         Mode::Filter | Mode::Search | Mode::SaveView => typing(key, control),
     }
 }
@@ -77,6 +80,7 @@ fn browsing(key: KeyEvent, control: bool) -> Action {
         KeyCode::Char('p') => Action::ToggleGrain,
         KeyCode::Char('w') => Action::BeginSaveView,
         KeyCode::Char('v') => Action::OpenViews,
+        KeyCode::Char('c') => Action::ToggleCalendar,
         KeyCode::Char('?') => Action::ToggleHelp,
         KeyCode::Char(digit @ '1'..='9') => Action::SortColumn(digit as usize - '1' as usize),
         _ => Action::Nothing,
@@ -92,6 +96,17 @@ fn picking(key: KeyEvent) -> Action {
         KeyCode::PageUp => Action::Page(-1),
         KeyCode::PageDown => Action::Page(1),
         KeyCode::Char('d') | KeyCode::Delete => Action::DeleteView,
+        KeyCode::Char('q') => Action::Quit,
+        _ => Action::Nothing,
+    }
+}
+
+fn calendar(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::Cancel,
+        KeyCode::Char('c') => Action::ToggleCalendar,
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp => Action::Move(-1),
+        KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown => Action::Move(1),
         KeyCode::Char('q') => Action::Quit,
         _ => Action::Nothing,
     }
@@ -200,9 +215,41 @@ mod tests {
             Mode::Search,
             Mode::SaveView,
             Mode::Views,
+            Mode::Calendar,
         ] {
             assert_eq!(Action::Quit, translate(mode, interrupt));
         }
+    }
+
+    #[test]
+    fn c_opens_the_calendar_and_closes_it_again() {
+        assert_eq!(
+            Action::ToggleCalendar,
+            translate(Mode::Normal, key(KeyCode::Char('c')))
+        );
+        assert_eq!(
+            Action::ToggleCalendar,
+            translate(Mode::Calendar, key(KeyCode::Char('c')))
+        );
+        assert_eq!(Action::Cancel, translate(Mode::Calendar, key(KeyCode::Esc)));
+        assert_eq!(
+            Action::Move(-1),
+            translate(Mode::Calendar, key(KeyCode::Up))
+        );
+        assert_eq!(
+            Action::Move(1),
+            translate(Mode::Calendar, key(KeyCode::Char('j')))
+        );
+        // The calendar does not descend, filter, or sort.
+        assert_eq!(
+            Action::Nothing,
+            translate(Mode::Calendar, key(KeyCode::Char('/')))
+        );
+        // `c` is only a command while browsing: typed text keeps it.
+        assert_eq!(
+            Action::Input('c'),
+            translate(Mode::Filter, key(KeyCode::Char('c')))
+        );
     }
 
     #[test]

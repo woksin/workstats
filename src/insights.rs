@@ -1869,6 +1869,16 @@ fn render_text(document: &Document) -> String {
                 }
             }
             Block::Table(table) => push_text_table(&mut output, table),
+            Block::Heatmap(heatmap) => {
+                for grid in &heatmap.grids {
+                    output.push_str(&format!("{}\n", safe_text(&grid.label)));
+                    for line in crate::document::heatmap_lines(grid, '·') {
+                        output.push_str(&format!("{line}\n"));
+                    }
+                    output.push('\n');
+                }
+                output.push_str(&format!("{}\n", safe_text(&heatmap.legend)));
+            }
         }
     }
     output

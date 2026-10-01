@@ -1177,6 +1177,14 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         blocks.push(Block::Section("Goals".to_string()));
         blocks.push(Block::List(goals.lines()));
     }
+
+    // The HTML page always has per-day figures and Markdown has them under
+    // `--daily`; a window shorter than 28 days is a list, not a calendar.
+    if let Some(heatmap) = crate::calendar::for_document(report) {
+        blocks.push(Block::Section("Calendar".to_string()));
+        blocks.push(Block::Heatmap(heatmap));
+    }
+
     blocks.push(Block::Section("Notes".to_string()));
     blocks.push(Block::List(
         footer_notes(report, diagnostics)
@@ -2168,6 +2176,7 @@ mod tests {
             },
             comparison: None,
             daily: None,
+            window: (None, None),
             goals: None,
         }
     }
@@ -2477,6 +2486,56 @@ mod tests {
         assert!(!html.contains("<b>"), "{html}");
         assert!(html.contains("&lt;script&gt;&amp;&quot;x&quot;|y"));
         assert!(html.contains("Warning: bad &lt;b&gt;path&lt;/b&gt;·| x"));
+    }
+
+    fn day_figures(date: &str, human_seconds: f64) -> crate::model::DayFigures {
+        crate::model::DayFigures {
+            date: date.parse().expect("a date"),
+            human_seconds,
+            agent_wall_seconds: 0.0,
+            prompts: 0,
+            commits: 0,
+            sessions: 0,
+        }
+    }
+
+    #[test]
+    fn the_html_page_draws_a_calendar_when_the_window_is_open() {
+        let mut report = hostile_report();
+        report.daily = Some(vec![day_figures("2026-08-12", 5400.0)]);
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(html.contains("<h2>Calendar</h2>"), "{html}");
+        assert!(html.contains("<svg class=\"cal\""));
+        assert!(html.contains("<title>2026-08-12 · 1h 30m</title>"));
+        // The hostile repository name is still only ever escaped text.
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("href"), "{html}");
+
+        // Markdown gets the same block when per-day figures were asked for.
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(markdown.contains("## Calendar\n"), "{markdown}");
+        assert!(markdown.contains("```text\n"));
+    }
+
+    #[test]
+    fn no_calendar_without_daily_figures_or_for_a_short_window() {
+        let mut report = hostile_report();
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!markdown.contains("Calendar"), "{markdown}");
+
+        report.daily = Some(vec![day_figures("2026-08-12", 5400.0)]);
+        let local = |text: &str| {
+            use chrono::TimeZone;
+            let date: chrono::NaiveDate = text.parse().unwrap();
+            chrono::Local
+                .from_local_datetime(&date.and_time(chrono::NaiveTime::MIN))
+                .earliest()
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        report.window = (Some(local("2026-08-10")), Some(local("2026-08-17")));
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!html.contains("Calendar"), "{html}");
     }
 
     #[test]
