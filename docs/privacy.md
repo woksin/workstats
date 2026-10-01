@@ -202,6 +202,17 @@ nothing about the machine and is sent nowhere. It appears only inside bundles
 you export, where it keeps one machine's `local:` repository keys apart from
 another's. It is never regenerated if the file is unreadable.
 
+### The calendar heatmap
+
+The calendar (`workstats calendar`, the HTML page, `--daily` Markdown and the
+explorer's `c` overlay) is drawn from the per-day human-time figures the report
+already holds. It adds nothing to what a report says beyond the layout: a date
+and a duration per square, and the legend's shade thresholds. No repository,
+branch, path or prompt text reaches it, and the HTML form is an inline SVG with
+no script, no link and no external resource, so it fits the page's
+`default-src 'none'` policy. A page that includes it shows which days you worked
+and for how long; share it the way you would share the report it belongs to.
+
 ### Bundles
 
 `workstats export` writes a `workstats-bundle` so another machine can merge your

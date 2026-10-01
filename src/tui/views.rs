@@ -644,6 +644,7 @@ const fn mode_name(mode: Mode) -> &'static str {
         Mode::Search => "search",
         Mode::SaveView => "save view",
         Mode::Views => "saved views",
+        Mode::Calendar => "calendar",
     }
 }
 
@@ -654,6 +655,7 @@ fn draw_overlays(frame: &mut Frame, area: Rect, app: &App) {
         Mode::Views => draw_views(frame, area, app),
         Mode::Search => draw_search(frame, area, app),
         Mode::SaveView => draw_save_view(frame, area, app),
+        Mode::Calendar => draw_calendar(frame, area, app),
         Mode::Normal | Mode::Filter => {}
     }
     // Help sits on top of everything else: it is what a lost reader reaches for.
@@ -829,6 +831,98 @@ fn draw_views(frame: &mut Frame, area: Rect, app: &App) {
             .highlight_symbol(MARKER),
         inner,
         &mut state,
+    );
+}
+
+/// The shade of each calendar level. The glyphs differ as well as the colours,
+/// so the grid still reads on a terminal with no colour or a colour-blind
+/// reader.
+const SHADES: [(&str, Style); 5] = [
+    ("·", DIM),
+    (
+        "░",
+        Style::new().fg(Color::Green).add_modifier(Modifier::DIM),
+    ),
+    ("▒", Style::new().fg(Color::Green)),
+    ("▓", Style::new().fg(Color::LightGreen)),
+    (
+        "█",
+        Style::new()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD),
+    ),
+];
+const WEEKDAY_LABELS: [&str; 7] = ["Mon", "", "Wed", "", "Fri", "", "Sun"];
+
+/// The calendar heatmap over the report window, one year at a time. Colours
+/// are drawn per cell; everything else on screen is text this tool wrote.
+fn draw_calendar(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(grid) = app
+        .heatmap()
+        .and_then(|heatmap| heatmap.grids.get(app.calendar_selected()))
+    else {
+        return;
+    };
+    let grids = app.heatmap().map_or(0, |heatmap| heatmap.grids.len());
+    let legend = app.heatmap().map_or("", |heatmap| heatmap.legend.as_str());
+    let title = if grids > 1 {
+        format!(
+            "Calendar {} ({}/{grids})",
+            grid.label,
+            app.calendar_selected() + 1
+        )
+    } else {
+        format!("Calendar {}", grid.label)
+    };
+    let label_width = 4;
+    let legend_lines = 3;
+    let outer = overlay(
+        area,
+        cells(grid.columns + label_width + 4).max(44),
+        cells(7 + 1 + legend_lines + 2),
+    );
+    let footer = if grids > 1 {
+        "↑ ↓ year · c or Esc closes"
+    } else {
+        "c or Esc closes"
+    };
+    let inner = panel(frame, outer, &title, footer);
+    if inner.is_empty() {
+        return;
+    }
+    let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::styled(" ", PLAIN); grid.columns]; 7];
+    for cell in &grid.cells {
+        if let Some(slot) = rows
+            .get_mut(cell.row)
+            .and_then(|row| row.get_mut(cell.column))
+        {
+            let (glyph, style) = SHADES[usize::from(cell.level).min(4)];
+            *slot = Span::styled(glyph, style);
+        }
+    }
+    let mut lines = vec![Line::styled(
+        format!(
+            "{:label_width$}{}",
+            "",
+            crate::document::heatmap_ruler(grid)
+        ),
+        DIM,
+    )];
+    for (label, row) in WEEKDAY_LABELS.iter().zip(rows) {
+        let mut spans = vec![Span::styled(format!("{label:label_width$}"), DIM)];
+        spans.extend(row);
+        lines.push(Line::from(spans));
+    }
+    // The grid is never wrapped, so a narrow terminal clips it instead of
+    // folding its rows into each other; only the legend is prose.
+    let [grid_area, legend_area] =
+        Layout::vertical([Constraint::Length(cells(lines.len())), Constraint::Fill(1)])
+            .spacing(1)
+            .areas(inner);
+    frame.render_widget(Paragraph::new(lines), grid_area);
+    frame.render_widget(
+        Paragraph::new(Line::styled(legend.to_string(), DIM)).wrap(Wrap { trim: true }),
+        legend_area,
     );
 }
 
@@ -1137,6 +1231,69 @@ mod tests {
                 row.trim_end().to_string()
             })
             .collect()
+    }
+
+    fn calendar_map() -> crate::document::Heatmap {
+        use crate::document::{HeatCell, HeatGrid, Heatmap};
+        Heatmap {
+            grids: ["2025", "2026"]
+                .iter()
+                .map(|year| HeatGrid {
+                    label: (*year).to_string(),
+                    columns: 3,
+                    cells: (0..3)
+                        .flat_map(|column| {
+                            (0..7).map(move |row| HeatCell {
+                                column,
+                                row,
+                                level: ((column + row) % 5) as u8,
+                                title: String::new(),
+                            })
+                        })
+                        .collect(),
+                    months: vec![(0, "Jan".to_string())],
+                })
+                .collect(),
+            legend: "Human time per day.".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_calendar_overlay_draws_the_newest_year_with_shades_and_weekday_labels() {
+        let (mut app, _directory) = wide_app();
+        app.set_heatmap_for_test(calendar_map());
+        app.apply(Action::ToggleCalendar);
+        let lines = screen(&mut app, 100, 30);
+        let text = lines.join("\n");
+        assert!(text.contains("Calendar 2026 (2/2)"), "{text}");
+        assert!(text.contains("Mon"), "{text}");
+        assert!(text.contains("Sun"), "{text}");
+        assert!(text.contains("Jan"), "{text}");
+        for shade in ["·", "░", "▒", "▓", "█"] {
+            assert!(text.contains(shade), "missing {shade}\n{text}");
+        }
+        assert!(
+            text.contains("calendar"),
+            "the status line names the mode\n{text}"
+        );
+        app.apply(Action::Move(-1));
+        assert!(
+            screen(&mut app, 100, 30)
+                .join("\n")
+                .contains("Calendar 2025 (1/2)")
+        );
+    }
+
+    #[test]
+    fn the_calendar_overlay_survives_tiny_terminals() {
+        let (mut app, _directory) = wide_app();
+        app.set_heatmap_for_test(calendar_map());
+        app.apply(Action::ToggleCalendar);
+        for width in [1, 5, 20, 60] {
+            for height in [1, 3, 8, 14] {
+                screen(&mut app, width, height);
+            }
+        }
     }
 
     fn entries(width: usize, count: usize) -> Vec<Entry> {

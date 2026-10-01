@@ -756,6 +756,11 @@ pub struct Report {
     /// explorer, or `--daily`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daily: Option<Vec<DayFigures>>,
+    /// The window the report covers. Not part of the JSON: it is what a
+    /// calendar needs to draw the days with nothing on them, which `daily`
+    /// leaves out.
+    #[serde(skip)]
+    pub window: crate::cli::ReportWindow,
     /// Weekly-hours and list-value-cap progress. Present only when goals are
     /// configured and not disabled.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -16,6 +16,7 @@ use super::state::{
     columns, default_sort, default_views_path, key_of, path_from_file_key,
 };
 use super::{diff, search};
+use crate::document::Heatmap;
 use crate::model::{GitCommit, Report};
 
 /// The most hits the search overlay will ever show. Anything past this is
@@ -50,6 +51,11 @@ pub struct App {
     views: SavedViews,
     views_path: PathBuf,
     views_selected: usize,
+    /// The calendar for the report window; `None` when the report carries no
+    /// per-day figures.
+    heatmap: Option<Heatmap>,
+    /// Which of its grids the overlay shows.
+    calendar_selected: usize,
     index: Index,
     hits: Vec<SearchRow>,
     search_selected: usize,
@@ -81,6 +87,8 @@ impl App {
             help: false,
             views_path,
             views_selected: 0,
+            heatmap: crate::calendar::build(report),
+            calendar_selected: 0,
             hits: Vec::new(),
             search_selected: 0,
             diff: None,
@@ -161,6 +169,14 @@ impl App {
         self.views_selected
     }
 
+    pub fn heatmap(&self) -> Option<&Heatmap> {
+        self.heatmap.as_ref()
+    }
+
+    pub fn calendar_selected(&self) -> usize {
+        self.calendar_selected
+    }
+
     pub fn search_hits(&self) -> &[SearchRow] {
         &self.hits
     }
@@ -208,6 +224,7 @@ impl App {
             Mode::Search => self.apply_search(action),
             Mode::SaveView => self.apply_save_view(action),
             Mode::Views => self.apply_views(action),
+            Mode::Calendar => self.apply_calendar(action),
         }
     }
 
@@ -249,6 +266,16 @@ impl App {
                     self.views_selected = 0;
                 }
             }
+            Action::ToggleCalendar => match &self.heatmap {
+                Some(heatmap) if !heatmap.grids.is_empty() => {
+                    self.mode = Mode::Calendar;
+                    // The newest year is the one a reader wants first.
+                    self.calendar_selected = heatmap.grids.len() - 1;
+                }
+                _ => {
+                    self.status = Some("no per-day figures in this window to draw".to_string());
+                }
+            },
             Action::Nothing
             | Action::Input(_)
             | Action::Backspace
@@ -345,6 +372,21 @@ impl App {
             }
             Action::DeleteView => self.delete_saved_view(self.views_selected),
             Action::Cancel => self.close_overlay(),
+            Action::Quit => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn apply_calendar(&mut self, action: Action) {
+        match action {
+            Action::Move(delta) => {
+                let grids = self
+                    .heatmap
+                    .as_ref()
+                    .map_or(0, |heatmap| heatmap.grids.len());
+                self.calendar_selected = step(self.calendar_selected, delta, grids);
+            }
+            Action::Cancel | Action::ToggleCalendar => self.close_overlay(),
             Action::Quit => self.quit = true,
             _ => {}
         }
@@ -639,6 +681,8 @@ pub(super) fn app_for_test(data: Dataset, views_path: PathBuf) -> App {
         views: SavedViews::default(),
         views_path,
         views_selected: 0,
+        heatmap: None,
+        calendar_selected: 0,
         hits: Vec::new(),
         search_selected: 0,
         diff: None,
@@ -649,6 +693,13 @@ pub(super) fn app_for_test(data: Dataset, views_path: PathBuf) -> App {
     };
     app.rebuild();
     app
+}
+
+#[cfg(test)]
+impl App {
+    pub(super) fn set_heatmap_for_test(&mut self, heatmap: Heatmap) {
+        self.heatmap = Some(heatmap);
+    }
 }
 
 /// Moves `current` by `delta` and keeps it inside `0..length`, saturating at
@@ -881,6 +932,62 @@ mod tests {
         app.apply(Action::Accept);
         assert_eq!(before, app.breadcrumb());
         assert_eq!(Mode::Normal, app.mode());
+    }
+
+    fn sample_heatmap(years: usize) -> Heatmap {
+        use crate::document::{HeatCell, HeatGrid};
+        Heatmap {
+            grids: (0..years)
+                .map(|index| HeatGrid {
+                    label: (2025 + index).to_string(),
+                    columns: 1,
+                    cells: vec![HeatCell {
+                        column: 0,
+                        row: 0,
+                        level: 3,
+                        title: "2025-01-06 · 1h".to_string(),
+                    }],
+                    months: vec![(0, "Jan".to_string())],
+                })
+                .collect(),
+            legend: "legend".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_calendar_opens_on_the_newest_year_and_closes_with_c_or_escape() {
+        let (mut app, _directory) = app();
+        app.heatmap = Some(sample_heatmap(3));
+        app.apply(Action::ToggleCalendar);
+        assert_eq!(Mode::Calendar, app.mode());
+        assert_eq!(2, app.calendar_selected());
+        app.apply(Action::Move(-1));
+        assert_eq!(1, app.calendar_selected());
+        // Saturates at both ends, as the lists do.
+        app.apply(Action::Move(-9));
+        assert_eq!(0, app.calendar_selected());
+        app.apply(Action::Move(9));
+        assert_eq!(2, app.calendar_selected());
+        app.apply(Action::ToggleCalendar);
+        assert_eq!(Mode::Normal, app.mode());
+
+        app.apply(Action::ToggleCalendar);
+        app.apply(Action::Cancel);
+        assert_eq!(Mode::Normal, app.mode());
+        // Browsing is where it was: opening the calendar moved nothing.
+        assert_eq!(LevelKind::Overview, app.level());
+    }
+
+    #[test]
+    fn a_report_without_daily_figures_says_so_instead_of_opening_an_empty_overlay() {
+        let (mut app, _directory) = app();
+        app.heatmap = None;
+        app.apply(Action::ToggleCalendar);
+        assert_eq!(Mode::Normal, app.mode());
+        assert!(
+            app.status()
+                .is_some_and(|status| status.contains("per-day"))
+        );
     }
 
     #[test]

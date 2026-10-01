@@ -787,6 +787,7 @@ fn assemble_report(
             cache: transcript_cache.map(|cache| cache.path().to_string_lossy().into_owned()),
         },
         daily: built.daily,
+        window: prepared.window,
         goals: None,
     };
     (report, built.timeline)

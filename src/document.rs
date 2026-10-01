@@ -30,6 +30,93 @@ pub(crate) enum Block {
     Table(Table),
     Paragraph(String),
     List(Vec<String>),
+    Heatmap(Heatmap),
+}
+
+/// A calendar of one figure per day, already reduced to shade levels. The
+/// renderers draw it and know nothing about what the figure is: the title of a
+/// cell carries the date and the figure as text, and the legend says what the
+/// shades mean.
+pub(crate) struct Heatmap {
+    pub(crate) grids: Vec<HeatGrid>,
+    pub(crate) legend: String,
+}
+
+/// One grid: ISO weeks as columns, Monday first, seven rows.
+pub(crate) struct HeatGrid {
+    pub(crate) label: String,
+    pub(crate) columns: usize,
+    pub(crate) cells: Vec<HeatCell>,
+    /// A month name and the column it starts at, for the ruler above the grid.
+    pub(crate) months: Vec<(usize, String)>,
+}
+
+pub(crate) struct HeatCell {
+    pub(crate) column: usize,
+    /// 0 is Monday.
+    pub(crate) row: usize,
+    /// 0 is no activity; 1 to 4 are the quartiles of the days that had some.
+    pub(crate) level: u8,
+    /// What a hover shows: the date and the figure.
+    pub(crate) title: String,
+}
+
+/// Shade glyphs by level. A space for level 0 keeps a Markdown code block quiet;
+/// the terminal view swaps in a dot so the shape of the grid shows.
+const SHADES: [char; 5] = [' ', '░', '▒', '▓', '█'];
+const WEEKDAYS: [&str; 7] = ["Mon", "", "Wed", "", "Fri", "", "Sun"];
+const LABEL_WIDTH: usize = 4;
+
+/// The month names of a grid laid out over its columns. A name that would run
+/// into the previous one is left out rather than printed over it, and only
+/// ASCII letters are kept, so the ruler is safe inside a Markdown code fence.
+pub(crate) fn heatmap_ruler(grid: &HeatGrid) -> String {
+    let mut ruler = vec![' '; grid.columns];
+    let mut next_free = 0;
+    for (column, name) in &grid.months {
+        let name: Vec<char> = name
+            .chars()
+            .filter(char::is_ascii_alphabetic)
+            .take(3)
+            .collect();
+        if *column < next_free {
+            continue;
+        }
+        if ruler.len() < column + name.len() {
+            ruler.resize(column + name.len(), ' ');
+        }
+        for (offset, character) in name.iter().enumerate() {
+            ruler[column + offset] = *character;
+        }
+        next_free = column + name.len() + 1;
+    }
+    ruler.into_iter().collect::<String>().trim_end().to_string()
+}
+
+/// A grid as lines of text: a month ruler, then one line per weekday. A day
+/// with no activity is drawn as `empty`; a day outside the window as a space.
+/// Only the shade glyphs, ASCII letters and spaces can appear, whatever the
+/// grid holds, so the lines are safe inside a Markdown code fence.
+pub(crate) fn heatmap_lines(grid: &HeatGrid, empty: char) -> Vec<String> {
+    let mut rows = vec![vec![' '; grid.columns]; 7];
+    for cell in &grid.cells {
+        if let Some(slot) = rows
+            .get_mut(cell.row)
+            .and_then(|row| row.get_mut(cell.column))
+        {
+            *slot = if cell.level == 0 {
+                empty
+            } else {
+                SHADES[usize::from(cell.level).min(4)]
+            };
+        }
+    }
+    let mut lines = vec![format!("{:LABEL_WIDTH$}{}", "", heatmap_ruler(grid))];
+    for (label, row) in WEEKDAYS.iter().zip(rows) {
+        let line: String = row.into_iter().collect();
+        lines.push(format!("{label:LABEL_WIDTH$}{}", line.trim_end()));
+    }
+    lines
 }
 
 pub(crate) struct Column {
@@ -168,9 +255,23 @@ pub(crate) fn render_markdown(document: &Document) -> String {
                 }
             }
             Block::Table(table) => render_markdown_table(&mut output, table),
+            Block::Heatmap(heatmap) => render_markdown_heatmap(&mut output, heatmap),
         }
     }
     output
+}
+
+fn render_markdown_heatmap(output: &mut String, heatmap: &Heatmap) {
+    for grid in &heatmap.grids {
+        output.push_str(&format!("### {}\n\n```text\n", markdown_text(&grid.label)));
+        for line in heatmap_lines(grid, ' ') {
+            output.push_str(line.trim_end());
+            output.push('\n');
+        }
+        output.push_str("```\n\n");
+    }
+    output.push_str(&markdown_text(&heatmap.legend));
+    output.push('\n');
 }
 
 fn render_markdown_table(output: &mut String, table: &Table) {
@@ -208,8 +309,8 @@ fn render_markdown_table(output: &mut String, table: &Table) {
 /// `prefers-color-scheme` follows the reader's system without a script, and the
 /// fonts are the system's own, so nothing is fetched.
 const STYLE: &str = "\
-:root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--muted:#59636e;--line:#d1d9e0;--head:#f6f8fa;--accent:#0969da}\
-@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--line:#3d444d;--head:#151b23;--accent:#4493f8}}\
+:root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--muted:#59636e;--line:#d1d9e0;--head:#f6f8fa;--accent:#0969da;--l0:#ebedf0;--l1:#9be9a8;--l2:#40c463;--l3:#30a14e;--l4:#216e39}\
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--line:#3d444d;--head:#151b23;--accent:#4493f8;--l0:#161b22;--l1:#0e4429;--l2:#006d32;--l3:#26a641;--l4:#39d353}}\
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif}\
 main{max-width:70rem;margin:0 auto;padding:2rem 1rem}\
 h1{font-size:1.6rem;margin:0 0 1rem}\
@@ -221,7 +322,11 @@ th,td{padding:.35rem .7rem;border:1px solid var(--line);text-align:left;vertical
 thead th,tbody th{background:var(--head);font-weight:600}\
 .num{text-align:right;font-variant-numeric:tabular-nums}\
 tfoot td{font-weight:600;background:var(--head)}\
-ul{padding-left:1.4rem}";
+ul{padding-left:1.4rem}\
+h3{font-size:1rem;margin:1rem 0 .25rem}\
+svg.cal{display:block}\
+svg.cal text{fill:var(--muted);font-size:9px}\
+svg.cal .l0{fill:var(--l0)}svg.cal .l1{fill:var(--l1)}svg.cal .l2{fill:var(--l2)}svg.cal .l3{fill:var(--l3)}svg.cal .l4{fill:var(--l4)}";
 
 /// A single static HTML page: inline CSS, no script, and no reference to any
 /// other resource. A `Content-Security-Policy` of `default-src 'none'` says so
@@ -259,10 +364,68 @@ pub(crate) fn render_html(document: &Document) -> String {
                 output.push_str("</tbody>\n</table></div>\n");
             }
             Block::Table(table) => render_html_table(&mut output, table),
+            Block::Heatmap(heatmap) => render_html_heatmap(&mut output, heatmap),
         }
     }
     output.push_str("</main>\n</body>\n</html>\n");
     output
+}
+
+/// Each cell is the side of a square, and the pitch leaves a gap between them.
+const CELL: usize = 11;
+const PITCH: usize = 13;
+const LEFT_MARGIN: usize = 28;
+const TOP_MARGIN: usize = 14;
+
+/// An inline `<svg>` per grid: no script, no link, no external reference. Every
+/// attribute that is not a number this function computed is a class name from
+/// a fixed list, and the only text is inside `<title>` and `<text>`, both
+/// escaped like any other value. The colours are classes in `STYLE`, so dark
+/// mode and the CSP (`style-src 'unsafe-inline'`) are the page's, not the
+/// graphic's.
+fn render_html_heatmap(output: &mut String, heatmap: &Heatmap) {
+    for grid in &heatmap.grids {
+        let label = html_text(&grid.label);
+        let width = LEFT_MARGIN + grid.columns * PITCH;
+        let height = TOP_MARGIN + 7 * PITCH;
+        output.push_str(&format!(
+            "<h3>{label}</h3>\n<div class=\"scroll\"><svg class=\"cal\" viewBox=\"0 0 {width} {height}\" width=\"{width}\" height=\"{height}\" role=\"img\" aria-label=\"{label}\">\n"
+        ));
+        for (column, name) in &grid.months {
+            let name: String = name
+                .chars()
+                .filter(char::is_ascii_alphabetic)
+                .take(3)
+                .collect();
+            output.push_str(&format!(
+                "<text x=\"{}\" y=\"{}\">{}</text>\n",
+                LEFT_MARGIN + column * PITCH,
+                TOP_MARGIN - 4,
+                html_text(&name)
+            ));
+        }
+        for (row, weekday) in WEEKDAYS
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| !name.is_empty())
+        {
+            output.push_str(&format!(
+                "<text x=\"0\" y=\"{}\">{weekday}</text>\n",
+                TOP_MARGIN + row * PITCH + CELL - 2
+            ));
+        }
+        for cell in &grid.cells {
+            output.push_str(&format!(
+                "<rect class=\"l{}\" x=\"{}\" y=\"{}\" width=\"{CELL}\" height=\"{CELL}\" rx=\"2\"><title>{}</title></rect>\n",
+                cell.level.min(4),
+                LEFT_MARGIN + cell.column * PITCH,
+                TOP_MARGIN + cell.row.min(6) * PITCH,
+                html_text(&cell.title)
+            ));
+        }
+        output.push_str("</svg></div>\n");
+    }
+    output.push_str(&format!("<p>{}</p>\n", html_text(&heatmap.legend)));
 }
 
 fn render_html_table(output: &mut String, table: &Table) {

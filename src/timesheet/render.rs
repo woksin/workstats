@@ -14,7 +14,7 @@ use serde_json::{Map, Value, json};
 use super::compute::{Computation, round_to_cents};
 use super::model::{Adjustment, EntryStatus, TimesheetEntry, TimesheetWindow, TotalsBy};
 use super::presets::status_name;
-use crate::document::{Block, Column, Document, Table};
+use crate::document::{Block, Column, Document, Table, heatmap_lines};
 use crate::output::safe_text;
 
 /// Stated at the top of every output.
@@ -557,6 +557,16 @@ pub(crate) fn render_text(document: &Document) -> String {
                 }
             }
             Block::Table(table) => text_table(&mut output, table),
+            Block::Heatmap(heatmap) => {
+                for grid in &heatmap.grids {
+                    let _ = writeln!(output, "{}", safe_text(&grid.label));
+                    for line in heatmap_lines(grid, '·') {
+                        let _ = writeln!(output, "{line}");
+                    }
+                    output.push('\n');
+                }
+                let _ = writeln!(output, "{}", safe_text(&heatmap.legend));
+            }
         }
     }
     output
