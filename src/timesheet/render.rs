@@ -256,6 +256,15 @@ pub(crate) fn document(view: &View<'_>) -> Document {
         blocks.push(Block::Table(engagement_table(view)));
     }
 
+    if !timesheet.drift.is_empty() {
+        blocks.push(Block::Section("DRIFT since locked".to_string()));
+        blocks.push(Block::Paragraph(
+            "The locked periods above show what was submitted. The current computation disagrees on these days; the cause is the most likely one, not a proof."
+                .to_string(),
+        ));
+        blocks.push(Block::Table(drift_table(view)));
+    }
+
     if !timesheet.dropped.is_empty() {
         let total: f64 = timesheet
             .dropped
@@ -335,7 +344,7 @@ fn facts(view: &View<'_>) -> Vec<(String, String)> {
             duration_text(reconciliation.unassigned_seconds.round() as u64)
         );
     }
-    vec![
+    let mut facts = vec![
         (
             "Window".to_string(),
             window_text(&timesheet.window, view.default_window),
@@ -349,7 +358,55 @@ fn facts(view: &View<'_>) -> Vec<(String, String)> {
             timesheet.methodology.split_rule.clone(),
         ),
         ("Reconciliation".to_string(), reconcile),
-    ]
+    ];
+    if !timesheet.applied_locks.is_empty() {
+        facts.push((
+            "Locked".to_string(),
+            format!(
+                "{}: the entries of these periods are the snapshots, not a recomputation",
+                timesheet.applied_locks.join(", ")
+            ),
+        ));
+    }
+    facts
+}
+
+/// `+0h 15m` or `-1h 00m`: a difference, always signed.
+fn signed_duration(seconds: i64) -> String {
+    format!(
+        "{}{}",
+        if seconds < 0 { "-" } else { "+" },
+        duration_text(seconds.unsigned_abs())
+    )
+}
+
+fn drift_table(view: &View<'_>) -> Table {
+    let rows = &view.computation.timesheet.drift;
+    Table::new(
+        vec![
+            Column::text("Date"),
+            Column::text("Engagement"),
+            Column::number("Locked"),
+            Column::number("Current"),
+            Column::number("Difference"),
+            Column::text("Likely cause"),
+        ],
+        rows.iter()
+            .map(|row| {
+                vec![
+                    row.date.to_string(),
+                    match &row.detail {
+                        Some(detail) => format!("{} / {detail}", row.engagement),
+                        None => row.engagement.clone(),
+                    },
+                    duration_text(row.locked_seconds),
+                    duration_text(row.current_seconds),
+                    signed_duration(row.difference_seconds),
+                    row.cause.clone(),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn entries_table(view: &View<'_>) -> Table {
@@ -766,6 +823,8 @@ mod tests {
                     split_rule: "once".to_string(),
                     rounding: "nearest to 15m".to_string(),
                 },
+                drift: Vec::new(),
+                applied_locks: Vec::new(),
             },
             reconciliation: Reconciliation {
                 raw_seconds: raw,

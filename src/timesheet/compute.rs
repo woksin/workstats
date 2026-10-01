@@ -45,6 +45,9 @@ pub(crate) struct Input<'a> {
     pub(crate) window: ReportWindow,
     /// `summary.human_estimated_seconds` of the same run.
     pub(crate) report_human_seconds: f64,
+    /// Manual entries, overrides and locks to apply; `None` computes the bare
+    /// estimate (the unit tests, which have no ledger).
+    pub(crate) ledger: Option<&'a ledger::Context<'a>>,
 }
 
 /// Whether the entries add up to the report they came from.
@@ -239,11 +242,15 @@ pub(crate) fn compute(input: &Input<'_>) -> Result<Computation> {
             split_rule: split_rule_text(settings.split).to_string(),
             rounding: rounding_text(settings),
         },
+        drift: Vec::new(),
+        applied_locks: Vec::new(),
     };
     // The one point where manual entries, overrides and locks reach the
     // computed figures. Everything above is the estimate; everything below is
     // what is displayed and exported.
-    ledger::apply(&mut timesheet).context("applying the timesheet ledger")?;
+    if let Some(context) = input.ledger {
+        ledger::apply(&mut timesheet, context).context("applying the timesheet ledger")?;
+    }
     finalize(&mut timesheet.entries);
     Ok(Computation {
         timesheet,
@@ -340,7 +347,7 @@ pub(crate) fn span_text(seconds: u64) -> String {
     text
 }
 
-fn entry_order(entry: &TimesheetEntry) -> (NaiveDate, bool, &str, &str) {
+pub(crate) fn entry_order(entry: &TimesheetEntry) -> (NaiveDate, bool, &str, &str) {
     (
         entry.date,
         entry.engagement == UNASSIGNED,
@@ -1026,6 +1033,7 @@ mod tests {
             settings,
             window: (None, None),
             report_human_seconds: seconds,
+            ledger: None,
         })
         .unwrap()
     }
@@ -1268,6 +1276,7 @@ mod tests {
             settings: &settings(SplitRule::Nearest, Rounding::Nearest),
             window: (None, None),
             report_human_seconds: 5000.0,
+            ledger: None,
         })
         .unwrap();
         assert!(!computation.reconciliation.consistent);

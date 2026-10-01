@@ -4,8 +4,10 @@
 //! collect the human timeline, compute suggested entries, filter, and present.
 //! The subcommands that change the ledger are dispatched from `run`.
 
+pub(crate) mod actions;
 pub(crate) mod compute;
 pub(crate) mod ledger;
+pub(crate) mod lock;
 pub(crate) mod model;
 pub(crate) mod presets;
 pub(crate) mod render;
@@ -24,7 +26,7 @@ use crate::document::{render_html, render_markdown};
 use crate::engagement::{self, Engagements, UNASSIGNED};
 use crate::model::Diagnostics;
 use crate::paths::{Config, home_dir, load_config};
-use crate::report::{Purpose, collect};
+use crate::report::{Collected, Purpose, collect};
 use model::{
     Detail, ExportPreset, Rounding, SplitRule, Timesheet, TimesheetSettings, TotalsBy,
     UnassignedMode,
@@ -255,7 +257,7 @@ pub(crate) struct LockArguments {
     // arguments of one name cannot share a command.
     #[arg(value_name = "PERIOD", help = "YYYY-MM, YYYY-Www, or A..B")]
     pub(crate) target: String,
-    #[arg(long, help = "Lock over existing drift or a lock already held")]
+    #[arg(long, help = "Replace the snapshot of a period that is already locked")]
     pub(crate) force: bool,
     #[command(flatten)]
     pub(crate) options: TimesheetOptions,
@@ -493,6 +495,7 @@ pub(crate) fn filter(
     timesheet
         .dropped
         .retain(|entry| keep(&entry.engagement, None));
+    timesheet.drift.retain(|row| keep(&row.engagement, None));
     if hidden.entries > 0 {
         if !wanted.is_empty() {
             hidden
@@ -515,20 +518,36 @@ pub(crate) fn run(arguments: TimesheetArguments) -> Result<()> {
         options,
         report,
     } = arguments;
-    // PLACEHOLDER (P3): the ledger actions are dispatched here. Each arm takes
-    // its own arguments and returns; only the plain `workstats timesheet` form
-    // reaches `run_report`.
-    match action {
-        None => {}
-        Some(_) => bail!("`workstats timesheet` subcommands are not yet implemented"),
+    // Each action takes only its own arguments and returns; only the plain
+    // `workstats timesheet` form reaches `run_report`.
+    if let Some(action) = action {
+        return actions::run(action);
     }
     run_report(options, report)
 }
 
-/// The report this command makes of its own: refused flags are refused before
-/// anything is scanned, and nothing is printed until everything has been
-/// computed.
-fn run_report(options: TimesheetOptions, mut report: ReportArguments) -> Result<()> {
+/// A computed timesheet and what it was computed from.
+pub(crate) struct Live {
+    pub(crate) collected: Collected,
+    pub(crate) resolved: Resolved,
+    pub(crate) computation: compute::Computation,
+    /// The ledger as it was read for this computation.
+    pub(crate) ledger: ledger::Ledger,
+    /// No window flag was given, so `--month current` was assumed.
+    pub(crate) default_window: bool,
+}
+
+/// Refuses what means nothing to a timesheet, reads the config, the ledger
+/// and the history, and computes the entries with the ledger applied.
+/// Everything that can be refused is refused before the history is scanned.
+/// Shared by the plain report and by `lock`, so a lock freezes exactly the
+/// figures the report shows. `ignore_locks` shows the live computation for
+/// locked periods.
+pub(crate) fn compute_live(
+    options: &TimesheetOptions,
+    mut report: ReportArguments,
+    ignore_locks: bool,
+) -> Result<Live> {
     // Flags that shape a report's rows mean nothing here, and ignoring them
     // silently is how a number gets read as something it is not.
     for (given, flag) in [
@@ -550,21 +569,11 @@ fn run_report(options: TimesheetOptions, mut report: ReportArguments) -> Result<
             );
         }
     }
-    let explicit_format = report.output_format;
-    if options.export.is_some()
-        && let Some(format) = explicit_format
-        && format != OutputFormat::Csv
-    {
-        bail!(
-            "--export writes CSV and cannot be combined with --format {}; drop one of them",
-            format.name()
-        );
-    }
 
     // Read early, so a bad flag or config value fails before a long scan.
     let mut diagnostics = Diagnostics::default();
     let config = load_config(report.config.as_deref(), &mut diagnostics);
-    let resolved = resolve(&options, &config)?;
+    let resolved = resolve(options, &config)?;
     let configured = Engagements::compile(
         config.engagements.as_ref(),
         &config.project_aliases,
@@ -583,12 +592,70 @@ fn run_report(options: TimesheetOptions, mut report: ReportArguments) -> Result<
             );
         }
     }
+    // An unreadable ledger stops the run: ignoring it would change hours that
+    // may already have been submitted.
+    let ledger = ledger::Ledger::load(&ledger::default_path())?;
 
     let default_window = !has_window(&report);
     if default_window {
         report.month = Some("current".to_string());
     }
     let collected = collect(report, Purpose::Query)?;
+
+    let current = lock::LockSettings::current(
+        &resolved.settings,
+        collected.settings.gap_cap,
+        collected.settings.human_idle,
+        collected.settings.review_credit,
+        engagement::active().fingerprint(),
+        &ledger.fingerprint(),
+    );
+    let context = ledger::Context {
+        ledger: &ledger,
+        engagements: engagement::active(),
+        ignore_locks,
+        current,
+    };
+    let mut computation = compute::compute(&compute::Input {
+        timeline: &collected.timeline,
+        engagements: engagement::active(),
+        settings: &resolved.settings,
+        window: collected.window,
+        report_human_seconds: collected.report.summary.human_estimated_seconds,
+        ledger: Some(&context),
+    })?;
+    render::describe_entries(options, &mut computation.timesheet.entries)?;
+    drop(context);
+    Ok(Live {
+        collected,
+        resolved,
+        computation,
+        ledger,
+        default_window,
+    })
+}
+
+/// The report this command makes of its own: refused flags are refused before
+/// anything is scanned, and nothing is printed until everything has been
+/// computed.
+fn run_report(options: TimesheetOptions, report: ReportArguments) -> Result<()> {
+    let explicit_format = report.output_format;
+    if options.export.is_some()
+        && let Some(format) = explicit_format
+        && format != OutputFormat::Csv
+    {
+        bail!(
+            "--export writes CSV and cannot be combined with --format {}; drop one of them",
+            format.name()
+        );
+    }
+    let Live {
+        collected,
+        resolved,
+        mut computation,
+        default_window,
+        ..
+    } = compute_live(&options, report, options.ignore_locks)?;
 
     let format = match (explicit_format, options.export) {
         (Some(format), _) => format,
@@ -602,14 +669,6 @@ fn run_report(options: TimesheetOptions, mut report: ReportArguments) -> Result<
             .unwrap_or(OutputFormat::Table),
     };
 
-    let mut computation = compute::compute(&compute::Input {
-        timeline: &collected.timeline,
-        engagements: engagement::active(),
-        settings: &resolved.settings,
-        window: collected.window,
-        report_human_seconds: collected.report.summary.human_estimated_seconds,
-    })?;
-    render::describe_entries(&options, &mut computation.timesheet.entries)?;
     let hidden = filter(
         &mut computation.timesheet,
         &options,
@@ -750,12 +809,6 @@ mod tests {
     #[test]
     fn a_manual_entry_cannot_be_both_billable_and_not() {
         assert!(parse(&["add", "today", "acme", "1h", "--billable", "--non-billable"]).is_err());
-    }
-
-    #[test]
-    fn the_ledger_actions_are_not_yet_dispatched() {
-        let error = run(parse(&["locks"]).unwrap()).unwrap_err();
-        assert!(error.to_string().contains("not yet implemented"));
     }
 
     fn config(timesheet: serde_json::Value) -> Config {
@@ -936,6 +989,8 @@ mod tests {
                 split_rule: String::new(),
                 rounding: String::new(),
             },
+            drift: Vec::new(),
+            applied_locks: Vec::new(),
         }
     }
 

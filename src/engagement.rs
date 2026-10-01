@@ -197,8 +197,6 @@ impl Engagements {
 
     /// A digest of the configuration the engagements were compiled from, so a
     /// lock can tell that the rules changed after it was taken.
-    // Read by the ledger's locks.
-    #[allow(dead_code)]
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
