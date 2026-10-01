@@ -81,6 +81,27 @@ Git's own `Binary files … differ` line — no bytes are ever emitted.
 These sections are filled in by the changes that add each read. Each states
 exactly what is read, what is stored, and what is never read.
 
+### Engagement configuration and timesheet outputs
+
+`engagements` in the config names clients, rates, currencies and the paths,
+remotes and branch patterns that identify them. It is read from the config file
+you wrote, never discovered, and it is not stored in the cache. The consequences
+to know about:
+
+- `workstats timesheet` prints those names and rates, and the amounts computed
+  from them, in its table, JSON, CSV, Markdown and HTML output. Treat a
+  timesheet as you would an invoice: anything you save, mail or paste carries
+  the client names, rates and hours.
+- The same keys appear as group names under `--group-by engagement`.
+- A timesheet adds no new reads. It is computed from the timeline the report
+  already built, so it never reads prompts, responses, file contents or commit
+  messages, and it makes no network call. Its evidence columns are counts
+  (prompts, commits, sessions), plus repository, branch and issue names.
+- The vendor CSV presets (`--export`) add the `timesheet.person` email and name
+  from the config, if you set them, and nothing else about you.
+- Descriptions are not part of this: they are opt-in and covered under
+  [Opt-in descriptions](#opt-in-descriptions).
+
 ### Branch names are read, cached and reported
 
 _Coming in this release._
