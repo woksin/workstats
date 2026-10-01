@@ -255,7 +255,7 @@ a path on your machine, so nothing scans it as one.
 
 `workstats now` keeps its last result in `now.json`, beside the index
 (`WORKSTATS_NOW_CACHE` overrides the path), so a prompt can print it without
-scanning anything. It is written with owner-only permissions, replaced
+scanning anything. It is created owner-only on Unix, replaced
 atomically, and holds:
 
 - the figures: today's human and agent time, prompts, commits and sessions, the
