@@ -123,8 +123,19 @@ fn a_recorded_branch_reaches_the_report_and_a_hostile_one_is_refused() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--branch"));
     let refused = record(&"b".repeat(257), "2026-03-02T09:20:00Z");
     assert!(!refused.status.success());
-    // Neither refused call wrote a line.
+    // `HEAD` and names Git forbids would be dropped on reading, so they are
+    // refused with a reason instead of being written.
+    let refused = record("HEAD", "2026-03-02T09:20:00Z");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("HEAD is not a branch name"));
+    let refused = record("fix login", "2026-03-02T09:20:00Z");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--branch"));
+    // No refused call wrote a line.
     assert_eq!(2, fs::read_to_string(&events).unwrap().lines().count());
+
+    // An all-digit name is a legal branch (a ticket number) and is kept.
+    assert!(record("4521873", "2026-03-02T09:30:00Z").status.success());
 
     // A record without --branch has no `branch` key at all.
     let plain = run(&[
@@ -150,7 +161,7 @@ fn a_recorded_branch_reaches_the_report_and_a_hostile_one_is_refused() {
     );
     let branches = prompts_by_branch(&report);
     assert_eq!(
-        vec!["feat/recorded", "main"],
+        vec!["4521873", "feat/recorded", "main"],
         branches.keys().map(String::as_str).collect::<Vec<_>>()
     );
     assert!(branches.values().all(|count| *count > 0));

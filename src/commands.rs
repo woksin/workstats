@@ -212,6 +212,16 @@ pub(crate) fn record_event(arguments: &RecordArguments) -> Result<()> {
     {
         bail!("--branch must be a branch name of at most 256 bytes without control characters");
     }
+    // The readers drop what is not a branch, so refuse it here rather than
+    // write a name that would silently vanish.
+    if let Some(branch) = arguments.branch.as_deref()
+        && !crate::branches::recordable_branch(branch)
+    {
+        if matches!(branch, "HEAD" | "@") {
+            bail!("--branch {branch:?}: HEAD is not a branch name (a detached checkout has none)");
+        }
+        bail!("--branch {branch:?} is not a valid Git branch name");
+    }
     // The value is echoed back because an RFC 3339 timestamp is usually wrong
     // in a way you can only see next to what you typed (AUDIT V).
     let timestamp = arguments

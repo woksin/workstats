@@ -143,14 +143,13 @@ fn a_configured_integration_branch_takes_over_the_fallback() {
     let config = config.to_str().unwrap();
 
     // `next` is the integration branch now. `c` is the only commit not on it
-    // (Unique to `main`); `a` predates the switch to `next`, so the reflog
-    // says it was made on `main`; `b` was made while `next` was out, which is
-    // the integration branch itself.
+    // (Unique to `main`); `a` and `b` are on `next`, so they are reported on
+    // it, whichever branch they were made on.
     let by_branch = git_report(
         &path,
         &arguments(&["--group-by", "branch", "--config", config]),
     );
-    let expected: BTreeMap<String, u64> = [("main".to_string(), 2), ("next".to_string(), 1)].into();
+    let expected: BTreeMap<String, u64> = [("main".to_string(), 1), ("next".to_string(), 2)].into();
     assert_eq!(expected, commits_by(&by_branch, &["branch"]));
 }
 
@@ -236,11 +235,14 @@ fn a_session_without_a_recorded_branch_follows_its_checkout() {
 }
 
 #[test]
-fn a_session_before_a_switch_is_on_the_branch_the_switch_left() {
+fn a_session_long_before_the_oldest_switch_has_no_branch_from_the_reflog() {
     let temporary = tempdir().unwrap();
     let path = repository_on_main(temporary.path(), "project");
     commit_on(&path, "a.txt", "a\n", "2026-02-27");
-    // The session ran on 2026-03-02, before the checkout moved on.
+    // The session ran on 2026-03-02, before the checkout moved on, but more
+    // than 30 days before the reflog is read (now): an expired switch could
+    // hide there, so the reflog does not say. The recent case is covered by
+    // the unit tests, which fix the read time.
     git_at(
         &path,
         "2026-03-10T10:00:00Z",
@@ -254,7 +256,7 @@ fn a_session_before_a_switch_is_on_the_branch_the_switch_left() {
     );
     let rows = report["rows"].as_array().unwrap();
     assert_eq!(1, rows.len(), "{rows:?}");
-    assert_eq!("main", rows[0]["key"]["branch"]);
+    assert_eq!("—", rows[0]["key"]["branch"]);
 }
 
 /// A `git` that appends its arguments to `log` and then runs the real one, so

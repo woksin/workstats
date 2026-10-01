@@ -15,8 +15,7 @@
 //!     other entries (`commit: <your message>`, `rebase: …`) are never
 //!     delivered to this process, let alone parsed.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -81,25 +80,35 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= MAXIMUM_NAME_BYTES && !name.chars().any(char::is_control)
 }
 
-/// Whether a reflog destination reads as a branch rather than a detached HEAD.
-/// `git checkout <sha>` and `git checkout HEAD~2` log their argument where a
-/// branch name would be. Branch names obey Git's ref rules, which exclude
-/// `~ ^ : ? * [ \`, spaces, `..` and `@{`, so those are told apart for free; a
-/// bare commit id is told apart by its shape. A tag checked out by name cannot
-/// be, and reads as a branch: the one blur this rule accepts.
-///
-/// The provider readers apply the same rule to the branch a transcript records
-/// (`gitBranch` is `HEAD` for a detached checkout), so those sessions stay
-/// open to the reflog fallback.
-pub(crate) fn plausible_branch(name: &str) -> bool {
-    let detached_id = name.len() >= 7 && name.chars().all(|c| c.is_ascii_hexdigit());
+/// Whether a name a provider or `log --branch` records can be a branch: bounded,
+/// free of control characters, not `HEAD` or `@` (what a detached checkout
+/// reports), and not a name Git forbids. Branch names obey Git's ref rules,
+/// which exclude spaces, `~ ^ : ? * [ \`, `..`, `@{`, a leading `-` and a
+/// trailing `/`, `.` or `.lock`, so a name that breaks them is not a branch.
+/// All-digit and all-hex names (ticket numbers, `deadbeef`) are legal branch
+/// names and are kept.
+pub(crate) fn recordable_branch(name: &str) -> bool {
     valid_name(name)
-        && !detached_id
         && name != "HEAD"
         && name != "@"
+        && !name.starts_with('-')
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
         && !name.contains("..")
         && !name.contains("@{")
         && !name.contains(['~', '^', ':', '?', '*', '[', '\\', ' '])
+}
+
+/// Whether a reflog destination reads as a branch rather than a detached HEAD.
+/// `git checkout <sha>` logs the typed argument where a branch name would be,
+/// so on top of [`recordable_branch`] a bare commit id is told apart by its
+/// shape. This is only for the reflog: a provider records `HEAD` for a
+/// detached checkout, never a SHA, so it does not get this test. A tag checked
+/// out by name cannot be told apart and reads as a branch: the one blur this
+/// rule accepts.
+fn plausible_branch(name: &str) -> bool {
+    let detached_id = name.len() >= 7 && name.chars().all(|c| c.is_ascii_hexdigit());
+    recordable_branch(name) && !detached_id
 }
 
 /// Spawns `git`, counts the processes and reports a failure once, in words.
@@ -273,10 +282,14 @@ fn parse_refs(output: &str, names: &[String]) -> Refs {
     refs
 }
 
-/// How far before the oldest retained switch the branch it left is still
-/// believed: Git's default reflog expiry, so an expired switch cannot sit
-/// inside it.
-const EXPIRY_GRACE: Duration = Duration::days(90);
+/// How far back from the moment the reflog is read the branch a checkout left
+/// is still believed. Git expires reflog entries by their age when `gc` runs,
+/// and entries whose commit nothing reaches any more (the checkout of a
+/// squash-merged, deleted feature branch) expire after
+/// `gc.reflogExpireUnreachable`, 30 days by default. Switches older than that
+/// can therefore be missing anywhere; only the last 30 days are known to be
+/// whole. This is the default, not the repository's configured value.
+const UNREACHABLE_EXPIRY: Duration = Duration::days(30);
 
 /// One branch switch of one checkout. `None` is a detached HEAD.
 #[derive(Debug)]
@@ -290,9 +303,11 @@ struct Switch {
 #[derive(Debug, Default)]
 struct Reflog {
     switches: Vec<Switch>,
+    /// When the reflog was read: what the look-back is measured from.
+    read_at: DateTime<Utc>,
 }
 
-fn parse_reflog(output: &str) -> Reflog {
+fn parse_reflog(output: &str, read_at: DateTime<Utc>) -> Reflog {
     let mut switches = Vec::new();
     for line in output.lines() {
         let Some((selector, subject)) = line.split_once('\t') else {
@@ -323,20 +338,20 @@ fn parse_reflog(output: &str) -> Reflog {
     // switches in one second in the order they happened.
     switches.reverse();
     switches.sort_by_key(|switch| switch.at);
-    Reflog { switches }
+    Reflog { switches, read_at }
 }
 
 impl Reflog {
     /// The branch the checkout was on at `at`: the destination of the last
     /// switch by then. Before the first switch on record, the branch that
-    /// switch left, but only for `EXPIRY_GRACE` before it: reflogs expire, so
-    /// the switches before the oldest one kept are invisible, and how long the
-    /// checkout had been on the branch it left is not known. Older than that
-    /// reads as unknown. `None` also when detached or when the reflog is empty.
+    /// switch left, but only if `at` is within `UNREACHABLE_EXPIRY` of when the
+    /// reflog was read: older switches may have expired, so how long the
+    /// checkout had been on that branch is not known, and older reads as
+    /// unknown. `None` also when detached or when the reflog is empty.
     fn branch_at(&self, at: DateTime<Utc>) -> Option<&str> {
         let first = self.switches.first()?;
         if at < first.at {
-            return (first.at - at <= EXPIRY_GRACE)
+            return (at >= self.read_at - UNREACHABLE_EXPIRY)
                 .then_some(first.from.as_deref())
                 .flatten();
         }
@@ -408,12 +423,10 @@ fn session_marks(
     (marks, source)
 }
 
-/// A working copy: its top directory, and the Git directory it shares with the
-/// other worktrees of the same repository.
+/// A working copy: its top directory.
 #[derive(Clone, Debug)]
 struct Checkout {
     root: PathBuf,
-    common: PathBuf,
 }
 
 /// The checkout `path` is in, found by looking for `.git` upward and without
@@ -425,31 +438,8 @@ fn checkout_of(path: &Path) -> Option<Checkout> {
     let root = path
         .ancestors()
         .find(|candidate| candidate.join(".git").exists())?;
-    let dot_git = root.join(".git");
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let common = if dot_git.is_dir() {
-        canonical(&dot_git)
-    } else {
-        // A linked worktree's `.git` is a file naming its own administration
-        // directory, which names the shared one in `commondir`.
-        let read = |path: &Path| fs::read_to_string(path).ok();
-        let git_dir = read(&dot_git)
-            .and_then(|text| {
-                text.lines()
-                    .find_map(|line| line.trim().strip_prefix("gitdir:"))
-                    .map(|location| root.join(location.trim()))
-            })
-            .map(|dir| canonical(&dir));
-        match git_dir {
-            Some(dir) => read(&dir.join("commondir"))
-                .map(|text| canonical(&dir.join(text.trim())))
-                .unwrap_or(dir),
-            None => canonical(&dot_git),
-        }
-    };
     Some(Checkout {
-        root: canonical(root),
-        common,
+        root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
     })
 }
 
@@ -457,6 +447,8 @@ fn checkout_of(path: &Path) -> Option<Checkout> {
 struct Context<'a> {
     git: Runner<'a>,
     names: &'a [String],
+    /// When the reflogs are read.
+    read_at: DateTime<Utc>,
     refs: HashMap<PathBuf, Option<Rc<Refs>>>,
     reflogs: HashMap<PathBuf, Option<Rc<Reflog>>>,
     checkouts: HashMap<String, Option<Checkout>>,
@@ -489,7 +481,7 @@ impl Context<'_> {
         let reflog = self
             .git
             .run(root, &reflog_arguments())
-            .map(|output| Rc::new(parse_reflog(&output)));
+            .map(|output| Rc::new(parse_reflog(&output, self.read_at)));
         self.reflogs.insert(root.to_path_buf(), reflog.clone());
         reflog
     }
@@ -550,13 +542,23 @@ pub fn enrich(
         diagnostics.warn(format!("{error:#}; using the default integration branches"));
         integration_names(None).unwrap_or_default()
     });
-    enrich_with(exe, &names, sessions, commits, agent_commits, diagnostics);
+    enrich_with(
+        exe,
+        &names,
+        Utc::now(),
+        sessions,
+        commits,
+        agent_commits,
+        diagnostics,
+    );
 }
 
-/// `enrich` with the pieces named; returns how many `git` processes ran.
+/// `enrich` with the pieces named, and the moment the reflogs are read as of;
+/// returns how many `git` processes ran.
 fn enrich_with(
     exe: PathBuf,
     names: &[String],
+    read_at: DateTime<Utc>,
     sessions: &mut [Session],
     commits: &mut [GitCommit],
     agent_commits: &mut [GitCommit],
@@ -569,6 +571,7 @@ fn enrich_with(
             spawned: 0,
         },
         names,
+        read_at,
         refs: HashMap::new(),
         reflogs: HashMap::new(),
         checkouts: HashMap::new(),
@@ -579,33 +582,16 @@ fn enrich_with(
         .filter(|commit| commit.branch.is_none())
         .collect();
 
-    // Every checkout of the run, grouped by the repository it belongs to, are
-    // the ones whose reflogs can say where a commit was made.
-    let mut siblings: HashMap<PathBuf, BTreeSet<PathBuf>> = HashMap::new();
+    // Each commit is looked up through the checkout it was found in.
     let mut groups: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
     for (index, commit) in commits.iter().enumerate() {
         if let Some(checkout) = context.checkout(&commit.cwd) {
-            siblings
-                .entry(checkout.common.clone())
-                .or_default()
-                .insert(checkout.root.clone());
             groups.entry(checkout.root).or_default().push(index);
-        }
-    }
-    for session in sessions.iter() {
-        if let Some(checkout) = context.checkout(&session.cwd) {
-            siblings
-                .entry(checkout.common)
-                .or_default()
-                .insert(checkout.root);
         }
     }
 
     for (root, indices) in &groups {
         let Some(refs) = context.refs(root) else {
-            continue;
-        };
-        let Some(common) = context.checkout(&commits[indices[0]].cwd).map(|c| c.common) else {
             continue;
         };
         let since = indices
@@ -616,69 +602,27 @@ fn enrich_with(
         let Some(sources) = context.sources(root, &refs, since) else {
             continue;
         };
-        let mut on_integration = Vec::new();
         for index in indices {
-            match sources.get(&commits[*index].sha) {
+            let commit = &mut *commits[*index];
+            match sources.get(&commit.sha) {
                 Some(Some(branch)) => {
-                    commits[*index].branch = Some(branch.clone());
-                    commits[*index].branch_source = BranchSource::Unique;
+                    commit.branch = Some(branch.clone());
+                    commit.branch_source = BranchSource::Unique;
                 }
                 // Reachable only from a detached HEAD: no branch to name.
                 Some(None) => {}
-                None => on_integration.push(*index),
-            }
-        }
-        let Some(integration) = refs.integration.as_deref() else {
-            continue;
-        };
-        if on_integration.is_empty() {
-            continue;
-        }
-        // The commit sits on the integration branch now, so the branch it was
-        // made on has to come from where the checkouts were then.
-        //
-        // The checkout the commit was found in comes first. If it was on the
-        // integration branch at that moment, the commit stays there: a hotfix
-        // made on `main` while a worktree had a feature branch out is not the
-        // feature's. That checkout is on its current branch after its last
-        // recorded switch (or if it never switched), as for a session.
-        // Otherwise, or when its reflog cannot say (no entry that old, or a
-        // detached HEAD), the checkouts vote: if exactly one branch other than
-        // the integration branch was checked out anywhere, that is the one;
-        // two or none cannot be told apart from work done on the integration
-        // branch itself.
-        let own = context.reflog(root);
-        let mut timelines = Vec::new();
-        for sibling in siblings.get(&common).into_iter().flatten() {
-            if let Some(reflog) = context.reflog(sibling) {
-                timelines.push(reflog);
-            }
-        }
-        for index in on_integration {
-            let commit = &mut *commits[index];
-            let on_integration_itself = own.as_ref().is_some_and(|reflog| {
-                let branch = if reflog.is_after_last(commit.timestamp) {
-                    refs.current.as_deref()
-                } else {
-                    reflog.branch_at(commit.timestamp)
-                };
-                branch == Some(integration)
-            });
-            let candidates: BTreeSet<&str> = if on_integration_itself {
-                BTreeSet::new()
-            } else {
-                timelines
-                    .iter()
-                    .filter_map(|reflog| reflog.branch_at(commit.timestamp))
-                    .filter(|branch| *branch != integration)
-                    .collect()
-            };
-            if let [only] = candidates.iter().collect::<Vec<_>>()[..] {
-                commit.branch = Some((*only).to_string());
-                commit.branch_source = BranchSource::Reflog;
-            } else {
-                commit.branch = Some(integration.to_string());
-                commit.branch_source = BranchSource::Integration;
+                // On the integration branch (merged, fast-forwarded, or the
+                // feature is gone). It is reported there: which checkout made
+                // the commit is not something the HEAD reflogs can say without
+                // reading their commit entries, and guessing would make the
+                // answer depend on directory order. The time spent on the
+                // feature is still attributed through the sessions.
+                None => {
+                    if let Some(integration) = refs.integration.as_deref() {
+                        commit.branch = Some(integration.to_string());
+                        commit.branch_source = BranchSource::Integration;
+                    }
+                }
             }
         }
     }
@@ -728,6 +672,7 @@ pub(crate) fn integration_branch(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::process::Command;
 
     use chrono::TimeZone;
@@ -856,6 +801,11 @@ mod tests {
         }
     }
 
+    /// The moment the fixtures' reflogs are read: the day after they were made.
+    fn read_time() -> DateTime<Utc> {
+        at("2026-03-02T00:00:00Z")
+    }
+
     fn defaults() -> Vec<String> {
         integration_names(None).unwrap()
     }
@@ -867,6 +817,7 @@ mod tests {
         let spawned = enrich_with(
             git_executable().unwrap(),
             &defaults(),
+            read_time(),
             sessions,
             commits,
             &mut [],
@@ -940,6 +891,47 @@ mod tests {
     }
 
     #[test]
+    fn recorded_branch_names_reject_what_git_forbids_but_keep_digits_and_hex() {
+        for name in [
+            "main",
+            "feat/x",
+            "20260301",
+            "1234567",
+            "deadbeef",
+            "4521873",
+            "release/1.2",
+        ] {
+            assert!(recordable_branch(name), "{name}");
+        }
+        for name in [
+            "HEAD",
+            "@",
+            "",
+            "fix login",
+            "a~1",
+            "a^",
+            "a:b",
+            "a?",
+            "a*",
+            "a[b",
+            "a\\b",
+            "x..y",
+            "a@{1}",
+            "-rf",
+            "x.lock",
+            "x/",
+            "x.",
+            "a\nb",
+        ] {
+            assert!(!recordable_branch(name), "{name:?}");
+        }
+        assert!(!recordable_branch(&"b".repeat(257)));
+        // The reflog alone also refuses a bare commit id.
+        assert!(!plausible_branch("deadbeef"));
+        assert!(!plausible_branch("20260301"));
+    }
+
+    #[test]
     fn the_reflog_read_asks_git_to_filter_and_asks_for_no_subject() {
         let arguments = reflog_arguments();
         assert!(arguments.contains(&"--grep-reflog=^checkout: moving from ".to_string()));
@@ -976,7 +968,7 @@ mod tests {
         assert!(!output.contains("SECRET"), "{output}");
         assert!(!output.contains("leak"), "{output}");
         assert!(!output.contains("commit"), "{output}");
-        let reflog = parse_reflog(&output);
+        let reflog = parse_reflog(&output, read_time());
         assert_eq!(1, reflog.switches.len());
         assert_eq!(Some("feat/x"), reflog.switches[0].to.as_deref());
         assert_eq!(Some("main"), reflog.switches[0].from.as_deref());
@@ -1003,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merged_and_deleted_branch_is_recovered_from_the_reflog() {
+    fn a_merged_and_deleted_branch_reads_as_main_but_its_session_keeps_the_feature() {
         let repo = Repo::new();
         let base = repo.commit("2026-03-01T09:00:00Z", "base");
         repo.run(
@@ -1022,18 +1014,60 @@ mod tests {
             commit_record(&repo.path, &base, "2026-03-01T09:00:00Z"),
             commit_record(&repo.path, &work, "2026-03-01T11:00:00Z"),
         ];
-        let spawned = enrich_commits(&mut commits, &mut []);
+        let mut sessions = vec![session(
+            &repo.path,
+            "2026-03-01T10:30:00Z",
+            "2026-03-01T11:30:00Z",
+        )];
+        let spawned = enrich_commits(&mut commits, &mut sessions);
 
-        // Before the first switch the checkout was on the branch it left.
-        assert_eq!(Some("main"), commits[0].branch.as_deref());
-        assert_eq!(BranchSource::Integration, commits[0].branch_source);
-        assert_eq!(Some("feat/gone"), commits[1].branch.as_deref());
-        assert_eq!(BranchSource::Reflog, commits[1].branch_source);
+        // A commit already merged into the integration branch is reported on it.
+        for commit in &commits {
+            assert_eq!(Some("main"), commit.branch.as_deref());
+            assert_eq!(BranchSource::Integration, commit.branch_source);
+        }
+        // The time spent on the feature is still attributed through the session.
+        assert_eq!("feat/gone", sessions[0].branches[0].branch);
+        assert_eq!(BranchSource::Reflog, sessions[0].branch_source);
         assert!(spawned <= 3, "{spawned}");
     }
 
     #[test]
-    fn two_worktrees_on_other_branches_at_once_are_ambiguous() {
+    fn a_squash_merged_and_deleted_feature_reads_as_main() {
+        let repo = Repo::new();
+        repo.commit("2026-03-01T09:00:00Z", "base");
+        repo.run(
+            "2026-03-01T10:00:00Z",
+            &["checkout", "-q", "-b", "feat/squashed"],
+        );
+        let one = repo.commit("2026-03-01T11:00:00Z", "one");
+        let two = repo.commit("2026-03-01T11:30:00Z", "two");
+        repo.run("2026-03-01T12:00:00Z", &["checkout", "-q", "main"]);
+        repo.run(
+            "2026-03-01T12:05:00Z",
+            &["merge", "-q", "--squash", "feat/squashed"],
+        );
+        let squash = repo.commit("2026-03-01T12:06:00Z", "squash");
+        repo.run(
+            "2026-03-01T12:10:00Z",
+            &["branch", "-q", "-D", "feat/squashed"],
+        );
+
+        // The original commits are on no branch any more.
+        let mut commits = vec![
+            commit_record(&repo.path, &one, "2026-03-01T11:00:00Z"),
+            commit_record(&repo.path, &two, "2026-03-01T11:30:00Z"),
+            commit_record(&repo.path, &squash, "2026-03-01T12:06:00Z"),
+        ];
+        enrich_commits(&mut commits, &mut []);
+        for commit in &commits {
+            assert_eq!(Some("main"), commit.branch.as_deref());
+            assert_eq!(BranchSource::Integration, commit.branch_source);
+        }
+    }
+
+    #[test]
+    fn commits_from_parallel_worktrees_read_as_main_and_each_session_keeps_its_branch() {
         let repo = Repo::new();
         repo.commit("2026-03-01T08:30:00Z", "base");
         let first = repo.path.with_file_name("first");
@@ -1144,10 +1178,43 @@ mod tests {
         assert_eq!(BranchSource::Head, sessions[0].branch_source);
         assert_eq!(None, sessions[0].branches[0].from);
         assert_eq!("main", sessions[1].branches[0].branch);
-        // The commit is on main now, so it is not unique; the worktree is the
-        // only checkout on another branch, but with no switch on record it has
-        // no vote, and the commit falls back to the integration branch.
+        // The commit is on main now, so it is not unique and reads as main.
+        assert_eq!(Some("main"), commits[0].branch.as_deref());
         assert_eq!(BranchSource::Integration, commits[0].branch_source);
+    }
+
+    #[test]
+    fn a_commit_made_in_a_feature_worktree_and_fast_forwarded_into_main_reads_as_main() {
+        let repo = Repo::new();
+        repo.commit("2026-03-01T08:30:00Z", "base");
+        let worktree = repo.path.with_file_name("wt");
+        repo.run(
+            "2026-03-01T09:00:00Z",
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/wt",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let work = repo.commit_in(&worktree, "2026-03-01T10:00:00Z", "work");
+        repo.run(
+            "2026-03-01T11:00:00Z",
+            &["merge", "-q", "--ff-only", "feat/wt"],
+        );
+
+        // Found through either checkout, the answer is the same.
+        let mut commits = vec![
+            commit_record(&repo.path, &work, "2026-03-01T10:00:00Z"),
+            commit_record(&worktree, &work, "2026-03-01T10:00:00Z"),
+        ];
+        enrich_commits(&mut commits, &mut []);
+        for commit in &commits {
+            assert_eq!(Some("main"), commit.branch.as_deref());
+            assert_eq!(BranchSource::Integration, commit.branch_source);
+        }
     }
 
     #[test]
@@ -1185,35 +1252,51 @@ mod tests {
     }
 
     #[test]
-    fn work_older_than_the_reflog_is_unknown_rather_than_the_first_branch_left() {
-        let switch = Utc.timestamp_opt(200 * 86_400, 0).unwrap();
-        let reflog = Reflog {
+    fn the_look_back_is_measured_from_the_read_time_not_from_the_oldest_switch() {
+        let read_at = Utc.timestamp_opt(400 * 86_400, 0).unwrap();
+        let reflog_with = |switch_at: DateTime<Utc>| Reflog {
             switches: vec![Switch {
-                at: switch,
+                at: switch_at,
                 from: Some("feat/old".to_string()),
                 to: Some("main".to_string()),
             }],
+            read_at,
         };
-        // Just before the oldest switch kept: still on the branch it left.
+
+        // Oldest kept switch is recent: before it, the branch it left is
+        // believed for 30 days back from the read time, and no further, even
+        // though that is well inside 90 days of the switch.
+        let recent = read_at - Duration::days(10);
+        let reflog = reflog_with(recent);
         assert_eq!(
             Some("feat/old"),
-            reflog.branch_at(switch - Duration::days(30))
+            reflog.branch_at(read_at - Duration::days(30))
         );
-        assert_eq!(Some("feat/old"), reflog.branch_at(switch - EXPIRY_GRACE));
-        // Further back than any expired switch could hide: unknown.
+        assert_eq!(
+            Some("feat/old"),
+            reflog.branch_at(recent - Duration::seconds(1))
+        );
         assert_eq!(
             None,
-            reflog.branch_at(switch - EXPIRY_GRACE - Duration::seconds(1))
+            reflog.branch_at(read_at - UNREACHABLE_EXPIRY - Duration::seconds(1))
         );
-        assert_eq!(None, reflog.branch_at(switch - Duration::days(150)));
-        assert_eq!(Some("main"), reflog.branch_at(switch));
+        // The reviewer's case: between switch - 90 days and read time - 30 days.
+        assert_eq!(None, reflog.branch_at(recent - Duration::days(60)));
+        assert_eq!(Some("main"), reflog.branch_at(recent));
+
+        // An old oldest switch (gc keeps reflogs that long): everything before
+        // it is older than the look-back, so there is no first-branch guess.
+        let old = read_at - Duration::days(100);
+        let reflog = reflog_with(old);
+        assert_eq!(None, reflog.branch_at(old - Duration::days(1)));
+        assert_eq!(Some("main"), reflog.branch_at(old));
 
         // So a session that old gets no marks from the reflog.
         let (marks, source) = session_marks(
-            &reflog,
+            &reflog_with(recent),
             Some("main"),
-            switch - Duration::days(150),
-            switch - Duration::days(149),
+            recent - Duration::days(60),
+            recent - Duration::days(59),
         );
         assert!(marks.is_empty());
         assert_eq!(BranchSource::None, source);
@@ -1326,7 +1409,10 @@ mod tests {
                 to: Some(format!("b{}", (index + 1) % 2)),
             })
             .collect();
-        let reflog = Reflog { switches };
+        let reflog = Reflog {
+            switches,
+            read_at: Utc.timestamp_opt(5_000, 0).unwrap(),
+        };
         let (marks, source) = session_marks(
             &reflog,
             Some("b0"),

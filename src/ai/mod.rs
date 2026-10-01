@@ -444,9 +444,9 @@ impl BranchTracker {
             self.refused += 1;
             return;
         };
-        // `HEAD` and a bare commit id are what a detached checkout records, not
-        // a branch. Skipped without a note, so the reflog can fill the gap.
-        if !crate::branches::plausible_branch(branch) {
+        // `HEAD` is what a detached checkout records, and Git forbids the other
+        // refused names. Skipped without a note, so the reflog can fill the gap.
+        if !crate::branches::recordable_branch(branch) {
             return;
         }
         if self.marks.last().is_some_and(|last| last.branch == branch) {
@@ -492,7 +492,7 @@ impl BranchTracker {
 pub(crate) fn whole_session_branch(branch: Option<&str>) -> Vec<BranchMark> {
     branch
         .and_then(safe_branch)
-        .filter(|branch| crate::branches::plausible_branch(branch))
+        .filter(|branch| crate::branches::recordable_branch(branch))
         .map(|branch| {
             vec![BranchMark {
                 from: None,
@@ -989,11 +989,8 @@ mod tests {
     fn a_detached_checkout_is_not_a_recorded_branch() {
         let mut tracker = BranchTracker::default();
         tracker.observe(utc("2026-01-01T00:01:00Z"), "HEAD");
-        tracker.observe(
-            utc("2026-01-01T00:02:00Z"),
-            "0123456789abcdef0123456789abcdef01234567",
-        );
-        tracker.observe(utc("2026-01-01T00:03:00Z"), &"ab".repeat(32));
+        tracker.observe(utc("2026-01-01T00:02:00Z"), "@");
+        tracker.observe(utc("2026-01-01T00:03:00Z"), "fix login");
         let mut diagnostics = Diagnostics::default();
         let marks = tracker.finish(&mut diagnostics, Path::new("x"));
         assert!(marks.is_empty(), "{marks:?}");
@@ -1007,6 +1004,19 @@ mod tests {
         tracker.observe(utc("2026-01-01T00:02:00Z"), "HEAD");
         let marks = tracker.finish(&mut Diagnostics::default(), Path::new("x"));
         assert_eq!(1, marks.len());
+    }
+
+    #[test]
+    fn provider_recorded_digit_and_hex_branch_names_are_kept() {
+        let mut tracker = BranchTracker::default();
+        tracker.observe(utc("2026-01-01T00:01:00Z"), "20260301");
+        tracker.observe(utc("2026-01-01T00:02:00Z"), "deadbeef");
+        tracker.observe(utc("2026-01-01T00:03:00Z"), "HEAD");
+        let marks = tracker.finish(&mut Diagnostics::default(), Path::new("x"));
+        let names: Vec<_> = marks.iter().map(|mark| mark.branch.as_str()).collect();
+        assert_eq!(vec!["20260301", "deadbeef"], names);
+        assert_eq!(1, whole_session_branch(Some("20260301")).len());
+        assert!(whole_session_branch(Some("HEAD")).is_empty());
     }
 
     #[test]
