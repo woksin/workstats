@@ -24,18 +24,40 @@ What `workstats` reads, what it never reads, and the one place file contents are
   turn took; the parser names no message field, so prompt and response bodies
   are never deserialized;
 - Copilot's `~/.copilot/session-store.db` is read for `sessions(id, cwd,
-  repository, branch, host_type)` and nothing else — that database also holds a
-  `turns` table of full prompt and response bodies and a `search_index` FTS5
-  index over them, and `workstats` queries neither;
+  repository, branch, host_type)`, the pull-request rows of `session_refs`, and
+  `sessions.summary` only when you pass `--describe sessions` — that database
+  also holds a `turns` table of full prompt and response bodies and a
+  `search_index` FTS5 index over them, and `workstats` queries neither;
 - Codex, Copilot, and OpenCode SQLite databases are opened read-only;
 - known credential locations such as `auth.json`, `secrets.json`, `.env`,
   `~/.config/github-copilot/`, and key stores are never discovery targets;
 - malformed and oversized transcript records degrade safely;
-- CSV cells are neutralized against spreadsheet formula injection.
+- CSV cells are neutralized against spreadsheet formula injection;
+- **branch names** are read from the few fields that hold them (Claude, Codex
+  and Copilot records, `record --branch`, and local Git ref names and branch
+  switches), cached, and reported under the `branch`, `issue` and `feature`
+  groupings and by `branch` and `pr`; they can carry client or ticket names
+  ([details below](#branch-names-are-read-cached-and-reported));
+- **pull-request references** are kept as a number and a repository, never a
+  URL ([details](#pull-request-references));
+- **descriptions are opt-in**: commit subject lines and tool-generated session
+  titles are read only for `--describe`, are never cached and never go into a
+  bundle ([details](#opt-in-descriptions));
+- **`--summarize-with`** is the one place a digest leaves `workstats`, and only
+  to a command you chose; `--digest` previews it
+  ([details](#--summarize-with-hands-a-digest-to-a-command-you-choose));
+- **two files you own sit beside the config**: `timesheet.json` (manual
+  entries, overrides and lock snapshots) and `machine.json` (a random id and a
+  label), neither a cache ([details](#files-beside-the-config-the-timesheet-ledger-and-the-machine-id));
+- **bundles** from `workstats export` carry the cache's structural fields,
+  repository keys and relative subdirectories, with no prompts, subjects,
+  titles or absolute paths, and are not encrypted ([details](#bundles));
+- **`now.json`** in the cache directory holds figures plus the active
+  session's repository label and branch ([details](#the-now-snapshot)).
 
 The cache contains the structural fields needed for reports: timestamps,
 working directories, session identifiers, model names, roles, derived
-intervals, and token usage counts. JSON/CSV output can contain repository
+intervals, token usage counts, branch names and pull-request numbers. JSON/CSV output can contain repository
 names and paths—review a report before sharing it. `--explain-human-time` is an
 explicitly more detailed view: it includes exact UTC signal/block timestamps,
 signal kinds, providers, and repository labels, but still excludes prompt and
@@ -78,8 +100,8 @@ Git's own `Binary files … differ` line — no bytes are ever emitted.
 
 ## Branch names, pull requests, descriptions, bundles and snapshots
 
-These sections are filled in by the changes that add each read. Each states
-exactly what is read, what is stored, and what is never read.
+What the commands added after the first dashboard read or write, one section
+each: exactly what is read, what is stored, and what is never read.
 
 ### Engagement configuration and timesheet outputs
 
@@ -123,9 +145,11 @@ Nothing else beside those fields is read, in particular:
   the Codex reader. The commit hash and repository URL next to
   `payload.git.branch` are not read either.
 - **Claude** `last-prompt` and `queue-operation` records carry prompt text and
-  `ai-title` / `agent-name` carry generated titles. The parser declares no
-  field for any of them, so their content is skipped by the deserializer
-  without being held in memory.
+  `ai-title` / `agent-name` carry generated titles. The transcript parser
+  declares no field for any of them, so their content is skipped by the
+  deserializer without being held in memory. The only code that reads a title
+  field is the opt-in reader described under
+  [Opt-in descriptions](#opt-in-descriptions).
 
 A branch name is stored only when it changes (at most 256 changes per session),
 at most 256 bytes long, and without control characters; anything else is
@@ -204,8 +228,8 @@ Nothing from a prompt or a response is involved, and nothing is sent anywhere.
 
 ### Opt-in descriptions
 
-Nothing here is read unless you pass `--describe` (the timesheet today;
-`branch` and `pr` use the same reader). Descriptions are never cached, never
+Nothing here is read unless you pass `--describe` (on `timesheet`, `branch`
+and `pr`; they share one reader). Descriptions are never cached, never
 written into a bundle and never added to a JSON or CSV output you did not ask
 them for. The one place a description is kept is a timesheet lock, which stores
 the description an entry had when you locked it, because that is what you
@@ -242,7 +266,8 @@ Descriptions reach the output only for the rows it shows.
 
 ### `--summarize-with` hands a digest to a command you choose
 
-`--summarize-with CMD` runs `CMD` once per timesheet entry through `sh -c`
+`--summarize-with CMD` (a timesheet option; `branch` and `pr` do not take it)
+runs `CMD` once per timesheet entry through `sh -c`
 (`cmd /C` on Windows) with your environment, and writes a digest as JSON to its
 standard input. The digest has names and counts: the date, the engagement key,
 hours, the repositories, branches and issue keys of the entry, and the number
