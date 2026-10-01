@@ -688,6 +688,13 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             attribution.unresolved_checkouts
         );
     }
+    if let Some(goals) = &report.goals {
+        println!("Goals");
+        for line in goals.lines() {
+            println!("  {line}");
+        }
+        println!();
+    }
     for line in footer_notes(report, diagnostics) {
         println!("{line}");
     }
@@ -1166,6 +1173,10 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         }
     }
 
+    if let Some(goals) = &report.goals {
+        blocks.push(Block::Section("Goals".to_string()));
+        blocks.push(Block::List(goals.lines()));
+    }
     blocks.push(Block::Section("Notes".to_string()));
     blocks.push(Block::List(
         footer_notes(report, diagnostics)

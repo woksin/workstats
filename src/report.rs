@@ -28,8 +28,10 @@ use crate::cli::{
 use crate::compare::{Comparison, Period};
 use crate::engagement::{self, Engagements};
 use crate::git::{default_git_author, read_agent_commits, read_git_commits};
+use crate::goals;
 use crate::issues::{self, IssueRules};
 use crate::model::{self, Diagnostics, Inputs, Report, Session};
+use crate::now;
 use crate::output::{print_csv, print_html, print_json, print_markdown, print_table};
 use crate::paths::{
     Config, PathResolver, ProjectAliases, SourceRule, configured_rules, default_cache_path,
@@ -556,6 +558,7 @@ fn prepare(mut arguments: ReportArguments, purpose: Purpose) -> Result<Prepared>
     let cache_path = arguments.cache.clone().unwrap_or_else(default_cache_path);
     if arguments.rebuild_cache {
         progress.set("Rebuilding transcript index");
+        now::remove_snapshot(arguments.cache.as_deref(), &mut diagnostics);
     } else if !arguments.no_ai && !arguments.no_cache {
         progress.set("Opening transcript index");
     }
@@ -664,7 +667,7 @@ fn execute(prepared: &mut Prepared) -> Result<Collected> {
         }
         None => None,
     };
-    let (report, timeline) = assemble_report(
+    let (mut report, timeline) = assemble_report(
         prepared,
         built,
         scan_roots,
@@ -673,6 +676,18 @@ fn execute(prepared: &mut Prepared) -> Result<Collected> {
         &diagnostics,
         transcript_cache.as_ref(),
     );
+    // Here rather than in `assemble_report`: pricing the caps needs the
+    // sessions' token events, which the report itself has aggregated away.
+    report.goals = goals::for_report(
+        !prepared.arguments.no_goals,
+        prepared.config.goals.as_ref(),
+        prepared.window,
+        prepared.now,
+        &sessions,
+        &timeline.human_intervals,
+        &prepared.rate_overrides,
+        &mut report.diagnostics,
+    )?;
     Ok(Collected {
         report,
         timeline,
