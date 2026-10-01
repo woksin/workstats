@@ -526,7 +526,9 @@ pub fn build_report_with_human_time_explanation(
                 .then_with(|| compare_number(left.ai_wall_seconds, right.ai_wall_seconds))
                 .then_with(|| left.commit_count.cmp(&right.commit_count))
         };
-        ordering.reverse()
+        // Rows that tie on every figure come out of the HashMap buckets in
+        // an order that changes between runs; the key makes it fixed.
+        ordering.reverse().then_with(|| left.key.cmp(&right.key))
     });
 
     let mut all_times = Vec::new();
@@ -1547,6 +1549,44 @@ mod tests {
         let human: f64 = daily.iter().map(|day| day.human_seconds).sum();
         assert!((human - report.summary.human_estimated_seconds).abs() < 0.01);
         assert_eq!(4, daily.iter().map(|day| day.prompts).sum::<usize>());
+    }
+
+    #[test]
+    fn rows_that_tie_on_every_figure_come_out_in_key_order_on_every_run() {
+        // Twelve repositories with the same single commit at the same moment:
+        // nothing but the key tells the rows apart, and the buckets they come
+        // from are a HashMap whose order differs from one instance to the next.
+        let names: Vec<String> = (0..12).map(|index| format!("repo-{index:02}")).collect();
+        let commits: Vec<GitCommit> = names
+            .iter()
+            .map(|name| {
+                commit(
+                    &format!("sha-{name}"),
+                    name,
+                    "2026-01-01T10:00:00Z",
+                    &[("src/lib.rs", 1, 0)],
+                )
+            })
+            .collect();
+        for _ in 0..20 {
+            let report = build_report(
+                &[],
+                &commits,
+                &[],
+                Duration::minutes(5),
+                None,
+                None,
+                &["repo".into()],
+                Duration::hours(1),
+                Duration::minutes(30),
+            );
+            let order: Vec<&str> = report
+                .rows
+                .iter()
+                .map(|row| row.key["repo"].as_str())
+                .collect();
+            assert_eq!(names.iter().map(String::as_str).collect::<Vec<_>>(), order);
+        }
     }
 
     #[test]
