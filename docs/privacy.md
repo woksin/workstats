@@ -83,11 +83,61 @@ exactly what is read, what is stored, and what is never read.
 
 ### Branch names are read, cached and reported
 
-_Coming in this release._
+Some providers record which Git branch a session was on. workstats now reads
+that one field, and only that field, from each:
+
+| Provider | What is read |
+|---|---|
+| Claude Code | `gitBranch` on `user` and `assistant` records |
+| Codex | `payload.git.branch` of the rollout's `session_meta` record, and the `git_branch` column of the `threads` table |
+| Copilot CLI | `data.context.branch` of `session.start` and `session.context_changed`, and the `branch` column of the session store (already read for the working directory) |
+| Events | the optional `branch` field of a record, which `workstats record --branch NAME` writes |
+
+Pi, OpenCode, Gemini and VS Code Copilot record no branch and are unchanged.
+
+Nothing else beside those fields is read, in particular:
+
+- **Codex** `threads.title`, `threads.preview` and `threads.first_user_message`
+  are the first prompt verbatim, so they stay out of the closed column list in
+  the Codex reader. The commit hash and repository URL next to
+  `payload.git.branch` are not read either.
+- **Claude** `last-prompt` and `queue-operation` records carry prompt text and
+  `ai-title` / `agent-name` carry generated titles. The parser declares no
+  field for any of them, so their content is skipped by the deserializer
+  without being held in memory.
+
+A branch name is stored only when it changes (at most 256 changes per session),
+at most 256 bytes long, and without control characters; anything else is
+dropped and counted in the run's notes. The names are stored in the transcript
+cache and appear in reports under the `branch`, `issue` and `feature`
+groupings.
+
+**Branch names can carry client names, ticket numbers or personal names**
+(`acme/ACME-123-login`, `users/ada/spike`). They are exactly as sensitive as
+your branch list. A report grouped by branch, or its JSON, shares them; a plain
+report does not show them.
+
+Deleting the cache (`--rebuild-cache`) removes the stored names; the history
+files they came from are never altered.
 
 ### Pull-request references
 
-_Coming in this release._
+Two providers link a session to a pull request, and workstats keeps only the
+pull request's number and repository:
+
+- **Claude Code** `pr-link` records: `prNumber` and `prRepository`. The
+  record's `prUrl` is not declared by the parser, so it is never read or stored.
+- **Copilot CLI** `session_refs` rows with `ref_type = 'pr'` in the session
+  store. The query selects the session id and the reference value and filters on
+  the type, so the `commit` rows are not delivered. A value may be a bare number,
+  `owner/repo#number` or a pull-request URL; only the number and the
+  `owner/repo` pair are kept, and the URL, host and query string are discarded.
+  Without a repository in the value, the session's own `repository` column is
+  used, which Copilot itself sometimes gets wrong.
+
+A session keeps at most 64 references. They are cached with the session and are
+used to find the branch a pull request was worked on; they are not shown in an
+ordinary report.
 
 ### Opt-in descriptions
 

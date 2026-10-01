@@ -38,7 +38,7 @@ use serde::{Deserialize, Deserializer};
 use walkdir::WalkDir;
 
 use crate::cache::{CacheLookup, FileStamp, TranscriptCache, file_stamp};
-use crate::model::{Diagnostics, RawSession, Session};
+use crate::model::{BranchMark, Diagnostics, PrLink, RawSession, Session};
 use crate::paths::PathResolver;
 
 pub const MAX_JSONL_LINE_BYTES: usize = 8 * 1024 * 1024;
@@ -404,6 +404,149 @@ fn safe_model(value: &str) -> String {
     } else {
         "unknown".to_string()
     }
+}
+
+/// Most branch marks one session keeps. A session that hops between branches more often
+/// than this is almost certainly a tool scripting checkouts; the later hops are counted
+/// and reported rather than stored without bound in the cache.
+pub(crate) const MAX_BRANCH_MARKS: usize = 256;
+pub(crate) const MAX_BRANCH_BYTES: usize = 256;
+/// Most pull requests one session keeps.
+pub(crate) const MAX_PR_LINKS: usize = 64;
+
+/// A branch name as a provider recorded it, or `None` when it cannot be stored.
+///
+/// Branch names reach reports, the cache and (later) bundles, so anything that is not a
+/// plain, bounded name is refused here: a control character could repaint a terminal and
+/// a very long value is not a branch. Git itself forbids both, so a real name is never
+/// refused.
+pub(crate) fn safe_branch(value: &str) -> Option<&str> {
+    let valid = !value.trim().is_empty()
+        && value.len() <= MAX_BRANCH_BYTES
+        && !value.chars().any(char::is_control);
+    valid.then_some(value)
+}
+
+/// Turns a stream of "the branch was X at time T" observations into marks written only
+/// where the branch changes.
+#[derive(Default)]
+pub(crate) struct BranchTracker {
+    marks: Vec<BranchMark>,
+    /// When the newest mark took effect, whether or not it is written as `from: None`.
+    latest: Option<DateTime<Utc>>,
+    refused: u64,
+    over_limit: u64,
+}
+
+impl BranchTracker {
+    pub(crate) fn observe(&mut self, at: DateTime<Utc>, branch: &str) {
+        let Some(branch) = safe_branch(branch) else {
+            self.refused += 1;
+            return;
+        };
+        if self.marks.last().is_some_and(|last| last.branch == branch) {
+            return;
+        }
+        if self.marks.len() >= MAX_BRANCH_MARKS {
+            self.over_limit += 1;
+            return;
+        }
+        // `branch_at` needs sorted marks. A log is written in order, so this only
+        // matters for a clock that stepped back, which must not unsort the marks.
+        let at = self.latest.map_or(at, |latest| latest.max(at));
+        let from = self.marks.last().map(|_| at);
+        self.latest = Some(at);
+        self.marks.push(BranchMark {
+            from,
+            branch: branch.to_string(),
+        });
+    }
+
+    /// Hands back the marks and says, once, what was left out.
+    pub(crate) fn finish(self, diagnostics: &mut Diagnostics, path: &Path) -> Vec<BranchMark> {
+        if self.refused > 0 {
+            diagnostics.note(format!(
+                "{} branch name(s) that were empty, too long or contained control characters were not stored: {}",
+                self.refused,
+                path.display()
+            ));
+        }
+        if self.over_limit > 0 {
+            diagnostics.note(format!(
+                "{} branch change(s) beyond the {MAX_BRANCH_MARKS} kept per session were not stored: {}",
+                self.over_limit,
+                path.display()
+            ));
+        }
+        self.marks
+    }
+}
+
+/// The marks for a session whose provider names one branch for its whole length (Codex's
+/// `session_meta`, the Copilot store): a single mark from the session start.
+pub(crate) fn whole_session_branch(branch: Option<&str>) -> Vec<BranchMark> {
+    branch
+        .and_then(safe_branch)
+        .map(|branch| {
+            vec![BranchMark {
+                from: None,
+                branch: branch.to_string(),
+            }]
+        })
+        .unwrap_or_default()
+}
+
+/// Collects the pull requests a session mentioned, by number and repository only.
+#[derive(Default)]
+pub(crate) struct PrCollector {
+    links: Vec<PrLink>,
+    refused: u64,
+}
+
+impl PrCollector {
+    pub(crate) fn observe(&mut self, number: u64, repository: &str, at: Option<DateTime<Utc>>) {
+        let repository_ok =
+            repository.len() <= MAX_BRANCH_BYTES && !repository.chars().any(char::is_control);
+        if number == 0 || !repository_ok {
+            self.refused += 1;
+            return;
+        }
+        if let Some(existing) = self
+            .links
+            .iter_mut()
+            .find(|link| link.number == number && link.repository == repository)
+        {
+            existing.at = existing.at.into_iter().chain(at).min();
+            return;
+        }
+        if self.links.len() >= MAX_PR_LINKS {
+            self.refused += 1;
+            return;
+        }
+        self.links.push(PrLink {
+            number,
+            repository: repository.to_string(),
+            at,
+        });
+    }
+
+    pub(crate) fn finish(self, diagnostics: &mut Diagnostics, path: &Path) -> Vec<PrLink> {
+        if self.refused > 0 {
+            diagnostics.note(format!(
+                "{} pull-request reference(s) that were malformed or beyond the {MAX_PR_LINKS} kept per session were not stored: {}",
+                self.refused,
+                path.display()
+            ));
+        }
+        self.links
+    }
+}
+
+/// A whole, positive number out of a lenient numeric field.
+fn whole_number(value: Option<f64>) -> Option<u64> {
+    let value = value?;
+    (value.is_finite() && value >= 1.0 && value.fract() == 0.0 && value <= 9_007_199_254_740_992.0)
+        .then_some(value as u64)
 }
 
 fn canonical_string(path: &Path) -> String {
@@ -808,5 +951,47 @@ mod tests {
         );
         assert_eq!(0, parsed.records_read);
         assert!(!records_without_activity(&parsed));
+    }
+
+    #[test]
+    fn branch_names_must_be_plain_and_short() {
+        assert_eq!(Some("feat/a-1"), safe_branch("feat/a-1"));
+        assert_eq!(Some("users/ada/x y"), safe_branch("users/ada/x y"));
+        for refused in ["", "  ", "a\nb", "a\u{1b}[0m", "\u{7f}"] {
+            assert_eq!(None, safe_branch(refused), "{refused:?}");
+        }
+        assert!(safe_branch(&"b".repeat(256)).is_some());
+        assert_eq!(None, safe_branch(&"b".repeat(257)));
+        // Bytes, not characters: 129 two-byte characters are 258 bytes.
+        assert_eq!(None, safe_branch(&"é".repeat(129)));
+    }
+
+    #[test]
+    fn a_branch_tracker_never_unsorts_its_marks() {
+        let mut tracker = BranchTracker::default();
+        tracker.observe(utc("2026-01-01T00:10:00Z"), "a");
+        // A clock that stepped back: the mark is placed no earlier than the last one.
+        tracker.observe(utc("2026-01-01T00:05:00Z"), "b");
+        tracker.observe(utc("2026-01-01T00:06:00Z"), "b");
+        let marks = tracker.finish(&mut Diagnostics::default(), Path::new("x"));
+        assert_eq!(2, marks.len());
+        assert_eq!(None, marks[0].from);
+        assert_eq!(Some(utc("2026-01-01T00:10:00Z")), marks[1].from);
+    }
+
+    #[test]
+    fn pull_request_collection_dedupes_and_is_bounded() {
+        let mut collector = PrCollector::default();
+        collector.observe(1, "a/b", Some(utc("2026-01-01T00:09:00Z")));
+        collector.observe(1, "a/b", Some(utc("2026-01-01T00:01:00Z")));
+        collector.observe(1, "c/d", None);
+        for number in 2..200 {
+            collector.observe(number, "a/b", None);
+        }
+        let mut diagnostics = Diagnostics::default();
+        let links = collector.finish(&mut diagnostics, Path::new("x"));
+        assert_eq!(MAX_PR_LINKS, links.len());
+        assert_eq!(Some(utc("2026-01-01T00:01:00Z")), links[0].at);
+        assert_eq!(1, diagnostics.note_count);
     }
 }

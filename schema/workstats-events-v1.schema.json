@@ -47,6 +47,13 @@
     "completed_at": {
       "type": "string",
       "format": "date-time"
+    },
+    "branch": {
+      "description": "The branch the work was on. Stored in the cache and shown in branch groupings, so it must be a plain name; a value that is longer than 256 bytes or contains control characters is ignored.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
     }
   },
   "dependentRequired": {

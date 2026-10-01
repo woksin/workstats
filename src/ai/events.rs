@@ -8,8 +8,8 @@ use serde::de::IgnoredAny;
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    MAX_JSONL_LINE_BYTES, ParsedFile, discover_files, for_json_lines, load_files, safe_model,
-    unknown_model,
+    BranchTracker, MAX_JSONL_LINE_BYTES, ParsedFile, discover_files, for_json_lines, load_files,
+    safe_model, unknown_model,
 };
 use crate::cache::TranscriptCache;
 use crate::model::{ActivityPoint, Diagnostics, ExactInterval, RawSession, Session};
@@ -30,6 +30,8 @@ struct WorkstatsEvent {
     role: String,
     started_at: Option<String>,
     completed_at: Option<String>,
+    /// The branch the tool was working on when it wrote the record.
+    branch: Option<String>,
     // One field each rather than six aliases of a single field. Aliases make
     // serde raise "duplicate field" as soon as a record carries two of them —
     // and `response` together with `output` is the ordinary shape of an
@@ -115,6 +117,7 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
     type EventKey = (String, String, String, bool);
     let mut sessions: BTreeMap<EventKey, RawSession> = BTreeMap::new();
     let mut sensitive_records = 0_u64;
+    let mut branches: BTreeMap<EventKey, BranchTracker> = BTreeMap::new();
     for_json_lines(
         path,
         max_line_bytes,
@@ -142,6 +145,12 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
                 record.cwd.clone(),
                 is_subagent,
             );
+            if let Some(branch) = record.branch.as_deref() {
+                branches
+                    .entry(key.clone())
+                    .or_default()
+                    .observe(timestamp, branch);
+            }
             let session = sessions.entry(key).or_insert_with(|| RawSession {
                 provider,
                 session_id: record.session_id,
@@ -201,7 +210,11 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
     // stable however the records are distributed.
     result.sessions = sessions
         .into_iter()
-        .map(|((_, _, cwd, is_subagent), mut session)| {
+        .map(|(key, mut session)| {
+            if let Some(tracker) = branches.remove(&key) {
+                session.branches = tracker.finish(&mut result.diagnostics, path);
+            }
+            let (_, _, cwd, is_subagent) = key;
             session.session_id = if is_subagent {
                 format!("{}:{cwd}:subagent", session.session_id)
             } else {
@@ -440,5 +453,69 @@ mod tests {
         assert!(subagent.human_points.is_empty());
         // Events carry no token counts.
         assert!(foreground.token_events.is_empty());
+    }
+
+    #[test]
+    fn event_branches_become_marks_at_changes_and_hostile_names_are_ignored() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let event = |time: &str, branch: serde_json::Value| {
+            serde_json::json!({"timestamp": time, "provider": "cursor", "session_id": "t",
+                "cwd": "/work", "event": "prompt", "branch": branch})
+        };
+        let records = [
+            event("2026-01-01T00:00:00Z", "main".into()),
+            event("2026-01-01T00:01:00Z", "main".into()),
+            event("2026-01-01T00:02:00Z", "feat/e".into()),
+            event("2026-01-01T00:03:00Z", "bad\u{1b}name".into()),
+            event("2026-01-01T00:04:00Z", serde_json::Value::Null),
+        ];
+        fs::write(
+            &path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let parsed = parse_event_file(&path, MAX_JSONL_LINE_BYTES);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        assert_eq!(
+            vec![
+                (None, "main"),
+                (Some(utc("2026-01-01T00:02:00Z")), "feat/e")
+            ],
+            parsed.sessions[0]
+                .branches
+                .iter()
+                .map(|mark| (mark.from, mark.branch.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(1, parsed.diagnostics.note_count);
+    }
+
+    #[test]
+    fn the_published_schema_declares_the_branch_field() {
+        let schema: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("schema/workstats-events-v1.schema.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let branch = &schema["properties"]["branch"];
+        assert_eq!("string", branch["type"]);
+        assert_eq!(256, branch["maxLength"]);
+        // Optional: a record without it stays valid.
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "branch")
+        );
+        assert_eq!(true, schema["additionalProperties"]);
     }
 }

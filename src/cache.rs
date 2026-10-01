@@ -12,12 +12,13 @@ use crate::paths::RepositoryHistoryEntry;
 
 /// Bumped whenever a parser changes what it stores or how a range is derived, so that
 /// entries written by an older build are recomputed instead of answered from. Version 4
-/// retains Pi parent-CWD repository hints for deleted temporary worktrees.
+/// retains Pi parent-CWD repository hints for deleted temporary worktrees. Version 5
+/// stores provider-recorded branch marks and pull-request references.
 ///
 /// This is the manual half of the validity key. Forgetting to bump it serves stale
 /// parses, which is why `parser_stamp` also mixes in the crate version: a release
 /// invalidates every older entry whether or not anyone remembered.
-const PARSER_VERSION: i64 = 4;
+const PARSER_VERSION: i64 = 5;
 
 /// What a cache entry must carry to be answered from: `PARSER_VERSION` joined to the
 /// crate version that wrote it.
@@ -522,6 +523,33 @@ mod tests {
         assert!(matches!(
             cache
                 .lookup(&source, "codex", "context", stamp, None, None)
+                .unwrap(),
+            CacheLookup::Miss
+        ));
+    }
+
+    #[test]
+    fn an_entry_written_by_parser_version_four_is_recomputed() {
+        assert!(parser_stamp().starts_with("5+"), "{}", parser_stamp());
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("session.jsonl");
+        fs::write(&source, "{}\n").unwrap();
+        let cache_path = directory.path().join("index.sqlite3");
+        let stamp = file_stamp(&source).unwrap();
+        let mut cache = TranscriptCache::open(&cache_path, false).unwrap();
+        cache
+            .put(&source, "claude", "context", stamp, &parsed(&source))
+            .unwrap();
+        // The same build's stamp, but as version 4 wrote it: before branch marks and
+        // pull-request links were stored.
+        let older = format!("4+{}", env!("CARGO_PKG_VERSION"));
+        cache
+            .connection
+            .execute("UPDATE transcript_cache SET parser_version = ?1", [older])
+            .unwrap();
+        assert!(matches!(
+            cache
+                .lookup(&source, "claude", "context", stamp, None, None)
                 .unwrap(),
             CacheLookup::Miss
         ));

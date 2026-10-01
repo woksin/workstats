@@ -212,6 +212,12 @@ pub(crate) struct RecordArguments {
     pub(crate) completed_at: Option<String>,
     #[arg(
         long,
+        value_name = "NAME",
+        help = "Branch the work was on (stored in the event log and shown in branch groupings)"
+    )]
+    pub(crate) branch: Option<String>,
+    #[arg(
+        long,
         value_name = "FILE",
         help = "Event log (default: platform data directory; '-' writes stdout)"
     )]
