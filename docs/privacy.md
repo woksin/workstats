@@ -99,11 +99,44 @@ _Coming in this release._
 
 ### Files beside the config: the timesheet ledger and the machine id
 
-_Coming in this release._
+`machine.json`, written by `workstats export` next to the config file, holds a
+random 128-bit id and a label for this machine (`--label`, or `HOSTNAME` /
+`COMPUTERNAME`). Nothing is read from the system to make the id; it identifies
+nothing about the machine and is sent nowhere. It appears only inside bundles
+you export, where it keeps one machine's `local:` repository keys apart from
+another's. It is never regenerated if the file is unreadable.
 
 ### Bundles
 
-_Coming in this release._
+`workstats export` writes a `workstats-bundle` so another machine can merge your
+history (see [Merging machines](merge.md)). It holds the same structural fields
+the transcript cache holds — activity timestamps, model names, token counts,
+session ids, branch names and pull-request numbers — plus:
+
+- repository identity keys: the normalised fetch remote (`remote:github.com/acme/api`),
+  a project alias key, or, for a repository with no shareable remote, an opaque
+  `local:<machine id>:<label>` key. A remote that names a directory on disk is
+  treated as having no remote, so it cannot carry a path out;
+- for each session, the working directory **relative to the repository root**
+  (`src/api`), never the absolute path;
+- per commit: SHA, author time, line counts, per-category line tallies, the
+  agent-authored / assisted flags and the branch name;
+- the machine's id and label, the Git author patterns used, the export window
+  and the idle/credit/gap settings.
+
+**Never in a bundle:** prompts or responses, commit subjects or bodies, session
+titles, absolute paths. Changed file paths appear only when you pass
+`--include-paths`, and are then repo-relative. Bundles are plain JSON and **are
+not encrypted**: anyone who has the file can read the dates and hours it
+implies, the repository names and branch names (which can carry client or
+ticket names), and the commit SHAs. Share them the way you would share the
+report they produce.
+
+Import reads a bundle with strict bounds (at most 1 GiB, a known format and
+version, every repository key and provider checked, labels and subdirectories
+reduced to plain relative names) and never executes or follows anything in it.
+Imported work gets a synthetic working directory (`api@laptop/src`) that is not
+a path on your machine, so nothing scans it as one.
 
 ### The `now` snapshot
 

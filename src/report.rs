@@ -187,8 +187,6 @@ pub(crate) enum Purpose {
     Print,
     Explore,
     Allocate,
-    // Used by the commands built on `collect` in later changes.
-    #[allow(dead_code)]
     Query,
 }
 
@@ -235,7 +233,6 @@ pub(crate) struct Collected {
 /// Runs the whole pipeline for `arguments` and returns what it produced
 /// without presenting any of it.
 // The entry point for the commands built on collected data.
-#[allow(dead_code)]
 pub(crate) fn collect(arguments: ReportArguments, purpose: Purpose) -> Result<Collected> {
     let mut prepared = prepare(arguments, purpose)?;
     let collected = execute(&mut prepared)?;
@@ -1027,10 +1024,27 @@ fn scan_window(
     );
     // Imported bundles join before labels are made unique, so a repository
     // that arrives from another machine is labelled with the rest.
+    if !arguments.import.is_empty() {
+        progress.set("Reading imported bundles");
+    }
+    let provider_allowed = |provider: &str| provider_enabled(provider, included, excluded);
     bundle::merge_imports(
-        &arguments.import,
+        &bundle::ImportRequest {
+            files: &arguments.import,
+            window,
+            repo_filter,
+            path_filtered: !csv_globs(&arguments.path).is_empty()
+                || !csv_globs(&arguments.path_exclude).is_empty(),
+            // Only when Git was read is there a local identity to compare.
+            local_authors: if arguments.no_git { &[] } else { authors },
+            human_idle,
+            review_credit,
+            gap_cap,
+            provider_enabled: &provider_allowed,
+        },
         &mut sessions,
         &mut commits,
+        &mut agent_commits,
         &scan.aliases,
         diagnostics,
     )?;

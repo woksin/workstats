@@ -285,8 +285,6 @@ impl ProjectAliases {
     /// checkout on this machine, which an imported session does not have. Two
     /// aliases claiming the identity cannot happen after validation, but would
     /// answer `None` here rather than guess.
-    // Used by bundle import, which lands in a later change.
-    #[allow(dead_code)]
     pub fn alias_for_natural_id(&self, natural_id: &str) -> Option<(String, String)> {
         let mut matches = self
             .aliases
