@@ -28,9 +28,11 @@ printed in reports; review a report before sharing it
    time is split at the moment of the switch.
 2. Otherwise the checkout's HEAD reflog (`reflog`): the branch it was on at the
    moment, read from the `checkout: moving from X to Y` entries. Before the
-   first entry on record, it was on the branch that entry left, for up to 90
-   days before it (Git's default reflog expiry); work older than that reads as
-   unknown.
+   first entry on record, it was on the branch that entry left, but only for
+   the last 30 days before the reflog is read (Git's default
+   `gc.reflogExpireUnreachable`: switches to branches nothing reaches any more
+   expire that soon, so older ones may be missing); work older than that reads
+   as unknown.
 3. Otherwise, for a session after the checkout's last switch (or one whose
    checkout never switched), the branch that is checked out now (`head`).
 4. Otherwise nothing: the session shows `—`.
@@ -48,18 +50,13 @@ worktree's branch.
    is none, every branch commit counts as unique to its branch.
 2. A commit reachable from exactly one local branch other than the integration
    branch is on that branch (`unique`).
-3. A commit only on the integration branch has usually been merged. The HEAD
-   reflogs of the repository's checkouts known to the run (the scanned
-   directory, and the checkouts sessions ran in) say which branches were out at
-   the commit's time. If exactly one branch other than the integration branch
-   was, the commit is on it (`reflog`). That is how a merged and deleted
-   branch is recovered.
-4. If several were, or none was, the commit is on the integration branch
-   (`integration`). Parallel worktrees on different branches make a commit
-   ambiguous, and `integration` is the honest answer. So is a commit made
-   while the checkout it was found in was itself on the integration branch: a
-   hotfix made on `main` while a worktree had a feature branch out stays on
-   `main`. The other checkouts vote only when that checkout cannot say.
+3. A commit only on the integration branch (merged, fast-forwarded,
+   rebased, or a squash-merged feature whose branch is gone) is on the
+   integration branch (`integration`), however it got there. The time spent on
+   the feature is still attributed through the sessions' recorded or reflog
+   branch.
+4. Nothing is guessed from other checkouts' reflogs, so a commit's branch never
+   depends on which worktree happens to be scanned first.
 5. A commit only a detached HEAD holds has no branch.
 
 ## Configuration
@@ -116,17 +113,22 @@ Only the branch name is read for issue keys. Commit subjects are not.
   original commits are gone from the integration branch. What is left are the
   squash commit, which is attributed like any commit on the integration
   branch, and the reflog, which can recover the branch if it has not expired.
-- **Reflogs expire** (about 90 days by default), so old work on a deleted
-  branch reads as the integration branch, and a session older than the
-  oldest switch the reflog kept (by more than 90 days) has no branch from it.
-- **Which checkout made a commit is not recorded.** The checkout the commit
-  was found in stands for it. A commit made in a feature worktree but found
-  through the main checkout, which was on `main` at the time, reads as `main`.
-- **A provider that records `HEAD`** (or a bare commit id) for a detached
-  checkout is read as having recorded no branch, so the checkout's reflog can
-  still fill it in.
+- **Reflogs expire.** Entries are dropped by age when Git runs `gc`, and
+  switches to branches nothing reaches any more expire after about 30 days. A
+  session's reflog branch is therefore trusted back only 30 days from now
+  before the oldest switch kept; older work with no recorded branch has none.
+- **A commit already merged into the integration branch is reported on it.**
+  This includes a commit made in a feature worktree and fast-forwarded into
+  `main`, and the commits of a squash-merged, deleted feature. The time spent
+  on the feature is still attributed through the sessions' recorded or reflog
+  branch.
+- **A provider that records `HEAD`** for a detached checkout (or `@`, or a name
+  Git forbids) is read as having recorded no branch, so the checkout's reflog
+  can still fill it in. Digit-only and hex-only names such as ticket numbers
+  are legal branch names and are kept.
 - **Tags checked out by name** look like branches in the reflog. Bare commit
-  ids and `HEAD~n` are recognised as a detached HEAD.
+  ids and `HEAD~n` are recognised as a detached HEAD, which also means a
+  branch named only with 7 or more hex digits is not read from the reflog.
 - **The integration branch is one branch.** A repository with separate long-lived
   `develop` and `main` branches names only one of them as the integration branch.
 - **Process cost.** Per checkout, at most three `git` processes: refs, the
