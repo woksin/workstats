@@ -227,6 +227,176 @@ fn html_text(value: &str) -> String {
     escape_html(&safe_text(value))
 }
 
+/// How a command lays its document out as terminal text. The three commands
+/// that print documents (the timesheet and calendar, `branch`/`pr`, and
+/// `insights`/`digest`) grew slightly different looks that people may have
+/// scripted against, so the one renderer takes the differences as data rather
+/// than changing anyone's output.
+#[derive(Clone, Copy)]
+pub(crate) struct TextStyle {
+    /// Underline a section title with `-` on the next line.
+    pub(crate) underline_sections: bool,
+    pub(crate) paragraphs: Paragraphs,
+    /// Put before each facts line and table line.
+    pub(crate) indent: &'static str,
+    /// The character that rules a table under its header.
+    pub(crate) rule: char,
+    /// Also rule a table above its total row.
+    pub(crate) rule_above_total: bool,
+    /// One space, not two, between two columns that are each at most two wide
+    /// (a heatmap's one-glyph hours would otherwise run past a terminal).
+    pub(crate) tight_narrow_columns: bool,
+}
+
+/// How a paragraph is set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Paragraphs {
+    /// As one line, flush left.
+    Plain,
+    /// As one line, indented two spaces.
+    Indented,
+    /// Indented two spaces and broken into lines of about this many characters.
+    Wrapped(usize),
+}
+
+/// The terminal view of a document: aligned columns, figures right-aligned,
+/// every string passed through the same control-character filter as every
+/// other output.
+pub(crate) fn render_text(document: &Document, style: &TextStyle) -> String {
+    let mut output = format!("{}\n", safe_text(&document.title));
+    for block in &document.blocks {
+        output.push('\n');
+        match block {
+            Block::Section(title) => {
+                let title = safe_text(title);
+                output.push_str(&title);
+                output.push('\n');
+                if style.underline_sections {
+                    output.push_str(&"-".repeat(title.chars().count()));
+                    output.push('\n');
+                }
+            }
+            Block::Paragraph(text) => {
+                let text = safe_text(text);
+                match style.paragraphs {
+                    Paragraphs::Plain => output.push_str(&format!("{text}\n")),
+                    Paragraphs::Indented => output.push_str(&format!("  {text}\n")),
+                    Paragraphs::Wrapped(width) => push_wrapped(&mut output, &text, width),
+                }
+            }
+            Block::List(items) => {
+                for item in items {
+                    output.push_str(&format!("  - {}\n", safe_text(item)));
+                }
+            }
+            Block::Facts(facts) => {
+                let width = facts
+                    .iter()
+                    .map(|(label, _)| safe_text(label).chars().count())
+                    .max()
+                    .unwrap_or(0);
+                for (label, value) in facts {
+                    output.push_str(&format!(
+                        "{}{:<width$}  {}\n",
+                        style.indent,
+                        safe_text(label),
+                        safe_text(value)
+                    ));
+                }
+            }
+            Block::Table(table) => push_text_table(&mut output, table, style),
+            Block::Heatmap(heatmap) => {
+                for grid in &heatmap.grids {
+                    output.push_str(&format!("{}\n", safe_text(&grid.label)));
+                    for line in heatmap_lines(grid, '\u{b7}') {
+                        output.push_str(&format!("{line}\n"));
+                    }
+                    output.push('\n');
+                }
+                output.push_str(&format!("{}\n", safe_text(&heatmap.legend)));
+            }
+        }
+    }
+    output
+}
+
+fn push_wrapped(output: &mut String, text: &str, limit: usize) {
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + word.chars().count() >= limit {
+            output.push_str(&format!("  {line}\n"));
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        output.push_str(&format!("  {line}\n"));
+    }
+}
+
+fn push_text_table(output: &mut String, table: &Table, style: &TextStyle) {
+    let clean =
+        |cells: &[String]| -> Vec<String> { cells.iter().map(|cell| safe_text(cell)).collect() };
+    let header: Vec<String> = table
+        .columns
+        .iter()
+        .map(|column| safe_text(&column.label))
+        .collect();
+    let rows: Vec<Vec<String>> = table.rows.iter().map(|row| clean(row)).collect();
+    let total = table.total.as_ref().map(|row| clean(row));
+    let mut widths: Vec<usize> = header.iter().map(|cell| cell.chars().count()).collect();
+    for row in rows.iter().chain(total.iter()) {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let gap = |index: usize| {
+        if index == 0 {
+            ""
+        } else if style.tight_narrow_columns && widths[index] <= 2 && widths[index - 1] <= 2 {
+            " "
+        } else {
+            "  "
+        }
+    };
+    let line = |cells: &[String]| {
+        let mut text = String::new();
+        for (index, column) in table.columns.iter().enumerate() {
+            let cell = cells.get(index).map_or("", String::as_str);
+            text.push_str(gap(index));
+            if column.numeric {
+                text.push_str(&format!("{cell:>width$}", width = widths[index]));
+            } else {
+                text.push_str(&format!("{cell:<width$}", width = widths[index]));
+            }
+        }
+        format!("{}{}\n", style.indent, text.trim_end())
+    };
+    let rule = format!(
+        "{}{}\n",
+        style.indent,
+        style.rule.to_string().repeat(
+            (0..widths.len())
+                .map(|index| widths[index] + gap(index).len())
+                .sum::<usize>()
+        )
+    );
+    output.push_str(&line(&header));
+    output.push_str(&rule);
+    for row in &rows {
+        output.push_str(&line(row));
+    }
+    if let Some(total) = total {
+        if style.rule_above_total {
+            output.push_str(&rule);
+        }
+        output.push_str(&line(&total));
+    }
+}
+
 /// GitHub-flavoured Markdown, ending in a newline. Tables keep their column
 /// alignment, so a pasted report lines up the way the terminal one does.
 pub(crate) fn render_markdown(document: &Document) -> String {
@@ -480,6 +650,48 @@ mod tests {
                 Block::List(vec![HOSTILE.to_string()]),
             ],
         }
+    }
+
+    #[test]
+    fn text_styles_differ_only_in_the_ways_each_command_was_already_printing() {
+        let mut table = Table::new(
+            vec![Column::text("name"), Column::number("n")],
+            vec![vec!["a".to_string(), "1".to_string()]],
+        );
+        table.total = Some(vec!["all".to_string(), "1".to_string()]);
+        let document = Document {
+            title: "T".to_string(),
+            blocks: vec![
+                Block::Section("Part".to_string()),
+                Block::Paragraph("words".to_string()),
+                Block::Facts(vec![("k".to_string(), "v".to_string())]),
+                Block::Table(table),
+            ],
+        };
+        let timesheet = TextStyle {
+            underline_sections: true,
+            paragraphs: Paragraphs::Plain,
+            indent: "",
+            rule: '-',
+            rule_above_total: true,
+            tight_narrow_columns: false,
+        };
+        assert_eq!(
+            render_text(&document, &timesheet),
+            "T\n\nPart\n----\n\nwords\n\nk  v\n\nname  n\n-------\na     1\n-------\nall   1\n"
+        );
+        let indented = TextStyle {
+            underline_sections: false,
+            paragraphs: Paragraphs::Indented,
+            indent: "  ",
+            rule: '\u{2500}',
+            rule_above_total: false,
+            tight_narrow_columns: false,
+        };
+        assert_eq!(
+            render_text(&document, &indented),
+            "T\n\nPart\n\n  words\n\n  k  v\n\n  name  n\n  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  a     1\n  all   1\n"
+        );
     }
 
     #[test]

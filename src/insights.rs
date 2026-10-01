@@ -19,12 +19,12 @@ use crate::aggregate::{Timeline, foreground_session_output};
 use crate::attribution::{self, Ctx};
 use crate::cli::{OutputFormat, ReportArguments, ReportWindow};
 use crate::compare::Comparison;
-use crate::document::{Block, Column, Document, Table, render_html, render_markdown};
+use crate::document::{
+    self, Block, Column, Document, Paragraphs, Table, TextStyle, render_html, render_markdown,
+};
 use crate::goals::GoalReport;
 use crate::model::{Diagnostics, GitCommit, Interval, Session, TokenUsage};
-use crate::output::{
-    compact_tokens, hours, number, percent, push_comparison, safe_text, warning_lines,
-};
+use crate::output::{compact_tokens, hours, number, percent, push_comparison, warning_lines};
 use crate::paths::{Config, home_dir};
 use crate::pricing::{self, RATES_AS_OF, RateOverrides, RateSource};
 use crate::report::{Collected, Purpose, collect};
@@ -1836,131 +1836,21 @@ fn digest_document(
 // Terminal rendering
 // ---------------------------------------------------------------------------
 
-/// The `Document` as terminal text: the table view of both commands. The
-/// renderers for Markdown and HTML live with the document model; this is the
-/// third, and it escapes nothing but still passes every string through
-/// `safe_text`, as they do.
+/// The `Document` as terminal text: the table view of both commands. Escapes
+/// nothing but passes every string through `safe_text`, as the Markdown and
+/// HTML renderers do.
 fn render_text(document: &Document) -> String {
-    let mut output = format!("{}\n", safe_text(&document.title));
-    for block in &document.blocks {
-        output.push('\n');
-        match block {
-            Block::Section(title) => {
-                output.push_str(&format!("{}\n", safe_text(title)));
-            }
-            Block::Paragraph(text) => push_wrapped(&mut output, &safe_text(text)),
-            Block::List(items) => {
-                for item in items {
-                    output.push_str(&format!("  - {}\n", safe_text(item)));
-                }
-            }
-            Block::Facts(facts) => {
-                let width = facts
-                    .iter()
-                    .map(|(label, _)| safe_text(label).chars().count())
-                    .max()
-                    .unwrap_or(0);
-                for (label, value) in facts {
-                    output.push_str(&format!(
-                        "  {:<width$}  {}\n",
-                        safe_text(label),
-                        safe_text(value)
-                    ));
-                }
-            }
-            Block::Table(table) => push_text_table(&mut output, table),
-            Block::Heatmap(heatmap) => {
-                for grid in &heatmap.grids {
-                    output.push_str(&format!("{}\n", safe_text(&grid.label)));
-                    for line in crate::document::heatmap_lines(grid, '·') {
-                        output.push_str(&format!("{line}\n"));
-                    }
-                    output.push('\n');
-                }
-                output.push_str(&format!("{}\n", safe_text(&heatmap.legend)));
-            }
-        }
-    }
-    output
-}
-
-fn push_wrapped(output: &mut String, text: &str) {
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        if !line.is_empty() && line.chars().count() + word.chars().count() >= 96 {
-            output.push_str(&format!("  {line}\n"));
-            line.clear();
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
-    }
-    if !line.is_empty() {
-        output.push_str(&format!("  {line}\n"));
-    }
-}
-
-fn push_text_table(output: &mut String, table: &Table) {
-    let rows: Vec<Vec<String>> = std::iter::once(
-        table
-            .columns
-            .iter()
-            .map(|column| safe_text(&column.label))
-            .collect::<Vec<_>>(),
+    document::render_text(
+        document,
+        &TextStyle {
+            underline_sections: false,
+            paragraphs: Paragraphs::Wrapped(96),
+            indent: "  ",
+            rule: '\u{2500}',
+            rule_above_total: false,
+            tight_narrow_columns: true,
+        },
     )
-    .chain(
-        table
-            .rows
-            .iter()
-            .chain(table.total.iter())
-            .map(|row| row.iter().map(|cell| safe_text(cell)).collect()),
-    )
-    .collect();
-    let widths: Vec<usize> = (0..table.columns.len())
-        .map(|index| {
-            rows.iter()
-                .map(|row| row.get(index).map_or(0, |cell| cell.chars().count()))
-                .max()
-                .unwrap_or(0)
-        })
-        .collect();
-    // Two spaces between columns, one between two narrow ones: a heatmap's
-    // 24 one-glyph hours would otherwise run far past a terminal's width.
-    let gap = |index: usize| {
-        if index == 0 {
-            ""
-        } else if widths[index] <= 2 && widths[index - 1] <= 2 {
-            " "
-        } else {
-            "  "
-        }
-    };
-    let line = |row: &Vec<String>| {
-        let mut text = String::new();
-        for (index, column) in table.columns.iter().enumerate() {
-            let cell = row.get(index).map_or("", String::as_str);
-            text.push_str(gap(index));
-            if column.numeric {
-                text.push_str(&format!("{cell:>width$}", width = widths[index]));
-            } else {
-                text.push_str(&format!("{cell:<width$}", width = widths[index]));
-            }
-        }
-        format!("  {}\n", text.trim_end())
-    };
-    output.push_str(&line(&rows[0]));
-    output.push_str(&format!(
-        "  {}\n",
-        "─".repeat(
-            (0..widths.len())
-                .map(|index| widths[index] + gap(index).len())
-                .sum::<usize>()
-        )
-    ));
-    for row in &rows[1..] {
-        output.push_str(&line(row));
-    }
 }
 
 #[cfg(test)]

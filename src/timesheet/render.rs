@@ -14,8 +14,7 @@ use serde_json::{Map, Value, json};
 use super::compute::{Computation, round_to_cents};
 use super::model::{Adjustment, EntryStatus, TimesheetEntry, TimesheetWindow, TotalsBy};
 use super::presets::status_name;
-use crate::document::{Block, Column, Document, Table, heatmap_lines};
-use crate::output::safe_text;
+use crate::document::{self, Block, Column, Document, Paragraphs, Table, TextStyle};
 
 /// Stated at the top of every output.
 pub(crate) const HEADER: &str =
@@ -566,96 +565,22 @@ fn cross_check_table(view: &View<'_>) -> Table {
 
 // ------------------------------------------------------------------- text
 
+/// The timesheet's terminal look (the calendar uses it too): underlined
+/// sections, flush-left lines, `-` rules above the header's rows and the total.
+const TEXT_STYLE: TextStyle = TextStyle {
+    underline_sections: true,
+    paragraphs: Paragraphs::Plain,
+    indent: "",
+    rule: '-',
+    rule_above_total: true,
+    tight_narrow_columns: false,
+};
+
 /// The terminal view of a document: aligned columns, figures right-aligned,
 /// every cell passed through the same control-character filter as every other
 /// output.
 pub(crate) fn render_text(document: &Document) -> String {
-    let mut output = format!("{}\n", safe_text(&document.title));
-    for block in &document.blocks {
-        output.push('\n');
-        match block {
-            Block::Section(title) => {
-                let title = safe_text(title);
-                let _ = writeln!(output, "{title}\n{}", "-".repeat(title.chars().count()));
-            }
-            Block::Paragraph(text) => {
-                let _ = writeln!(output, "{}", safe_text(text));
-            }
-            Block::List(items) => {
-                for item in items {
-                    let _ = writeln!(output, "  - {}", safe_text(item));
-                }
-            }
-            Block::Facts(facts) => {
-                let width = facts
-                    .iter()
-                    .map(|(label, _)| label.chars().count())
-                    .max()
-                    .unwrap_or(0);
-                for (label, value) in facts {
-                    let _ = writeln!(output, "{:<width$}  {}", safe_text(label), safe_text(value));
-                }
-            }
-            Block::Table(table) => text_table(&mut output, table),
-            Block::Heatmap(heatmap) => {
-                for grid in &heatmap.grids {
-                    let _ = writeln!(output, "{}", safe_text(&grid.label));
-                    for line in heatmap_lines(grid, '·') {
-                        let _ = writeln!(output, "{line}");
-                    }
-                    output.push('\n');
-                }
-                let _ = writeln!(output, "{}", safe_text(&heatmap.legend));
-            }
-        }
-    }
-    output
-}
-
-fn text_table(output: &mut String, table: &Table) {
-    let clean =
-        |cells: &[String]| -> Vec<String> { cells.iter().map(|cell| safe_text(cell)).collect() };
-    let header: Vec<String> = table.columns.iter().map(|c| safe_text(&c.label)).collect();
-    let rows: Vec<Vec<String>> = table.rows.iter().map(|row| clean(row)).collect();
-    let total = table.total.as_ref().map(|row| clean(row));
-    let mut widths: Vec<usize> = header.iter().map(|cell| cell.chars().count()).collect();
-    for row in rows.iter().chain(total.iter()) {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.chars().count());
-        }
-    }
-    let line = |cells: &[String]| {
-        let mut text = String::new();
-        for (index, cell) in cells.iter().enumerate() {
-            if index > 0 {
-                text.push_str("  ");
-            }
-            let width = widths[index];
-            if table.columns[index].numeric {
-                let _ = write!(text, "{cell:>width$}");
-            } else {
-                let _ = write!(text, "{cell:<width$}");
-            }
-        }
-        text.trim_end().to_string()
-    };
-    let _ = writeln!(output, "{}", line(&header));
-    let _ = writeln!(
-        output,
-        "{}",
-        "-".repeat(widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1))
-    );
-    for row in &rows {
-        let _ = writeln!(output, "{}", line(row));
-    }
-    if let Some(total) = total {
-        let _ = writeln!(
-            output,
-            "{}",
-            "-".repeat(widths.iter().sum::<usize>() + 2 * widths.len().saturating_sub(1))
-        );
-        let _ = writeln!(output, "{}", line(&total));
-    }
+    document::render_text(document, &TEXT_STYLE)
 }
 
 // ------------------------------------------------------------------- json

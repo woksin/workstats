@@ -31,7 +31,8 @@ use crate::branches;
 use crate::cli::{OutputFormat, ReportArguments, report_window, scan_directory};
 use crate::describe;
 use crate::document::{
-    Block, Column, Document, Table, escape_markdown, render_html, render_markdown,
+    self, Block, Column, Document, Paragraphs, Table, TextStyle, escape_markdown, render_html,
+    render_markdown,
 };
 use crate::git::git_executable;
 use crate::model::{Diagnostics, GitCommit, Interval, Session, TokenUsage};
@@ -1517,84 +1518,15 @@ fn document(output: &Output, command: Kind, all: bool) -> Document {
 /// The terminal rendering of a `Document`: plain lines, aligned columns. The
 /// same text the other formats carry, under the same control-character filter.
 fn render_text(document: &Document) -> String {
-    let mut text = format!("{}\n", safe_text(&document.title));
-    for block in &document.blocks {
-        text.push('\n');
-        match block {
-            Block::Section(title) => text.push_str(&format!("{}\n", safe_text(title))),
-            Block::Paragraph(paragraph) => {
-                text.push_str(&format!("  {}\n", safe_text(paragraph)));
-            }
-            Block::List(items) => {
-                for item in items {
-                    text.push_str(&format!("  - {}\n", safe_text(item)));
-                }
-            }
-            Block::Facts(facts) => {
-                let width = facts
-                    .iter()
-                    .map(|(label, _)| label.chars().count())
-                    .max()
-                    .unwrap_or(0);
-                for (label, value) in facts {
-                    text.push_str(&format!("  {label:<width$}  {}\n", safe_text(value)));
-                }
-            }
-            Block::Table(table) => {
-                let rows: Vec<Vec<String>> = std::iter::once(
-                    table
-                        .columns
-                        .iter()
-                        .map(|column| column.label.clone())
-                        .collect(),
-                )
-                .chain(table.rows.iter().chain(table.total.iter()).cloned())
-                .map(|row: Vec<String>| row.iter().map(|cell| safe_text(cell)).collect())
-                .collect();
-                let widths: Vec<usize> = (0..table.columns.len())
-                    .map(|index| {
-                        rows.iter()
-                            .map(|row| row.get(index).map_or(0, |cell| cell.chars().count()))
-                            .max()
-                            .unwrap_or(0)
-                    })
-                    .collect();
-                for (position, row) in rows.iter().enumerate() {
-                    let mut line = String::new();
-                    for (index, column) in table.columns.iter().enumerate() {
-                        let cell = row.get(index).map_or("", String::as_str);
-                        if index > 0 {
-                            line.push_str("  ");
-                        }
-                        if column.numeric {
-                            line.push_str(&format!("{cell:>width$}", width = widths[index]));
-                        } else {
-                            line.push_str(&format!("{cell:<width$}", width = widths[index]));
-                        }
-                    }
-                    text.push_str(&format!("  {}\n", line.trim_end()));
-                    if position == 0 {
-                        text.push_str(&format!(
-                            "  {}\n",
-                            "\u{2500}"
-                                .repeat(widths.iter().sum::<usize>() + 2 * (widths.len() - 1))
-                        ));
-                    }
-                }
-            }
-            // The branch report builds no calendar; the arm keeps the match
-            // exhaustive and renders one faithfully should that change.
-            Block::Heatmap(heatmap) => {
-                for grid in &heatmap.grids {
-                    text.push_str(&format!("{}\n", safe_text(&grid.label)));
-                    for line in crate::document::heatmap_lines(grid, '\u{b7}') {
-                        text.push_str(&format!("{line}\n"));
-                    }
-                    text.push('\n');
-                }
-                text.push_str(&format!("{}\n", safe_text(&heatmap.legend)));
-            }
-        }
-    }
-    text
+    document::render_text(
+        document,
+        &TextStyle {
+            underline_sections: false,
+            paragraphs: Paragraphs::Indented,
+            indent: "  ",
+            rule: '\u{2500}',
+            rule_above_total: false,
+            tight_narrow_columns: false,
+        },
+    )
 }
