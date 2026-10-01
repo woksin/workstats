@@ -22,6 +22,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::cli::{OutputFormat, ReportArguments};
+use crate::describe;
 use crate::document::{render_html, render_markdown};
 use crate::engagement::{self, Engagements, UNASSIGNED};
 use crate::model::Diagnostics;
@@ -535,6 +536,21 @@ pub(crate) struct Live {
     pub(crate) ledger: ledger::Ledger,
     /// No window flag was given, so `--month current` was assumed.
     pub(crate) default_window: bool,
+    /// What each described entry's digest said; filled when any of
+    /// `--describe`, `--summarize-with` or `--digest` is given.
+    pub(crate) digests: Vec<describe::Digest>,
+}
+
+/// Whether the output lists an entry, by the filters that hide entries. Used
+/// to leave unlisted entries undescribed: nothing is read or summarised for a
+/// row nobody will see. (`--unassigned hide` is not considered, so `lock`,
+/// which lists everything, describes everything.)
+fn is_listed(options: &TimesheetOptions, entry: &model::TimesheetEntry) -> bool {
+    let wanted = options.engagement.is_empty()
+        || options.engagement.iter().any(|key| {
+            *key == entry.engagement || (is_unassigned(key) && entry.engagement == UNASSIGNED)
+        });
+    wanted && (!options.billable_only || entry.billable)
 }
 
 /// Refuses what means nothing to a timesheet, reads the config, the ledger
@@ -574,6 +590,16 @@ pub(crate) fn compute_live(
     let mut diagnostics = Diagnostics::default();
     let config = load_config(report.config.as_deref(), &mut diagnostics);
     let resolved = resolve(options, &config)?;
+    let plan = describe::Plan::parse(
+        &options.describe,
+        options.summarize_with.as_deref(),
+        options
+            .summarize_timeout
+            .as_deref()
+            .map(|value| span_seconds("--summarize-timeout", value))
+            .transpose()?,
+        options.digest,
+    )?;
     let configured = Engagements::compile(
         config.engagements.as_ref(),
         &config.project_aliases,
@@ -600,6 +626,7 @@ pub(crate) fn compute_live(
     if default_window {
         report.month = Some("current".to_string());
     }
+    let describe_context = describe::Context::from_report(&report);
     let collected = collect(report, Purpose::Query)?;
 
     let current = lock::LockSettings::current(
@@ -624,7 +651,16 @@ pub(crate) fn compute_live(
         report_human_seconds: collected.report.summary.human_estimated_seconds,
         ledger: Some(&context),
     })?;
-    render::describe_entries(options, &mut computation.timesheet.entries)?;
+    // Descriptions are read after the figures are final and are never part of
+    // them: they are not cached, and only a lock keeps the one it was given.
+    let digests = describe::for_timesheet(
+        &plan,
+        &describe_context,
+        &collected,
+        &resolved.settings,
+        &mut computation.timesheet,
+        |entry| is_listed(options, entry),
+    );
     drop(context);
     Ok(Live {
         collected,
@@ -632,6 +668,7 @@ pub(crate) fn compute_live(
         computation,
         ledger,
         default_window,
+        digests,
     })
 }
 
@@ -654,8 +691,21 @@ fn run_report(options: TimesheetOptions, report: ReportArguments) -> Result<()> 
         resolved,
         mut computation,
         default_window,
+        digests,
         ..
     } = compute_live(&options, report, options.ignore_locks)?;
+
+    // `--digest` shows what `--summarize-with` would be given, and stops.
+    if options.digest {
+        for warning in &computation.timesheet.warnings {
+            eprintln!("workstats: {warning}");
+        }
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        serde_json::to_writer_pretty(&mut out, &digests)?;
+        writeln!(out)?;
+        return Ok(());
+    }
 
     let format = match (explicit_format, options.export) {
         (Some(format), _) => format,

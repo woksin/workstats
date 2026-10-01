@@ -152,6 +152,9 @@ totals.
 | `--billable-only` | only billable engagements |
 | `--unassigned show\|hide` | list or hide work matching no engagement |
 | `--totals-by day\|week` | subtotal by day (default) or ISO week |
+| `--describe commits\|sessions[=PROVIDERS]` | add a description column; see [Descriptions](#descriptions) |
+| `--summarize-with CMD`, `--summarize-timeout DUR` | a command writes each entry's description |
+| `--digest` | print what `--summarize-with` would be given, and run nothing |
 | `--ignore-locks` | show the live computation for locked periods instead of their snapshots |
 | `--no-evidence` | leave prompts, commits and sessions out |
 | `--format table\|json\|csv\|markdown\|html` | output format |
@@ -320,8 +323,46 @@ separate ledger, for instance per client.
 Back it up like any other record of submitted hours. What it contains is
 described in [privacy](privacy.md).
 
-## What is not here yet
+## Descriptions
 
-Descriptions (`--describe`, `--summarize-with`, `--digest`) are refused until
-they land. See [privacy](privacy.md) for what the engagement configuration, the
-ledger and the outputs contain.
+Entries have no description unless you ask. They are read when you run the
+command, shown, and thrown away: never cached, never in a bundle. The
+[privacy](privacy.md) page says exactly what is read.
+
+```sh
+workstats timesheet --describe commits                  # the subjects of your own commits
+workstats timesheet --describe sessions                 # session titles (not Codex)
+workstats timesheet --describe commits,sessions=claude+codex
+workstats timesheet --describe commits --summarize-with 'my-summarizer' --summarize-timeout 90s
+workstats timesheet --describe commits --digest         # print the digests, run nothing
+```
+
+* `commits` lists the subject lines of the commits that are yours (agent-authored
+  commits are left out), 200 characters each.
+* `sessions` lists titles Claude, Pi, OpenCode and Copilot gave their sessions.
+  Codex is read only when you name it (`sessions=codex`).
+* With both, titles come first, joined with `; ` and cut at 500 characters.
+* `--summarize-with CMD` replaces that text: each entry's digest (JSON) goes to
+  the command's standard input, and the first 500 characters of its output
+  become the description. If it fails or times out you get a warning and no
+  description for that entry.
+
+The digest looks like this; the last two fields appear only for the matching
+`--describe`:
+
+```json
+{"version": 1, "date": "2026-03-02", "engagement": "acme", "detail": "ABC-12",
+ "hours": 3.5, "repos": ["acme"], "branches": ["feat/ABC-12-export"],
+ "issues": ["ABC-12"], "counts": {"prompts": 12, "commits": 3, "sessions": 2},
+ "commit_subjects": ["Add the invoice export"], "session_titles": ["Reconcile the invoices"]}
+```
+
+The description is a column in the table, Markdown and HTML output, and appears
+in JSON and CSV only when requested. The vendor presets use it in place of the
+detail for their Description (or Notes) column. Locked entries keep the
+description they had when you locked the period, and are not described again.
+Only the entries the output shows are described, so `--engagement` and
+`--billable-only` also bound what is read and what a summarizer is run for.
+
+See [privacy](privacy.md) for what the engagement configuration, the ledger and
+the outputs contain.

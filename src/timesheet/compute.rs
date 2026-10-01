@@ -357,12 +357,33 @@ pub(crate) fn entry_order(entry: &TimesheetEntry) -> (NaiveDate, bool, &str, &st
 }
 
 fn key_for(input: &Input<'_>, repo_id: &str, cwd: &str, branch: Option<&str>, repo: &str) -> Key {
-    let engagement = input.engagements.label_for(&Ctx {
+    entry_key(
+        input.engagements,
+        input.settings.detail,
+        repo_id,
+        cwd,
+        branch,
+        repo,
+    )
+}
+
+/// The engagement (and `--detail` key) a signal's fields belong to. Public to
+/// the crate so that anything that maps a commit or session back to a
+/// timesheet entry, as descriptions do, uses the very rule the time used.
+pub(crate) fn entry_key(
+    engagements: &Engagements,
+    detail: Option<Detail>,
+    repo_id: &str,
+    cwd: &str,
+    branch: Option<&str>,
+    repo: &str,
+) -> Key {
+    let engagement = engagements.label_for(&Ctx {
         repo_id,
         cwd,
         branch,
     });
-    let detail = input.settings.detail.map(|detail| match detail {
+    let detail = detail.map(|detail| match detail {
         Detail::Issue => attribution::issue_label(branch),
         Detail::Feature => attribution::feature_label(branch),
         Detail::Branch => attribution::branch_label(branch),

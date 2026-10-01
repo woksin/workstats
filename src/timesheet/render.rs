@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -57,23 +57,6 @@ impl View<'_> {
             .cloned()
             .collect()
     }
-}
-
-/// Descriptions come from commit subjects, session titles or a summarizer, and
-/// all of them are opt-in. Wired here, where the description column is built,
-/// so the reader that fills it can land without the rest of the timesheet
-/// changing.
-// P8 (descriptions) replaces the body: fill `entry.description` for each entry.
-pub(crate) fn describe_entries(
-    options: &super::TimesheetOptions,
-    _entries: &mut [TimesheetEntry],
-) -> Result<()> {
-    if !options.describe.is_empty() || options.summarize_with.is_some() || options.digest {
-        bail!(
-            "--describe, --summarize-with and --digest are not yet implemented; descriptions arrive in a later change"
-        );
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------- figures
@@ -1003,16 +986,6 @@ mod tests {
         let hidden = Hidden::default();
         let text = render_text(&document(&view(&computation, &hidden, TotalsBy::Day)));
         assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));
-    }
-
-    #[test]
-    fn descriptions_are_refused_until_they_exist() {
-        let options = super::super::TimesheetOptions {
-            describe: vec!["commits".to_string()],
-            ..Default::default()
-        };
-        assert!(describe_entries(&options, &mut []).is_err());
-        assert!(describe_entries(&Default::default(), &mut []).is_ok());
     }
 
     #[test]

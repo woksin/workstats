@@ -143,7 +143,6 @@ pub struct Session {
     pub is_subagent: bool,
     // The fields below are filled by the providers and read by the branch
     // enrichment, `branch`/`pr` and description work packages.
-    #[allow(dead_code)]
     pub source_file: PathBuf,
     /// Branch changes in time order; empty when no branch is known.
     pub branches: Vec<BranchMark>,

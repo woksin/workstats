@@ -204,11 +204,60 @@ Nothing from a prompt or a response is involved, and nothing is sent anywhere.
 
 ### Opt-in descriptions
 
-_Coming in this release._
+Nothing here is read unless you pass `--describe` (the timesheet today;
+`branch` and `pr` use the same reader). Descriptions are never cached, never
+written into a bundle and never added to a JSON or CSV output you did not ask
+them for. The one place a description is kept is a timesheet lock, which stores
+the description an entry had when you locked it, because that is what you
+submitted.
+
+**`--describe commits`** runs one extra `git log --no-walk --stdin
+--format=%H%x09%s` per repository, over the SHAs of the commits that count as
+your own work in the window. It reads the subject line only, never the body or
+a diff. A subject is cut at 200 characters and has control and bidirectional
+characters replaced. A commit an agent authored is never asked about, so its
+subject is never read. Commits of imported bundles belong to repositories that
+are not on this machine; they are skipped, and a warning says how many.
+
+**`--describe sessions`** reads titles the tool generated or you set, from the
+named fields only, after a substring check says a line could be a title. Each
+title is made one line and cut at 200 characters.
+
+| Provider | Read |
+| --- | --- |
+| Claude Code | `ai-title.aiTitle`, `custom-title.customTitle`, and the legacy `summary.summary`; the last in the file wins |
+| Pi | `session_info.name` |
+| OpenCode | `session.title`, only if the column exists |
+| Copilot CLI | the session store's `sessions.summary` |
+| Codex | `threads.name` and `session_index.thread_name`, **only** when named: `--describe sessions=codex` |
+
+A bare `--describe sessions` reads every provider above except Codex.
+`--describe sessions=claude+pi` reads just those (a `+` separates providers,
+because the flag itself is comma-separated). Codex is excluded by default
+because its `title`, `preview` and `first_user_message` are the first prompt; they
+are never read even when Codex is named, and neither are Claude's `last-prompt`
+and `queue-operation` records or any message body.
+
+Descriptions reach the output only for the rows it shows.
 
 ### `--summarize-with` hands a digest to a command you choose
 
-_Coming in this release._
+`--summarize-with CMD` runs `CMD` once per timesheet entry through `sh -c`
+(`cmd /C` on Windows) with your environment, and writes a digest as JSON to its
+standard input. The digest has names and counts: the date, the engagement key,
+hours, the repositories, branches and issue keys of the entry, and the number
+of prompts, commits and sessions. It has commit subjects and session titles
+**only** when `--describe commits` or `--describe sessions` was also given, at
+most 50 subjects and 20 titles per entry. It never has prompt or response text.
+Because that is the point where data leaves workstats, you choose the command;
+workstats does not know where it sends the digest. Run `--digest` to print
+exactly what would be sent, and nothing is run.
+
+The first 500 characters of the command's standard output, made one line with
+control characters replaced, become the description. A command that fails,
+prints nothing or runs past `--summarize-timeout` (default 60s; the command and
+anything it started are stopped) gives a warning and no description for that
+entry. The output is not cached and is not in bundles.
 
 ### Files beside the config: the timesheet ledger and the machine id
 
