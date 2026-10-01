@@ -147,9 +147,7 @@ pub struct Session {
     pub source_file: PathBuf,
     /// Branch changes in time order; empty when no branch is known.
     pub branches: Vec<BranchMark>,
-    #[allow(dead_code)]
     pub branch_source: BranchSource,
-    #[allow(dead_code)]
     pub pull_requests: Vec<PrLink>,
 }
 
@@ -330,8 +328,7 @@ pub struct GitCommit {
     pub categories: CategoryTally,
     pub authorship: Authorship,
     pub branch: Option<String>,
-    // Set by `branches::enrich`; read by the branch report.
-    #[allow(dead_code)]
+    // Set by `branches::enrich`; read by the branch report and bundle export.
     pub branch_source: BranchSource,
 }
 
