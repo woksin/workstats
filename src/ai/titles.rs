@@ -59,6 +59,12 @@ pub(crate) fn read_titles(
         if !providers.contains(&session.provider) {
             continue;
         }
+        // Sessions that came from a bundle have no transcript on this machine
+        // (an empty source file), so they have no title to read. That is not
+        // a failure, and one warning per session would bury the real ones.
+        if session.source_file.as_os_str().is_empty() {
+            continue;
+        }
         let key = (session.provider.clone(), session.session_id.clone());
         match session.provider.as_str() {
             "claude" | "pi" => {
@@ -427,6 +433,26 @@ mod tests {
             branch_source: Default::default(),
             pull_requests: Vec::new(),
         }
+    }
+
+    #[test]
+    fn imported_sessions_have_no_source_and_no_warning() {
+        let sessions = [
+            session("claude", "a", PathBuf::new()),
+            session("pi", "b", PathBuf::new()),
+            session("copilot", "c", PathBuf::new()),
+            session("codex", "d", PathBuf::new()),
+            session("opencode", "e", PathBuf::new()),
+        ];
+        let refs: Vec<&Session> = sessions.iter().collect();
+        let all: BTreeSet<String> = TITLE_PROVIDERS
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let mut warnings = Vec::new();
+        let titles = read_titles(&refs, &all, None, &mut warnings);
+        assert!(titles.is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     fn only(provider: &str) -> BTreeSet<String> {
