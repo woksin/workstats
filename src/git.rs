@@ -88,7 +88,7 @@ const COMMIT_HEADER_WITH_CO_AUTHORS: &str = "--pretty=format:W%x09%H%x09%aI%x09%
 /// How far before `--since` Git is allowed to look, because it compares the
 /// committer date while the report windows on the author date. See
 /// `collect_commits`.
-const COMMITTER_DATE_SKEW: chrono::Duration = chrono::Duration::days(30);
+pub(crate) const COMMITTER_DATE_SKEW: chrono::Duration = chrono::Duration::days(30);
 
 pub fn git_executable() -> Option<PathBuf> {
     if let Some(configured) = env::var_os("WORKSTATS_GIT") {

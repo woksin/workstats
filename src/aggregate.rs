@@ -1520,7 +1520,9 @@ mod tests {
             .iter()
             .map(|row| row.key["feature"].as_str())
             .collect();
-        assert_eq!(BTreeSet::from(["feat/a", "feat/b"]), features);
+        // No issue is named, so a feature is the slug: the default rules strip
+        // the `feat/` prefix.
+        assert_eq!(BTreeSet::from(["a", "b"]), features);
     }
 
     #[test]
