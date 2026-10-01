@@ -41,6 +41,8 @@ struct RecordedEvent {
     started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
 }
 
 pub(crate) fn run_update_command(arguments: &UpdateArguments) -> Result<()> {
@@ -203,6 +205,23 @@ pub(crate) fn record_event(arguments: &RecordArguments) -> Result<()> {
     {
         bail!("--model must be a short model identifier, not message content");
     }
+    // A branch name goes into a log other tools read and into reports, so it is held to
+    // the same bounds the readers apply: plain, at most 256 bytes, no control characters.
+    if let Some(branch) = arguments.branch.as_deref()
+        && crate::ai::safe_branch(branch).is_none()
+    {
+        bail!("--branch must be a branch name of at most 256 bytes without control characters");
+    }
+    // The readers drop what is not a branch, so refuse it here rather than
+    // write a name that would silently vanish.
+    if let Some(branch) = arguments.branch.as_deref()
+        && !crate::branches::recordable_branch(branch)
+    {
+        if matches!(branch, "HEAD" | "@") {
+            bail!("--branch {branch:?}: HEAD is not a branch name (a detached checkout has none)");
+        }
+        bail!("--branch {branch:?} is not a valid Git branch name");
+    }
     // The value is echoed back because an RFC 3339 timestamp is usually wrong
     // in a way you can only see next to what you typed (AUDIT V).
     let timestamp = arguments
@@ -255,6 +274,7 @@ pub(crate) fn record_event(arguments: &RecordArguments) -> Result<()> {
         role: arguments.role,
         started_at: started_at.map(|value| value.to_rfc3339()),
         completed_at: completed_at.map(|value| value.to_rfc3339()),
+        branch: arguments.branch.clone(),
     };
     let mut encoded = serde_json::to_vec(&event)?;
     encoded.push(b'\n');

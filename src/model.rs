@@ -63,6 +63,43 @@ pub struct TokenEvent {
     pub usage: TokenUsage,
 }
 
+/// A branch a session was on from a moment onward. `from: None` means from the
+/// start of the session. Marks are written only when the branch changes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct BranchMark {
+    pub from: Option<DateTime<Utc>>,
+    pub branch: String,
+}
+
+/// Where a branch name came from, in decreasing order of trust. `None` means
+/// nothing is known.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchSource {
+    #[default]
+    None,
+    /// The provider recorded it (or `--source` found the only branch with it).
+    Recorded,
+    /// The commit is reachable from exactly one local branch that is not the
+    /// integration branch.
+    Unique,
+    /// Reconstructed from the HEAD reflog of the checkout.
+    Reflog,
+    /// The checkout's current `HEAD`.
+    Head,
+    /// Fell back to the integration branch.
+    Integration,
+}
+
+/// A pull request a session mentioned, by number only. URLs are not stored.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PrLink {
+    pub number: u64,
+    pub repository: String,
+    #[serde(default)]
+    pub at: Option<DateTime<Utc>>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RawSession {
     pub provider: String,
@@ -82,6 +119,10 @@ pub struct RawSession {
     pub is_subagent: bool,
     pub approximate_cwd: bool,
     pub version: Option<String>,
+    #[serde(default)]
+    pub branches: Vec<BranchMark>,
+    #[serde(default)]
+    pub pull_requests: Vec<PrLink>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,9 +141,22 @@ pub struct Session {
     pub human_points: Vec<ActivityPoint>,
     pub token_events: Vec<TokenEvent>,
     pub is_subagent: bool,
+    // The fields below are filled by the providers and read by the branch
+    // enrichment, `branch`/`pr` and description work packages.
+    pub source_file: PathBuf,
+    /// Branch changes in time order; empty when no branch is known.
+    pub branches: Vec<BranchMark>,
+    pub branch_source: BranchSource,
+    pub pull_requests: Vec<PrLink>,
 }
 
 impl Session {
+    /// The branch the session was on at `at`: the last mark that starts at or
+    /// before it. Marks must be sorted by `from`, with `None` first.
+    pub fn branch_at(&self, at: DateTime<Utc>) -> Option<&str> {
+        branch_at(&self.branches, at)
+    }
+
     pub fn first_seen(&self) -> Option<DateTime<Utc>> {
         self.points
             .iter()
@@ -122,6 +176,15 @@ impl Session {
     }
 }
 
+/// The branch in force at `at` among time-ordered `marks`.
+pub fn branch_at(marks: &[BranchMark], at: DateTime<Utc>) -> Option<&str> {
+    marks
+        .iter()
+        .rev()
+        .find(|mark| mark.from.is_none_or(|from| from <= at))
+        .map(|mark| mark.branch.as_str())
+}
+
 #[derive(Clone, Debug)]
 pub struct HumanSignal {
     pub timestamp: DateTime<Utc>,
@@ -133,6 +196,7 @@ pub struct HumanSignal {
     pub root: String,
     pub kind: String,
     pub model: String,
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +210,7 @@ pub struct Interval {
     pub repo: String,
     pub repo_id: String,
     pub root: String,
+    pub branch: Option<String>,
 }
 
 impl Interval {
@@ -259,6 +324,9 @@ pub struct GitCommit {
     pub ignored_deletions: u64,
     pub categories: CategoryTally,
     pub authorship: Authorship,
+    pub branch: Option<String>,
+    // Set by `branches::enrich`; read by the branch report and bundle export.
+    pub branch_source: BranchSource,
 }
 
 impl GitCommit {
@@ -284,6 +352,7 @@ impl GitCommit {
             root: self.root.clone(),
             kind: "commit".to_string(),
             model: "—".to_string(),
+            branch: self.branch.clone(),
         })
     }
 }
@@ -680,6 +749,30 @@ pub struct Report {
     /// window's report exactly as it would be without the flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comparison: Option<crate::compare::Comparison>,
+    /// Human and agent figures per local calendar day. Present for HTML, the
+    /// explorer, or `--daily`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily: Option<Vec<DayFigures>>,
+    /// The window the report covers. Not part of the JSON: it is what a
+    /// calendar needs to draw the days with nothing on them, which `daily`
+    /// leaves out.
+    #[serde(skip)]
+    pub window: crate::cli::ReportWindow,
+    /// Weekly-hours and list-value-cap progress. Present only when goals are
+    /// configured and not disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goals: Option<crate::goals::GoalReport>,
+}
+
+/// One local calendar day of the report window.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DayFigures {
+    pub date: chrono::NaiveDate,
+    pub human_seconds: f64,
+    pub agent_wall_seconds: f64,
+    pub prompts: usize,
+    pub commits: usize,
+    pub sessions: usize,
 }
 
 #[cfg(test)]
@@ -732,7 +825,39 @@ mod tests {
             ignored_deletions: 0,
             categories: CategoryTally::default(),
             authorship,
+            branch: None,
+            branch_source: BranchSource::None,
         }
+    }
+
+    #[test]
+    fn a_branch_is_the_last_mark_that_has_started() {
+        let at = |value: i64| DateTime::from_timestamp(value, 0).unwrap();
+        let marks = vec![
+            BranchMark {
+                from: None,
+                branch: "main".into(),
+            },
+            BranchMark {
+                from: Some(at(100)),
+                branch: "feat/x".into(),
+            },
+        ];
+        assert_eq!(Some("main"), branch_at(&marks, at(99)));
+        assert_eq!(Some("feat/x"), branch_at(&marks, at(100)));
+        assert_eq!(Some("feat/x"), branch_at(&marks, at(500)));
+        assert_eq!(None, branch_at(&[], at(500)));
+    }
+
+    #[test]
+    fn a_raw_session_without_branches_still_deserializes() {
+        let raw: RawSession = serde_json::from_str(
+            r#"{"provider":"p","session_id":"s","source_file":"f","cwd":"/c","points":[],
+            "exact_intervals":[],"human_points":[],"is_subagent":false,
+            "approximate_cwd":false,"version":null}"#,
+        )
+        .unwrap();
+        assert!(raw.branches.is_empty() && raw.pull_requests.is_empty());
     }
 
     /// The one lever that keeps the estimate honest. A commit a coding agent

@@ -1,6 +1,6 @@
 # Usage
 
-Everything beyond the short command list in the [README](../README.md#start-here): scope and authors, grouping and filtering, windows and comparisons, output formats, the interactive explorer, and feeding in other tools.
+Everything beyond the short command list in the [README](../README.md#start-here): scope and authors, grouping and filtering, windows and comparisons, output formats, the interactive explorer, feeding in other tools, and a short guide to the commands for timesheets, branches, insights, a prompt line and multiple machines.
 
 ## Scope, branches and authors
 
@@ -51,8 +51,20 @@ either). Point `--dir` at the nested repository to include it.
 ## Grouping and filtering
 
 Dimensions can be composed: `root`, `repo`, `cwd`, `provider`, `model`, `day`,
-`week`, and `month`. The default is `repo`. `day`, `week` and `month` cut time
-into buckets, so a run uses at most one of them.
+`week`, `month`, `branch`, `issue`, `feature` and `engagement`. The default is
+`repo`. `day`, `week` and `month` cut time into buckets, so a run uses at most
+one of them.
+
+The last four say *what the work was for*. `branch` is the Git branch a session
+or commit was on, `issue` is the key cut from the branch name (`ACME-123`,
+`#42`), `feature` is the issue, or the branch's slug when there is none, and
+`engagement` is the client or contract from the config's `engagements`. Work
+with no known branch, issue or engagement is grouped as `—` or `(unassigned)`
+rather than dropped. How the branch is found, and what it costs, is in
+[Branches and pull requests](branches.md); the engagement rules are in
+[Timesheet](timesheet.md#engagements). Branch names can carry client or ticket
+names, so review a grouped report before sharing it
+([Privacy](privacy.md#branch-names-are-read-cached-and-reported)).
 
 `week` is an ISO 8601 week: it starts on Monday and is labelled `2026-W09`. The
 year in the label is the ISO week-numbering year, which is not always the
@@ -286,6 +298,65 @@ A calculation ledger is one-to-many relative to CSV's grouped rows, so
 `--explain-human-time` supports table and JSON output and deliberately rejects
 `--format csv`, `markdown`, and `html` rather than silently omitting detail.
 
+## Report flags added for the newer commands
+
+Three flags work on every report command, `workstats ui` included:
+
+- `--daily` adds human and agent figures for each local day to JSON output (they
+  are always present in HTML and the explorer). It also draws the
+  [calendar heatmap](calendar.md) in Markdown.
+- `--import FILE` folds a bundle written by `workstats export` into the report,
+  repeatable; see [Merging machines](merge.md).
+- `--no-goals` leaves the config's [`goals`](configuration.md#goals) out of the
+  report, the digest and `now`.
+
+## The other commands
+
+Each has its own page; this is the one-line version.
+
+```bash
+workstats timesheet --month last             # suggested hours per day and client
+workstats timesheet --month last --export toggl > toggl.csv
+workstats branch                             # the effort behind the current branch
+workstats pr --number 123 --format markdown  # a block for a pull request description
+workstats insights --section focus,leverage  # focus, patterns and leverage, last 28 days
+workstats digest                             # this week against the week before
+workstats now                                # a short line for a prompt or status bar
+workstats calendar                           # a year grid of human time per day
+workstats export --output laptop.json        # this machine's evidence, to merge elsewhere
+workstats merge laptop.json desktop.json     # one report from several machines
+workstats record --provider cursor --session s1 --kind prompt --branch feat/ACME-1
+```
+
+- **`timesheet`**: one entry per day per [engagement](timesheet.md#engagements),
+  rounded, with manual entries, overrides and period locks
+  ([the ledger](timesheet.md#the-ledger-manual-entries-overrides-and-locks)),
+  vendor CSV exports and opt-in [descriptions](timesheet.md#descriptions).
+  See [Timesheet](timesheet.md).
+- **`branch` and `pr`**: the human time, agent time, tokens, list value and
+  commits behind one branch or pull request, or one row per branch with `--all`;
+  `pr --number N` finds the branch through the sessions that mentioned it.
+  `--describe commits,sessions` adds commit subjects and session titles. See
+  [Branches and pull requests](branches.md#the-branch-and-pr-commands).
+- **`insights` and `digest`**: focus, patterns (when you work), leverage and
+  models over a window (default: the last 28 days), and a weekly summary
+  compared with the week before that also shows progress against your goals. See
+  [Insights and digest](insights.md).
+- **`now`**: today and the week so far, cheap enough to run on every prompt
+  redraw because a fresh snapshot is printed without scanning anything. Format
+  it with `--template` (or `now.template` in the config); `--no-wait` prints the
+  last result at once and refreshes in the background, and `--quiet-errors`
+  keeps a prompt clean when something fails. See
+  [`now` in the configuration](configuration.md#now).
+- **`calendar`**: the heatmap in the terminal; the same grid is in the HTML and
+  Markdown reports and the explorer. See [Calendar heatmap](calendar.md).
+- **`export` and `merge`**: write a content-free bundle of this machine's
+  evidence and fold bundles from several machines into one report, or into any
+  report with `--import`. See [Merging machines](merge.md).
+- **`record --branch NAME`** stores the branch the work was on in the event log,
+  so tools that are not read natively still group by `branch`, `issue` and
+  `feature`. See [Add any tool or API](#add-any-tool-or-api).
+
 ## Explore it interactively
 
 ```bash
@@ -391,7 +462,8 @@ small and forward-compatible; unknown structural fields are ignored:
 {"timestamp":"2026-08-15T09:30:00Z","provider":"openai-api","session_id":"task-42","cwd":"/workspace/project","model":"model-x","event":"prompt","role":"foreground"}
 ```
 
-`event` is `prompt` or `activity`; `role` is `foreground` or `subagent`.
+`event` is `prompt` or `activity`; `role` is `foreground` or `subagent`. An
+optional `branch` (`record --branch NAME`) names the Git branch the work was on.
 Optional RFC 3339 `started_at` and `completed_at` fields provide an exact agent
 interval. On Windows, JSON paths use normal JSON escaping—using `workstats
 record` handles that automatically. Records containing common payload fields

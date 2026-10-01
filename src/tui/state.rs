@@ -307,6 +307,8 @@ pub enum Mode {
     Search,
     SaveView,
     Views,
+    /// The calendar heatmap overlay.
+    Calendar,
 }
 
 /// The `?` overlay, and the only place the key map is described to a user.
@@ -328,6 +330,10 @@ pub const KEYBINDINGS: &[(&str, &str)] = &[
     ("p", "cycle the period through month, day and ISO week"),
     ("w", "save the current view"),
     ("v", "open the saved views"),
+    (
+        "c",
+        "show the calendar heatmap of the window; ↑ ↓ change year",
+    ),
     ("d", "delete the highlighted saved view"),
     ("?", "show or hide this help"),
     ("q / Ctrl-C", "quit"),
@@ -407,7 +413,7 @@ impl SavedViews {
             .with_context(|| format!("cannot write to {}", parent.display()))?;
         file.write_all(&encoded)?;
         file.flush()?;
-        file.persist(path)
+        crate::durable::persist(file, path)
             .with_context(|| format!("cannot replace {}", path.display()))?;
         Ok(())
     }
@@ -974,6 +980,8 @@ pub(super) fn sample_commit(sha: &str, cwd: &str, files: &[(&str, u64, u64)]) ->
         // `main` never passes it the agent-authorship pass — so every commit
         // that reaches a `Dataset` is one the configured author wrote.
         authorship: Authorship::default(),
+        branch: None,
+        branch_source: crate::model::BranchSource::None,
     }
 }
 

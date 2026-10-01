@@ -8,8 +8,8 @@ use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use super::{
-    MAX_JSONL_LINE_BYTES, ParsedFile, discover_files, file_stem, for_json_lines, load_files,
-    safe_model,
+    BranchTracker, MAX_JSONL_LINE_BYTES, ParsedFile, PrCollector, deserialize_maybe_number,
+    discover_files, file_stem, for_json_lines, load_files, safe_model, whole_number,
 };
 use crate::cache::TranscriptCache;
 use crate::model::{ActivityPoint, Diagnostics, RawSession, Session, TokenEvent, TokenUsage};
@@ -27,6 +27,20 @@ struct ClaudeRecord {
     #[serde(rename = "requestId")]
     request_id: Option<String>,
     version: Option<String>,
+    /// The checkout's branch when the record was written. Present on `user` and
+    /// `assistant` records.
+    #[serde(rename = "gitBranch")]
+    git_branch: Option<String>,
+    /// `pr-link` records name a pull request by number and repository. Their `prUrl`
+    /// is deliberately not declared, so it is skipped without being read.
+    #[serde(
+        default,
+        rename = "prNumber",
+        deserialize_with = "deserialize_maybe_number"
+    )]
+    pr_number: Option<f64>,
+    #[serde(rename = "prRepository")]
+    pr_repository: Option<String>,
     #[serde(default, deserialize_with = "deserialize_message")]
     message: Option<ClaudeMessage>,
     #[serde(default, rename = "isMeta")]
@@ -248,10 +262,25 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
     let mut session_id = None;
     let mut version = None;
     let mut current_model = "unknown".to_string();
+    let mut branches = BranchTracker::default();
+    let mut pull_requests = PrCollector::default();
+    // Only the structural fields of these records are declared on `ClaudeRecord`. The
+    // `last-prompt` and `queue-operation` records carry prompt text in fields this
+    // struct has no name for, so they are skipped by the deserializer unread.
     for_json_lines(path, max_line_bytes, &mut result, |record: ClaudeRecord| {
         let Some(record_type) = record.record_type.as_deref() else {
             return;
         };
+        if record_type == "pr-link" {
+            if let Some(number) = whole_number(record.pr_number) {
+                pull_requests.observe(
+                    number,
+                    record.pr_repository.as_deref().unwrap_or_default(),
+                    record.timestamp.as_deref().and_then(parse_timestamp),
+                );
+            }
+            return;
+        }
         if record_type != "user" && record_type != "assistant" {
             return;
         }
@@ -279,6 +308,9 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         let Some(timestamp) = record.timestamp.as_deref().and_then(parse_timestamp) else {
             return;
         };
+        if let Some(branch) = record.git_branch.as_deref() {
+            branches.observe(timestamp, branch);
+        }
         points.push(ActivityPoint {
             timestamp,
             model: current_model.clone(),
@@ -378,6 +410,8 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
             .any(|part| part.as_os_str() == "subagents"),
         approximate_cwd,
         version,
+        branches: branches.finish(&mut result.diagnostics, path),
+        pull_requests: pull_requests.finish(&mut result.diagnostics, path),
     });
     result
 }
@@ -629,5 +663,181 @@ mod tests {
             ),
             file_time_range(&parsed.sessions)
         );
+    }
+    fn write_records(path: &Path, records: &[serde_json::Value]) {
+        fs::write(
+            path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn claude_branch_marks_are_written_only_where_the_branch_changes() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let record = |kind: &str, time: &str, branch: &str| {
+            serde_json::json!({
+                "type": kind, "timestamp": time, "cwd": "/work", "gitBranch": branch,
+                "message": {"content": "go"}
+            })
+        };
+        write_records(
+            &path,
+            &[
+                record("user", "2026-01-01T00:00:00Z", "main"),
+                record("assistant", "2026-01-01T00:01:00Z", "main"),
+                record("user", "2026-01-01T00:02:00Z", "feat/a"),
+                record("assistant", "2026-01-01T00:03:00Z", "feat/a"),
+                record("user", "2026-01-01T00:04:00Z", "main"),
+            ],
+        );
+        let parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        let marks = &parsed.sessions[0].branches;
+        assert_eq!(
+            vec![
+                (None, "main"),
+                (Some(utc("2026-01-01T00:02:00Z")), "feat/a"),
+                (Some(utc("2026-01-01T00:04:00Z")), "main"),
+            ],
+            marks
+                .iter()
+                .map(|mark| (mark.from, mark.branch.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            Some("feat/a"),
+            crate::model::branch_at(marks, utc("2026-01-01T00:03:30Z"))
+        );
+    }
+
+    #[test]
+    fn claude_branch_marks_are_capped_and_hostile_names_are_dropped() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut records = Vec::new();
+        for index in 0..300 {
+            records.push(serde_json::json!({
+                "type": "user", "timestamp": format!("2026-01-01T00:{:02}:{:02}Z", index / 60, index % 60),
+                "cwd": "/work", "gitBranch": format!("branch-{index}"),
+                "message": {"content": "go"}
+            }));
+        }
+        records.push(serde_json::json!({
+            "type": "user", "timestamp": "2026-01-01T01:00:00Z", "cwd": "/work",
+            "gitBranch": "evil\u{1b}[2Jname", "message": {"content": "go"}
+        }));
+        records.push(serde_json::json!({
+            "type": "user", "timestamp": "2026-01-01T01:00:01Z", "cwd": "/work",
+            "gitBranch": "x".repeat(257), "message": {"content": "go"}
+        }));
+        write_records(&path, &records);
+        let parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        let marks = &parsed.sessions[0].branches;
+        assert_eq!(256, marks.len());
+        assert!(marks.iter().all(|mark| !mark.branch.contains('\u{1b}')));
+        assert!(marks.iter().all(|mark| mark.branch.len() <= 256));
+        assert!(marks.windows(2).all(|pair| pair[0].from < pair[1].from));
+        // What was left out is said, not silently dropped.
+        assert_eq!(2, parsed.diagnostics.note_count);
+    }
+
+    #[test]
+    fn claude_pr_links_keep_the_number_and_repository_but_not_the_url() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        write_records(
+            &path,
+            &[
+                serde_json::json!({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "cwd": "/work", "message": {"content": "go"}}),
+                serde_json::json!({"type": "pr-link", "timestamp": "2026-01-01T00:05:00Z",
+                    "sessionId": "s", "prNumber": 123, "prRepository": "acme/api",
+                    "prUrl": "https://example.invalid/URL_SECRET/pull/123"}),
+                // The same pull request again, later: one link, first sighting kept.
+                serde_json::json!({"type": "pr-link", "timestamp": "2026-01-01T00:09:00Z",
+                    "prNumber": 123, "prRepository": "acme/api"}),
+                serde_json::json!({"type": "pr-link", "prNumber": "oops", "prRepository": "acme/api"}),
+                serde_json::json!({"type": "pr-link", "prNumber": 0, "prRepository": "acme/api"}),
+            ],
+        );
+        let parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(0, parsed.diagnostics.malformed_lines);
+        let links = &parsed.sessions[0].pull_requests;
+        assert_eq!(1, links.len());
+        assert_eq!(123, links[0].number);
+        assert_eq!("acme/api", links[0].repository);
+        assert_eq!(Some(utc("2026-01-01T00:05:00Z")), links[0].at);
+        let stored = serde_json::to_string(&parsed).unwrap();
+        assert!(!stored.contains("URL_SECRET"));
+    }
+
+    #[test]
+    fn claude_prompt_bearing_records_never_reach_the_parsed_file() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        write_records(
+            &path,
+            &[
+                serde_json::json!({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "cwd": "/work", "gitBranch": "main", "message": {"content": "PROMPT_SECRET"}}),
+                serde_json::json!({"type": "last-prompt", "lastPrompt": "LAST_PROMPT_SECRET",
+                    "sessionId": "s", "timestamp": "2026-01-01T00:01:00Z"}),
+                serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                    "content": "QUEUED_SECRET", "timestamp": "2026-01-01T00:02:00Z"}),
+                serde_json::json!({"type": "ai-title", "aiTitle": "TITLE_SECRET"}),
+                serde_json::json!({"type": "agent-name", "agentName": "NAME_SECRET"}),
+            ],
+        );
+        let parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(5, parsed.records_read);
+        let stored = serde_json::to_string(&parsed).unwrap();
+        for secret in [
+            "PROMPT_SECRET",
+            "LAST_PROMPT_SECRET",
+            "QUEUED_SECRET",
+            "TITLE_SECRET",
+            "NAME_SECRET",
+        ] {
+            assert!(!stored.contains(secret), "{secret} reached the parse");
+        }
+        assert!(stored.contains("\"main\""));
+    }
+
+    #[test]
+    fn a_provider_recorded_branch_marks_the_session_as_recorded() {
+        use crate::model::BranchSource;
+        let root = tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        write_records(
+            &path,
+            &[
+                serde_json::json!({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "cwd": root.path(), "gitBranch": "main", "message": {"content": "go"}}),
+                serde_json::json!({"type": "user", "timestamp": "2026-01-01T00:01:00Z",
+                    "cwd": root.path(), "sessionId": "other", "message": {"content": "go"}}),
+            ],
+        );
+        let mut resolver = PathResolver::with_home(Vec::new(), root.path().to_path_buf());
+        let mut parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        let session = resolver.resolve_session(parsed.sessions.remove(0));
+        assert_eq!(BranchSource::Recorded, session.branch_source);
+        assert_eq!(Some("main"), session.branch_at(utc("2026-01-01T00:00:30Z")));
+
+        // No branch on any record: nothing is claimed.
+        write_records(
+            &path,
+            &[
+                serde_json::json!({"type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "cwd": root.path(), "message": {"content": "go"}}),
+            ],
+        );
+        let mut parsed = parse_claude_file(&path, root.path(), MAX_JSONL_LINE_BYTES);
+        let session = resolver.resolve_session(parsed.sessions.remove(0));
+        assert_eq!(BranchSource::None, session.branch_source);
     }
 }

@@ -9,8 +9,9 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Deserialize;
 
 use super::{
-    MAX_JSONL_LINE_BYTES, ParsedFile, deserialize_maybe_number, discover_files, file_stem,
-    for_json_lines, load_files, safe_model, sqlite_columns, sqlite_table_exists, sqlite_text,
+    BranchTracker, MAX_JSONL_LINE_BYTES, ParsedFile, PrCollector, deserialize_maybe_number,
+    discover_files, file_stem, for_json_lines, load_files, safe_model, sqlite_columns,
+    sqlite_table_exists, sqlite_text, whole_session_branch,
 };
 use crate::cache::TranscriptCache;
 use crate::model::{
@@ -36,6 +37,9 @@ struct CopilotData {
     session_id: Option<String>,
     context: Option<CopilotContext>,
     cwd: Option<String>,
+    /// `session.context_changed` may carry the branch beside `cwd` rather than inside
+    /// `context`; both spellings are the same fact.
+    branch: Option<String>,
     #[serde(rename = "selectedModel")]
     selected_model: Option<String>,
     #[serde(rename = "newModel")]
@@ -60,6 +64,7 @@ struct CopilotData {
 #[derive(Deserialize)]
 struct CopilotContext {
     cwd: Option<String>,
+    branch: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -91,6 +96,9 @@ pub struct CopilotStoreSession {
     pub repository: Option<String>,
     pub branch: Option<String>,
     pub host_type: Option<String>,
+    /// `session_refs` rows with `ref_type = 'pr'`: the number, and the repository when
+    /// the value itself named one. Never a URL.
+    pub pull_requests: Vec<(u64, Option<String>)>,
 }
 
 #[derive(Debug, Default)]
@@ -160,6 +168,9 @@ pub fn parse_copilot_file(
     let mut human_by_cwd: BTreeMap<Option<String>, Vec<ActivityPoint>> = BTreeMap::new();
     let mut token_events_by_cwd: BTreeMap<Option<String>, Vec<TokenEvent>> = BTreeMap::new();
     let mut subagent_intervals: Vec<(String, String, ExactInterval)> = Vec::new();
+    // Kept per working directory like the points, so a branch recorded in one checkout
+    // is never read as the branch of another the session moved to.
+    let mut branches_by_cwd: BTreeMap<Option<String>, BranchTracker> = BTreeMap::new();
     for_json_lines(
         path,
         max_line_bytes,
@@ -170,11 +181,25 @@ pub fn parse_copilot_file(
             };
             if record_type == "session.start" {
                 session_id = record.data.session_id.or(session_id.take());
+                let context_branch = record
+                    .data
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.branch.clone());
                 cwd = record
                     .data
                     .context
                     .and_then(|context| context.cwd)
                     .or(cwd.take());
+                if let (Some(branch), Some(timestamp)) = (
+                    context_branch,
+                    record.timestamp.as_deref().and_then(parse_timestamp),
+                ) {
+                    branches_by_cwd
+                        .entry(cwd.clone())
+                        .or_default()
+                        .observe(timestamp, &branch);
+                }
                 if let Some(model) = record.data.selected_model {
                     current_model = safe_model(&model);
                 }
@@ -182,7 +207,21 @@ pub fn parse_copilot_file(
                 return;
             }
             if record_type == "session.context_changed" {
+                let context_branch = record
+                    .data
+                    .context
+                    .and_then(|context| context.branch)
+                    .or(record.data.branch);
                 cwd = record.data.cwd.or(cwd.take());
+                if let (Some(branch), Some(timestamp)) = (
+                    context_branch,
+                    record.timestamp.as_deref().and_then(parse_timestamp),
+                ) {
+                    branches_by_cwd
+                        .entry(cwd.clone())
+                        .or_default()
+                        .observe(timestamp, &branch);
+                }
             }
             if record_type == "session.model_change"
                 && let Some(model) = record.data.new_model
@@ -300,6 +339,23 @@ pub fn parse_copilot_file(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let store_branch = store_entry
+        .and_then(|entry| entry.branch.as_deref())
+        .map(str::trim);
+    let mut pull_requests = PrCollector::default();
+    if let Some(entry) = store_entry {
+        for (number, repository) in &entry.pull_requests {
+            pull_requests.observe(
+                *number,
+                repository
+                    .as_deref()
+                    .or(entry.repository.as_deref())
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+    }
+    let pull_requests = pull_requests.finish(&mut result.diagnostics, path);
     // A `session.context_changed` after the last activity event leaves the shutdown
     // usage under a cwd that has no points, so the sessions come from the union of the
     // maps rather than from the activity map alone — as `parse_codex_file` already does.
@@ -317,10 +373,21 @@ pub fn parse_copilot_file(
         }
         // A cwd the event log recorded is the directory the CLI actually ran in, so the
         // store never overrides it — only fills its absence.
+        // What the event log recorded for this directory wins; the store's single
+        // branch only fills the absence, and only for the directory the store names (or
+        // for the whole session when it never left one).
+        let tracked = branches_by_cwd.remove(&cwd_key);
         let resolved = cwd_key.or_else(|| store_cwd.clone());
         let approximate_cwd = resolved.is_none();
         let resolved_cwd = resolved
             .unwrap_or_else(|| path.parent().unwrap_or(path).to_string_lossy().into_owned());
+        let mut branches = tracked.map_or_else(Vec::new, |tracker| {
+            tracker.finish(&mut result.diagnostics, path)
+        });
+        if branches.is_empty() && (!multiple || store_cwd.as_deref() == Some(resolved_cwd.as_str()))
+        {
+            branches = whole_session_branch(store_branch);
+        }
         result.sessions.push(RawSession {
             provider: "copilot".to_string(),
             session_id: if multiple {
@@ -338,6 +405,8 @@ pub fn parse_copilot_file(
             is_subagent: false,
             approximate_cwd,
             version: version.clone(),
+            branches,
+            pull_requests: pull_requests.clone(),
         });
     }
     for (subagent_id, subagent_cwd, interval) in subagent_intervals {
@@ -345,6 +414,9 @@ pub fn parse_copilot_file(
             .filter(|value| !value.is_empty())
             .or_else(|| store_cwd.clone());
         let approximate_cwd = resolved.is_none();
+        // A subagent runs in the checkout it was started from. Without events of its
+        // own for that directory it takes the store's branch, as the session does.
+        let branches = whole_session_branch(store_branch);
         result.sessions.push(RawSession {
             provider: "copilot".to_string(),
             session_id: format!("{base_id}:subagent:{subagent_id}"),
@@ -359,6 +431,8 @@ pub fn parse_copilot_file(
             is_subagent: true,
             approximate_cwd,
             version: version.clone(),
+            branches,
+            pull_requests: Vec::new(),
         });
     }
     report_copilot_repository_disagreement(&mut result, store_entry, &base_id, path);
@@ -455,16 +529,26 @@ fn copilot_session_store_path(root: &Path) -> PathBuf {
 /// store and may hold an approximate cwd the store can now resolve, and to v4 because a
 /// v3 entry recorded the repository disagreement as a warning: transcripts do not change
 /// after a session ends, so without this the cache would keep replaying the warning this
-/// release exists to stop, on every run, forever.
+/// release exists to stop, on every run, forever. Bumped to v5 because the store's branch
+/// and pull-request rows now reach the parse.
 fn copilot_context_fingerprint(store: &CopilotSessionStore, path: &Path) -> String {
     match store.get(&copilot_session_directory(path)) {
         Some(entry) => format!(
-            "copilot-v4:{}:{}:{}",
+            "copilot-v5:{}:{}:{}:{}",
             entry.cwd.as_deref().unwrap_or_default(),
             entry.repository.as_deref().unwrap_or_default(),
-            entry.branch.as_deref().unwrap_or_default()
+            entry.branch.as_deref().unwrap_or_default(),
+            entry
+                .pull_requests
+                .iter()
+                .map(|(number, repository)| format!(
+                    "{number}@{}",
+                    repository.as_deref().unwrap_or_default()
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
         ),
-        None => "copilot-v4:none".to_string(),
+        None => "copilot-v5:none".to_string(),
     }
 }
 
@@ -527,9 +611,13 @@ pub fn read_copilot_session_store(
                     repository: sqlite_text(row, 2),
                     branch: sqlite_text(row, 3),
                     host_type: sqlite_text(row, 4),
+                    pull_requests: Vec::new(),
                 },
             );
         }
+        drop(rows);
+        drop(statement);
+        read_pull_request_refs(&connection, &mut store, diagnostics);
         Ok(store)
     })();
     match result {
@@ -544,6 +632,94 @@ pub fn read_copilot_session_store(
             CopilotSessionStore::default()
         }
     }
+}
+
+/// Adds `session_refs` pull-request rows to the sessions already read. The query names
+/// three columns and filters on the type, so the `commit` rows (and anything else the
+/// table later holds) are never delivered. A failure costs the pull requests only.
+fn read_pull_request_refs(
+    connection: &Connection,
+    store: &mut CopilotSessionStore,
+    diagnostics: &mut Diagnostics,
+) {
+    let result = (|| -> rusqlite::Result<u64> {
+        if !sqlite_table_exists(connection, "session_refs")? {
+            return Ok(0);
+        }
+        let columns = sqlite_columns(connection, "session_refs")?;
+        if !["session_id", "ref_type", "ref_value"]
+            .iter()
+            .all(|name| columns.contains(*name))
+        {
+            return Ok(0);
+        }
+        let mut statement = connection.prepare(
+            "SELECT \"session_id\", \"ref_value\" FROM session_refs WHERE \"ref_type\" = 'pr'",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut unreadable = 0_u64;
+        while let Some(row) = rows.next()? {
+            let (Some(id), Some(value)) = (sqlite_text(row, 0), sqlite_text(row, 1)) else {
+                unreadable += 1;
+                continue;
+            };
+            let Some(entry) = store.by_id.get_mut(&id) else {
+                continue;
+            };
+            match parse_pull_request_ref(&value) {
+                Some(parsed) if !entry.pull_requests.contains(&parsed) => {
+                    entry.pull_requests.push(parsed);
+                }
+                Some(_) => {}
+                None => unreadable += 1,
+            }
+        }
+        for entry in store.by_id.values_mut() {
+            entry.pull_requests.sort();
+        }
+        Ok(unreadable)
+    })();
+    match result {
+        Ok(0) => {}
+        Ok(unreadable) => diagnostics.note(format!(
+            "{unreadable} GitHub Copilot pull-request reference(s) were not a number, owner/repo#number or pull-request URL and were not stored"
+        )),
+        Err(error) => diagnostics.warn(format!(
+            "GitHub Copilot pull-request references ignored: {error}"
+        )),
+    }
+}
+
+/// A pull request out of a `session_refs` value: a bare number, `owner/repo#number`, or
+/// a `.../owner/repo/pull/number` URL. Only the number and the `owner/repo` pair are
+/// kept; the URL itself, its host and anything after the number are discarded.
+fn parse_pull_request_ref(value: &str) -> Option<(u64, Option<String>)> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 512 {
+        return None;
+    }
+    let digits = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u64>().ok())
+            .flatten()
+            .filter(|number| *number > 0)
+    };
+    if let Some(number) = digits(value) {
+        return Some((number, None));
+    }
+    if let Some((head, tail)) = value.split_once("/pull/") {
+        let number = digits(tail.split(['/', '?', '#']).next()?)?;
+        let mut segments = head.rsplit('/');
+        let repository = segments.next().filter(|segment| !segment.is_empty())?;
+        let owner = segments.next().filter(|segment| !segment.is_empty())?;
+        return Some((number, Some(format!("{owner}/{repository}"))));
+    }
+    let (repository, number) = value.rsplit_once('#')?;
+    Some((digits(number)?, Some(repository.to_string()))).filter(|(_, repository)| {
+        repository
+            .as_deref()
+            .is_some_and(|name| !name.is_empty() && !name.chars().any(char::is_control))
+    })
 }
 
 #[cfg(test)]
@@ -964,5 +1140,190 @@ mod tests {
             subagent.exact_intervals[0].start
         );
         assert_eq!(utc("2026-01-01T12:01:00Z"), subagent.exact_intervals[0].end);
+    }
+
+    fn write_lines(path: &Path, records: &[serde_json::Value]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn copilot_context_events_give_branch_marks_at_changes_only() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("s1/events.jsonl");
+        write_lines(
+            &path,
+            &[
+                serde_json::json!({"type": "session.start", "timestamp": "2026-01-01T00:00:00Z",
+                    "data": {"sessionId": "s1", "context": {"cwd": "/work", "branch": "main"}}}),
+                serde_json::json!({"type": "user.message", "timestamp": "2026-01-01T00:00:10Z", "data": {}}),
+                // Unchanged branch: no new mark.
+                serde_json::json!({"type": "session.context_changed", "timestamp": "2026-01-01T00:01:00Z",
+                    "data": {"cwd": "/work", "context": {"branch": "main"}}}),
+                serde_json::json!({"type": "session.context_changed", "timestamp": "2026-01-01T00:02:00Z",
+                    "data": {"cwd": "/work", "context": {"branch": "feat/x"}}}),
+                serde_json::json!({"type": "assistant.message", "timestamp": "2026-01-01T00:03:00Z", "data": {}}),
+            ],
+        );
+        let parsed =
+            parse_copilot_file(&path, &CopilotSessionStore::default(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(1, parsed.sessions.len());
+        assert_eq!(
+            vec![
+                (None, "main"),
+                (Some(utc("2026-01-01T00:02:00Z")), "feat/x")
+            ],
+            parsed.sessions[0]
+                .branches
+                .iter()
+                .map(|mark| (mark.from, mark.branch.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn copilot_branches_stay_with_the_directory_they_were_recorded_in() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("s1/events.jsonl");
+        write_lines(
+            &path,
+            &[
+                serde_json::json!({"type": "session.start", "timestamp": "2026-01-01T00:00:00Z",
+                    "data": {"sessionId": "s1", "context": {"cwd": "/one", "branch": "main"}}}),
+                serde_json::json!({"type": "user.message", "timestamp": "2026-01-01T00:00:10Z", "data": {}}),
+                serde_json::json!({"type": "session.context_changed", "timestamp": "2026-01-01T00:02:00Z",
+                    "data": {"cwd": "/two", "context": {"branch": "feat/y"}}}),
+                serde_json::json!({"type": "user.message", "timestamp": "2026-01-01T00:03:00Z", "data": {}}),
+            ],
+        );
+        let parsed =
+            parse_copilot_file(&path, &CopilotSessionStore::default(), MAX_JSONL_LINE_BYTES);
+        assert_eq!(2, parsed.sessions.len());
+        for session in &parsed.sessions {
+            let expected = if session.cwd == "/one" {
+                "main"
+            } else {
+                "feat/y"
+            };
+            assert_eq!(1, session.branches.len());
+            assert_eq!(expected, session.branches[0].branch);
+        }
+    }
+
+    #[test]
+    fn the_store_supplies_the_branch_and_pull_requests_without_reading_commit_refs() {
+        let root = tempdir().unwrap();
+        let database = root.path().join("session-store.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, repository TEXT,
+                    host_type TEXT, branch TEXT, summary TEXT);
+                CREATE TABLE session_refs (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL, ref_type TEXT NOT NULL, ref_value TEXT NOT NULL,
+                    turn_index INTEGER, UNIQUE(session_id, ref_type, ref_value));
+                INSERT INTO sessions(id, cwd, repository, host_type, branch, summary)
+                    VALUES ('s1', '/work', 'acme/api', 'github', 'feat/store', 'SUMMARY_SECRET');
+                INSERT INTO session_refs(session_id, ref_type, ref_value) VALUES
+                    ('s1', 'pr', '42'),
+                    ('s1', 'pr', 'other/repo#7'),
+                    ('s1', 'pr', 'https://example.invalid/own/proj/pull/9?x=URL_SECRET'),
+                    ('s1', 'pr', 'not a reference'),
+                    ('s1', 'commit', 'COMMIT_SECRET');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut diagnostics = Diagnostics::default();
+        let store = read_copilot_session_store(&database, &mut diagnostics);
+        // The one value that is not a reference is said so, once.
+        assert_eq!(1, diagnostics.note_count);
+        assert_eq!(0, diagnostics.warning_count);
+
+        let path = root.path().join("session-state/s1/events.jsonl");
+        write_lines(
+            &path,
+            &[
+                serde_json::json!({"type": "session.start", "timestamp": "2026-01-01T00:00:00Z",
+                    "data": {"sessionId": "s1", "context": {"cwd": "/work"}}}),
+                serde_json::json!({"type": "user.message", "timestamp": "2026-01-01T00:00:10Z", "data": {}}),
+            ],
+        );
+        let parsed = parse_copilot_file(&path, &store, MAX_JSONL_LINE_BYTES);
+        let session = &parsed.sessions[0];
+        // The event log recorded no branch, so the store's fills the absence.
+        assert_eq!(1, session.branches.len());
+        assert_eq!("feat/store", session.branches[0].branch);
+        let mut links: Vec<_> = session
+            .pull_requests
+            .iter()
+            .map(|link| (link.number, link.repository.as_str()))
+            .collect();
+        links.sort();
+        assert_eq!(
+            vec![(7, "other/repo"), (9, "own/proj"), (42, "acme/api")],
+            links
+        );
+        let stored = serde_json::to_string(&parsed).unwrap();
+        for secret in [
+            "SUMMARY_SECRET",
+            "COMMIT_SECRET",
+            "URL_SECRET",
+            "example.invalid",
+        ] {
+            assert!(!stored.contains(secret), "{secret} reached the parse");
+        }
+        // A change to the rows must invalidate the cached parse.
+        assert_ne!(
+            copilot_context_fingerprint(&store, &path),
+            copilot_context_fingerprint(&CopilotSessionStore::default(), &path)
+        );
+    }
+
+    #[test]
+    fn the_event_log_branch_wins_over_the_store_branch() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("s1/events.jsonl");
+        write_lines(
+            &path,
+            &[
+                serde_json::json!({"type": "session.start", "timestamp": "2026-01-01T00:00:00Z",
+                    "data": {"sessionId": "s1", "context": {"cwd": "/work", "branch": "from-log"}}}),
+                serde_json::json!({"type": "user.message", "timestamp": "2026-01-01T00:00:10Z", "data": {}}),
+            ],
+        );
+        let mut store = CopilotSessionStore::default();
+        store.by_id.insert(
+            "s1".to_string(),
+            CopilotStoreSession {
+                branch: Some("from-store".to_string()),
+                ..CopilotStoreSession::default()
+            },
+        );
+        let parsed = parse_copilot_file(&path, &store, MAX_JSONL_LINE_BYTES);
+        assert_eq!("from-log", parsed.sessions[0].branches[0].branch);
+    }
+
+    #[test]
+    fn pull_request_references_keep_only_a_number_and_a_repository() {
+        assert_eq!(Some((12, None)), parse_pull_request_ref(" 12 "));
+        assert_eq!(
+            Some((3, Some("a/b".to_string()))),
+            parse_pull_request_ref("a/b#3")
+        );
+        assert_eq!(
+            Some((5, Some("own/proj".to_string()))),
+            parse_pull_request_ref("https://host.invalid/own/proj/pull/5/files")
+        );
+        for rejected in ["", "0", "abc", "#4", "a/b#", "x/pull/", &"9".repeat(600)] {
+            assert_eq!(None, parse_pull_request_ref(rejected), "{rejected:?}");
+        }
     }
 }

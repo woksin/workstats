@@ -12,7 +12,7 @@ use walkdir::WalkDir;
 
 use super::{
     MAX_JSONL_LINE_BYTES, ParsedFile, canonical_string, deserialize_maybe_number, file_stem,
-    for_json_lines, load_files, safe_model,
+    for_json_lines, load_files, safe_model, whole_session_branch,
 };
 use crate::cache::TranscriptCache;
 use crate::model::{
@@ -27,6 +27,9 @@ pub struct CodexMetadata {
     pub rollout_path: Option<String>,
     pub cwd: Option<String>,
     pub model: Option<String>,
+    /// `threads.git_branch`: the branch the thread started on. Only a fallback for a
+    /// rollout whose own `session_meta` did not record one.
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -53,6 +56,9 @@ struct CodexPayload {
     source: bool,
     cwd: Option<String>,
     model: Option<String>,
+    /// `session_meta.payload.git`. Only `branch` is declared, so the commit hash and
+    /// repository URL beside it are skipped unread.
+    git: Option<CodexGit>,
     #[serde(rename = "type")]
     payload_type: Option<String>,
     role: Option<String>,
@@ -64,6 +70,11 @@ struct CodexPayload {
     result: Option<ExactCandidate>,
     task: Option<ExactCandidate>,
     info: Option<CodexTokenInfo>,
+}
+
+#[derive(Deserialize)]
+struct CodexGit {
+    branch: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +235,7 @@ pub fn parse_codex_file(
     let mut token_events_by_cwd: BTreeMap<Option<String>, Vec<TokenEvent>> = BTreeMap::new();
     let mut cwd = None;
     let mut metadata_cwd = None;
+    let mut rollout_branch = None;
     let mut session_id = None;
     let mut current_model = "unknown".to_string();
     let mut is_subagent = false;
@@ -239,6 +251,9 @@ pub fn parse_codex_file(
                 if let Some(value) = payload.cwd {
                     metadata_cwd = Some(value.clone());
                     cwd = Some(value);
+                }
+                if let Some(branch) = payload.git.and_then(|git| git.branch) {
+                    rollout_branch = Some(branch);
                 }
                 if let Some(model) = payload.model {
                     current_model = safe_model(&model);
@@ -312,6 +327,12 @@ pub fn parse_codex_file(
     if metadata_cwd.is_none() {
         metadata_cwd = meta.and_then(|item| item.cwd.clone());
     }
+    // The rollout's own record wins; the thread row only fills its absence.
+    let session_branch = whole_session_branch(
+        rollout_branch
+            .as_deref()
+            .or_else(|| meta.and_then(|item| item.branch.as_deref())),
+    );
     let fallback_model = safe_model(
         meta.and_then(|item| item.model.as_deref())
             .unwrap_or("unknown"),
@@ -358,6 +379,14 @@ pub fn parse_codex_file(
         } else {
             base_id
         };
+        // Codex records the branch once, at the start, for the directory the session
+        // began in. A session that later moved to another directory gives the branch to
+        // the directory it began in only: the name says nothing about the other checkout.
+        let branches = if !multiple || metadata_cwd.as_deref() == Some(resolved_cwd.as_str()) {
+            session_branch.clone()
+        } else {
+            Vec::new()
+        };
         result.sessions.push(RawSession {
             provider: "codex".to_string(),
             session_id: split_id,
@@ -371,6 +400,8 @@ pub fn parse_codex_file(
             is_subagent,
             approximate_cwd,
             version: None,
+            branches,
+            pull_requests: Vec::new(),
         });
     }
     result
@@ -387,13 +418,14 @@ fn codex_context_fingerprint(metadata: &CodexMetadataIndex, path: &Path) -> Stri
         .or_else(|| codex_rollout_id(path).and_then(|id| metadata.by_id.get(&id)))
         .map(|item| {
             format!(
-                "codex-v2:{}:{}:{}",
+                "codex-v3:{}:{}:{}:{}",
                 item.id.as_deref().unwrap_or_default(),
                 item.cwd.as_deref().unwrap_or_default(),
-                item.model.as_deref().unwrap_or_default()
+                item.model.as_deref().unwrap_or_default(),
+                item.branch.as_deref().unwrap_or_default()
             )
         })
-        .unwrap_or_else(|| "codex-v2:none".to_string())
+        .unwrap_or_else(|| "codex-v3:none".to_string())
 }
 
 fn codex_rollout_id(path: &Path) -> Option<String> {
@@ -496,7 +528,10 @@ pub fn read_codex_sqlite_metadata(
             .query_map([], |row| row.get(1))?
             .filter_map(Result::ok)
             .collect();
-        let selected: Vec<_> = ["id", "rollout_path", "cwd", "model"]
+        // The column list is closed on purpose. `title`, `preview` and
+        // `first_user_message` are the first prompt verbatim, so they are never selected;
+        // `git_branch` is a branch name, not message text.
+        let selected: Vec<_> = ["id", "rollout_path", "cwd", "model", "git_branch"]
             .into_iter()
             .filter(|name| columns.contains(*name))
             .collect();
@@ -523,6 +558,7 @@ pub fn read_codex_sqlite_metadata(
                     "rollout_path" => item.rollout_path = value,
                     "cwd" => item.cwd = value,
                     "model" => item.model = value,
+                    "git_branch" => item.branch = value,
                     _ => {}
                 }
             }
@@ -853,5 +889,114 @@ mod tests {
             ],
             tokens
         );
+    }
+
+    fn write_lines(path: &Path, records: &[serde_json::Value]) {
+        fs::write(
+            path,
+            records
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn session_with_git(git: serde_json::Value) -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"timestamp": "2026-01-01T00:00:00Z", "type": "session_meta",
+                "payload": {"id": "s", "cwd": "/work", "git": git}}),
+            serde_json::json!({"timestamp": "2026-01-01T00:00:05Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user"}}),
+        ]
+    }
+
+    #[test]
+    fn codex_session_meta_git_branch_becomes_one_mark_and_nothing_else_from_git() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("rollout-test.jsonl");
+        write_lines(
+            &path,
+            &session_with_git(serde_json::json!({
+                "branch": "feat/codex",
+                "commit_hash": "COMMIT_SECRET",
+                "repository_url": "https://example.invalid/REMOTE_SECRET.git"
+            })),
+        );
+        let parsed = parse_codex_file(&path, &CodexMetadataIndex::default(), MAX_JSONL_LINE_BYTES);
+        let branches = &parsed.sessions[0].branches;
+        assert_eq!(1, branches.len());
+        assert_eq!(None, branches[0].from);
+        assert_eq!("feat/codex", branches[0].branch);
+        let stored = serde_json::to_string(&parsed).unwrap();
+        assert!(!stored.contains("COMMIT_SECRET") && !stored.contains("REMOTE_SECRET"));
+    }
+
+    #[test]
+    fn codex_without_a_recorded_branch_or_with_a_hostile_one_has_no_marks() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("rollout-test.jsonl");
+        for git in [
+            serde_json::json!(null),
+            serde_json::json!({"commit_hash": "abc"}),
+            serde_json::json!({"branch": "bad\u{7}name"}),
+            serde_json::json!({"branch": "y".repeat(300)}),
+        ] {
+            write_lines(&path, &session_with_git(git));
+            let parsed =
+                parse_codex_file(&path, &CodexMetadataIndex::default(), MAX_JSONL_LINE_BYTES);
+            assert!(parsed.sessions[0].branches.is_empty());
+        }
+    }
+
+    #[test]
+    fn the_threads_table_supplies_a_branch_but_never_a_title_or_prompt() {
+        let root = tempdir().unwrap();
+        let database = root.path().join("state.sqlite");
+        let rollout = root.path().join("rollout-test.jsonl");
+        // A rollout that recorded no branch of its own, and one that did.
+        write_lines(&rollout, &session_with_git(serde_json::json!(null)));
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, model TEXT,
+                    git_branch TEXT, name TEXT, title TEXT, preview TEXT, first_user_message TEXT);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads VALUES ('s', ?1, '/work', 'gpt-a', 'feat/thread', 'NAME_SECRET',
+                    'TITLE_SECRET', 'PREVIEW_SECRET', 'FIRST_PROMPT_SECRET')",
+                [rollout.to_string_lossy()],
+            )
+            .unwrap();
+        drop(connection);
+        let mut diagnostics = Diagnostics::default();
+        let metadata = read_codex_sqlite_metadata(&database, &mut diagnostics);
+        assert_eq!(0, diagnostics.warning_count);
+        let debug = format!("{metadata:?}");
+        for secret in [
+            "NAME_SECRET",
+            "TITLE_SECRET",
+            "PREVIEW_SECRET",
+            "FIRST_PROMPT_SECRET",
+        ] {
+            assert!(!debug.contains(secret), "{secret} was selected");
+        }
+
+        let parsed = parse_codex_file(&rollout, &metadata, MAX_JSONL_LINE_BYTES);
+        assert_eq!("feat/thread", parsed.sessions[0].branches[0].branch);
+        assert!(!serde_json::to_string(&parsed).unwrap().contains("SECRET"));
+        // A changed thread row must not be answered from the cached parse.
+        assert!(codex_context_fingerprint(&metadata, &rollout).contains("feat/thread"));
+
+        // The rollout's own record wins over the thread row.
+        write_lines(
+            &rollout,
+            &session_with_git(serde_json::json!({"branch": "from-rollout"})),
+        );
+        let parsed = parse_codex_file(&rollout, &metadata, MAX_JSONL_LINE_BYTES);
+        assert_eq!("from-rollout", parsed.sessions[0].branches[0].branch);
     }
 }

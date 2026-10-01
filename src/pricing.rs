@@ -489,6 +489,24 @@ impl RateOverrides {
     }
 }
 
+/// List-price value of `usage` for `model` in USD, using an override when one
+/// matches and the built-in table otherwise. `None` means the model is
+/// unpriced, which is different from worth nothing.
+pub fn list_value_usd(
+    model: &str,
+    usage: &crate::model::TokenUsage,
+    overrides: &RateOverrides,
+) -> Option<f64> {
+    overrides.resolve(model).map(|resolved| {
+        resolved.rate.value(
+            usage.input_tokens,
+            usage.cache_creation_tokens,
+            usage.cache_read_tokens,
+            usage.output_tokens,
+        )
+    })
+}
+
 /// Normalises the punctuation drift between how a vendor names a model and how
 /// each CLI records it (`claude-sonnet-4.6` vs `claude-sonnet-4-6`).
 fn canonical(model: &str) -> String {
@@ -614,6 +632,29 @@ mod tests {
         // 1M input + 1M cache write + 1M cache read + 1M output.
         let total = rate.value(1_000_000, 1_000_000, 1_000_000, 1_000_000);
         assert!((total - 36.75).abs() < 1e-9, "got {total}");
+    }
+
+    #[test]
+    fn list_value_prices_a_usage_record_and_leaves_unknown_models_unpriced() {
+        let usage = crate::model::TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        let overrides = RateOverrides::default();
+        let known = list_value_usd("claude-opus-5", &usage, &overrides);
+        let rate = rate_for("claude-opus-5").expect("built-in rate");
+        assert_eq!(
+            Some(rate.value(1_000_000, 0, 0, 1_000_000)),
+            known,
+            "same arithmetic as the rate itself"
+        );
+        assert_eq!(
+            None,
+            list_value_usd("no-such-model", &usage, &overrides),
+            "unpriced is not the same as free"
+        );
     }
 
     fn date(text: &str) -> NaiveDate {

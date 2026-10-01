@@ -285,17 +285,13 @@ pub struct Allocation {
 }
 
 fn row_value(row: &ReportRow, model: &str, overrides: &RateOverrides) -> Measures {
-    let value = overrides
-        .resolve(model)
-        .map(|resolved| {
-            resolved.rate.value(
-                row.input_tokens,
-                row.cache_creation_tokens,
-                row.cache_read_tokens,
-                row.output_tokens,
-            )
-        })
-        .unwrap_or(0.0);
+    let usage = crate::model::TokenUsage {
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_creation_tokens: row.cache_creation_tokens,
+    };
+    let value = crate::pricing::list_value_usd(model, &usage, overrides).unwrap_or(0.0);
     Measures {
         output: row.output_tokens as f64,
         value,

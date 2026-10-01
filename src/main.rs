@@ -1,20 +1,33 @@
 mod aggregate;
 mod ai;
 mod allocate;
+mod attribution;
+mod branch_report;
+mod branches;
+mod bundle;
 mod cache;
+mod calendar;
 mod classify;
 mod cli;
 mod commands;
 mod compare;
+mod describe;
 mod document;
+mod durable;
+mod engagement;
 mod git;
+mod goals;
+mod insights;
+mod issues;
 mod model;
+mod now;
 mod output;
 mod paths;
 mod pricing;
 mod progress;
 mod report;
 mod sources;
+mod timesheet;
 mod timeutil;
 mod tui;
 mod update;
@@ -37,6 +50,15 @@ fn main() {
         Some(Command::Record(command)) => record_event(&command),
         Some(Command::Update(command)) => run_update_command(&command),
         Some(Command::Allocate(command)) => run_allocation(*command),
+        Some(Command::Timesheet(command)) => timesheet::run(*command),
+        Some(Command::Branch(command)) => branch_report::run_branch(*command),
+        Some(Command::Pr(command)) => branch_report::run_pr(*command),
+        Some(Command::Insights(command)) => insights::run_insights(*command),
+        Some(Command::Digest(command)) => insights::run_digest(*command),
+        Some(Command::Now(command)) => now::run(*command),
+        Some(Command::Export(command)) => bundle::run_export(*command),
+        Some(Command::Merge(command)) => bundle::run_merge(*command),
+        Some(Command::Calendar(command)) => calendar::run(*command),
         None => run(report, Presentation::Print, None),
     };
     if let Err(error) = result {

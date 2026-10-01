@@ -11,7 +11,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use tempfile::tempfile;
 
 use crate::classify::{CategoryTally, classify};
-use crate::model::{Authorship, Diagnostics, GitCommit};
+use crate::model::{Authorship, BranchSource, Diagnostics, GitCommit};
 use crate::paths::{PathResolver, disambiguated_repository_label};
 
 pub const DEFAULT_IGNORES: &[&str] = &[
@@ -88,7 +88,7 @@ const COMMIT_HEADER_WITH_CO_AUTHORS: &str = "--pretty=format:W%x09%H%x09%aI%x09%
 /// How far before `--since` Git is allowed to look, because it compares the
 /// committer date while the report windows on the author date. See
 /// `collect_commits`.
-const COMMITTER_DATE_SKEW: chrono::Duration = chrono::Duration::days(30);
+pub(crate) const COMMITTER_DATE_SKEW: chrono::Duration = chrono::Duration::days(30);
 
 pub fn git_executable() -> Option<PathBuf> {
     if let Some(configured) = env::var_os("WORKSTATS_GIT") {
@@ -761,6 +761,8 @@ fn parse_git_log(
                     ignored_deletions: pending.ignored_deletions,
                     categories: pending.categories,
                     authorship: pending.authorship,
+                    branch: None,
+                    branch_source: BranchSource::None,
                 });
             }
         };

@@ -486,6 +486,7 @@ fn interval_for_session(
         repo: session.repo.clone(),
         repo_id: session.repo_id.clone(),
         root: session.root.clone(),
+        branch: session.branch_at(start).map(str::to_string),
     }
 }
 
@@ -668,6 +669,7 @@ pub fn calculate_human_time(
                     repo: signal.repo.clone(),
                     repo_id: signal.repo_id.clone(),
                     root: signal.root.clone(),
+                    branch: signal.branch.clone(),
                 });
             }
             left = left.max(right);
@@ -904,6 +906,10 @@ mod tests {
             human_points: vec![],
             token_events: vec![],
             is_subagent: false,
+            branch_source: crate::model::BranchSource::None,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
+            source_file: std::path::PathBuf::new(),
         }
     }
 
@@ -933,6 +939,7 @@ mod tests {
             repo: "x".into(),
             repo_id: "x".into(),
             root: "root".into(),
+            branch: None,
         }
     }
 
@@ -1045,11 +1052,76 @@ mod tests {
             root: "root".into(),
             kind: "commit".into(),
             model: "—".into(),
+            branch: None,
         };
         let intervals = build_human_intervals(&[signal], Duration::minutes(30), Duration::MAX);
         let date = timestamp.with_timezone(&Local).date_naive();
         assert_eq!(local_midnight(date), intervals[0].start);
         assert_eq!(local_midnight(date.succ_opt().unwrap()), intervals[0].end);
+    }
+
+    #[test]
+    fn the_branch_travels_with_every_interval_the_pipeline_cuts() {
+        let mut value = session(vec![
+            point("2026-01-01T10:00:00Z", "m"),
+            point("2026-01-01T10:03:00Z", "m"),
+            point("2026-01-01T10:20:00Z", "m"),
+            point("2026-01-01T10:22:00Z", "m"),
+        ]);
+        value.branches = vec![
+            crate::model::BranchMark {
+                from: None,
+                branch: "feat/a".into(),
+            },
+            crate::model::BranchMark {
+                from: Some(parse_timestamp("2026-01-01T10:10:00Z").unwrap()),
+                branch: "feat/b".into(),
+            },
+        ];
+        let intervals = build_session_intervals(&value, Duration::minutes(5));
+        let branches: Vec<_> = intervals
+            .iter()
+            .map(|item| item.branch.as_deref())
+            .collect();
+        assert_eq!(vec![Some("feat/a"), Some("feat/b")], branches);
+
+        // Clipping and splitting copy the interval they cut.
+        let clipped = clip_interval(
+            &intervals[0],
+            Some(parse_timestamp("2026-01-01T10:01:00Z").unwrap()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(Some("feat/a"), clipped.branch.as_deref());
+        assert!(
+            split_interval(&clipped, "day")
+                .iter()
+                .all(|(_, piece)| piece.branch.as_deref() == Some("feat/a"))
+        );
+
+        // Human pieces take the branch of the signal nearest to them.
+        let signal = |at: &str, branch: &str| HumanSignal {
+            timestamp: parse_timestamp(at).unwrap(),
+            provider: "codex".into(),
+            session_id: "s".into(),
+            cwd: "/x".into(),
+            repo: "x".into(),
+            repo_id: "x".into(),
+            root: "root".into(),
+            kind: "codex_prompt".into(),
+            model: "m".into(),
+            branch: Some(branch.into()),
+        };
+        let human = build_human_intervals(
+            &[
+                signal("2026-01-01T10:00:00Z", "feat/a"),
+                signal("2026-01-01T10:10:00Z", "feat/b"),
+            ],
+            Duration::hours(1),
+            Duration::zero(),
+        );
+        let branches: Vec<_> = human.iter().map(|item| item.branch.as_deref()).collect();
+        assert_eq!(vec![Some("feat/a"), Some("feat/b")], branches);
     }
 
     #[test]
@@ -1183,6 +1255,7 @@ mod tests {
             repo_id: "x".into(),
             root: "root".into(),
             model: "m".into(),
+            branch: None,
         };
         let pieces = split_interval(&interval, "week");
         assert_eq!(
@@ -1240,6 +1313,7 @@ mod tests {
             repo_id: "x".into(),
             root: "root".into(),
             model: "m".into(),
+            branch: None,
         };
         let keys: Vec<_> = split_interval(&interval, "week")
             .into_iter()
@@ -1385,6 +1459,7 @@ mod tests {
             root: "root".into(),
             kind: kind.into(),
             model: "model".into(),
+            branch: None,
         };
         let intervals = build_human_intervals(
             &[
@@ -1415,6 +1490,7 @@ mod tests {
             root: "root".into(),
             kind: kind.into(),
             model: "model".into(),
+            branch: None,
         };
         let calculation = calculate_human_time(
             &[
@@ -1463,6 +1539,7 @@ mod tests {
             root: "root".into(),
             kind: "provider_prompt".into(),
             model: "model".into(),
+            branch: None,
         };
         let calculation = calculate_human_time(
             &[
@@ -1501,6 +1578,7 @@ mod tests {
                 root: "/ROOT_SECRET".into(),
                 kind: "provider_prompt".into(),
                 model: "MODEL_SECRET".into(),
+                branch: None,
             },
             HumanSignal {
                 timestamp: timestamp + Duration::seconds(1),
@@ -1512,6 +1590,7 @@ mod tests {
                 root: "/ROOT_SECRET".into(),
                 kind: "commit".into(),
                 model: "MODEL_SECRET".into(),
+                branch: None,
             },
         ];
         let explanation = calculate_human_time(
@@ -1557,6 +1636,7 @@ mod tests {
             root: "root".into(),
             kind: "commit".into(),
             model: "—".into(),
+            branch: None,
         };
         let intervals =
             build_human_intervals(&[signal], Duration::minutes(30), Duration::minutes(10));
@@ -1579,6 +1659,7 @@ mod tests {
             repo: "x".into(),
             repo_id: "x".into(),
             root: "root".into(),
+            branch: None,
         };
         let pieces = split_interval(&interval, "month");
         assert_eq!(

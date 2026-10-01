@@ -51,7 +51,9 @@ workstats --config ./team.json  # read source roots and categories from elsewher
 The config file holds `source_roots`, `categories`, `category_mode`,
 `project_aliases`, `authors` (a string for one identity, or a list), `model_rates` (list-rate overrides for
 [`allocate`](allocate.md#rates-and-when-they-go-stale)), `check_updates`, and `defaults`
-(below). `workstats ui`'s saved views are kept beside it as
+(below), plus the blocks for the newer commands, which
+[have their own section](#blocks-for-the-newer-commands): `engagements`, `issues`,
+`branches`, `timesheet`, `goals`, `insights` and `now`. `workstats ui`'s saved views are kept beside it as
 `views.json` — configuration, never cache — so `--rebuild-cache` and
 `--no-cache` leave them alone.
 
@@ -127,6 +129,126 @@ Code and Codex transcripts directly and from Copilot's end-of-session summary.
 Gemini CLI and OpenCode token counts are best-effort and may read as zero if
 the locally installed version doesn't expose per-turn usage fields; this never
 affects the time-based metrics.
+
+## Blocks for the newer commands
+
+Each block is optional, is checked when a command that uses it runs, and stops
+that run with an error naming the key when it is misspelt or the wrong type,
+the same way `defaults` and `model_rates` are. The examples show the shape; the
+linked pages say what every key does.
+
+### Engagements
+
+Which client or contract work bills to, matched by project, remote, path, branch
+or issue prefix. Used by `timesheet` and by `--group-by engagement`.
+
+```json
+{
+  "engagements": {
+    "acme": {
+      "label": "ACME – Platform", "billable": true, "rate": 1450, "currency": "NOK",
+      "remotes": ["git@github.com:acme/api.git"], "issue_prefixes": ["ACME"]
+    },
+    "internal": {"label": "Internal", "billable": false, "paths": ["~/code"], "fallback": true}
+  }
+}
+```
+
+See [Timesheet](timesheet.md#engagements).
+
+### Issues and branches
+
+How a branch name becomes an issue key and a feature, and which branch is the
+integration branch the others are measured against. Used by the `branch`,
+`issue` and `feature` groupings, `branch`, `pr` and `timesheet --detail`.
+
+```json
+{
+  "branches": {"integration": ["main", "trunk"]},
+  "issues": {"projects": ["ACME", "PLAT"], "fallback": "slug"}
+}
+```
+
+See [Branches and pull requests](branches.md#configuration).
+
+### Timesheet
+
+Rounding and export defaults, each overridden by the matching flag.
+
+```json
+{
+  "timesheet": {
+    "increment": "15m", "rounding": "nearest", "daily_cap": "10h",
+    "person": {"email": "me@example.com", "first_name": "Ada", "last_name": "L"}
+  }
+}
+```
+
+Keys: `increment`, `rounding`, `min_entry`, `drop_below`, `daily_cap`, `split`,
+`unassigned` and `person`. See [Options](timesheet.md#options). The manual
+entries, overrides and locks are not configuration: they live in
+`timesheet.json` beside the config file
+([the ledger](timesheet.md#the-ledger-manual-entries-overrides-and-locks)).
+
+### Goals
+
+Targets that reports, the digest and `now` measure progress against. Numbers
+only; nothing here reads your history.
+
+```json
+{
+  "goals": {
+    "weekly_hours": 30,
+    "daily_hours": 6,
+    "max_weekly_hours": 45,
+    "list_value_caps": [
+      {"pool": "claude", "period": "month", "usd": 400, "warn_at": 0.8}
+    ]
+  }
+}
+```
+
+- `weekly_hours`, `daily_hours` and `max_weekly_hours` are human hours (a
+  target, a daily target, and a ceiling that must not be below the target).
+- `list_value_caps` limit the list value (the tokens at published prices, not a
+  bill) a subscription pool draws per `week` or `month`. `pool` is `claude`,
+  `openai` (`codex` works too), `google` or `copilot`; `warn_at` is the share of
+  the cap where a warning starts (default `0.8`). Each pool and period may
+  appear once.
+- A goal that cannot be measured for a window (it covers part of a week, say) is
+  marked partial, not prorated. `--no-goals` leaves goals out of a run.
+
+See [`digest`](insights.md#workstats-digest) for the goals section.
+
+### Insights
+
+When "night" and "weekend" start for the patterns heatmap.
+
+```json
+{"insights": {"night": ["22:00", "06:00"], "weekend": ["sat", "sun"]}}
+```
+
+The values shown are the defaults. See
+[Insights and digest](insights.md#heatmap---section-heatmap).
+
+### Now
+
+Defaults for `workstats now`, each overridden by a flag.
+
+```json
+{"now": {"template": "{human} · {agent} agent · ${value}{warn}", "max_age": "60s", "active_within": "10m"}}
+```
+
+`template` is text with `{token}` placeholders (`{{` and `}}` are literal
+braces); a token that does not exist is an error rather than an empty string.
+The tokens are `human`, `human_decimal`, `agent`, `prompts`, `commits`,
+`sessions`, `active`, `active_provider`, `active_repo`, `active_branch`,
+`value`, `value_week`, `value_month`, `week_human`, `week_target`, `week_pct`,
+`cap_pct`, `warn` and `stale`. `max_age` is how long the last result is reused
+(`0` always recomputes) and `active_within` how recent a session must be to
+count as active. `now` reads the config file itself so that a fresh snapshot
+costs no scan; the result is kept as `now.json` beside the index
+([what it holds](privacy.md#the-now-snapshot)).
 
 ## Make the areas your own
 

@@ -14,6 +14,117 @@ tag are the generated list of pull requests.
 
 ### Added
 
+- `workstats timesheet`: suggested hours per day and engagement, rounded the way
+  a timesheet is (nearest, up, down, or balanced across the day, with a minimum
+  entry, a drop threshold and a daily cap) and shown with the evidence beside
+  each entry. Every hour is attributed once, to the engagement of the nearest
+  prompt, commit or session edge, so concurrent agents add no hours, and the
+  output states that it reconciles with the report's human time. `--detail
+  issue|feature|branch|repo` breaks an engagement down further, and table, JSON,
+  CSV, Markdown and HTML are supported, all labelled as estimates for review.
+  See [Timesheet](docs/timesheet.md).
+- Engagements in the config: which client or contract work bills to, matched by
+  project, remote, remote glob, path, branch pattern or issue prefix, with a
+  rate, a currency and a billable flag. They drive `timesheet` and
+  `--group-by engagement`; amounts are summed per currency and never converted.
+- A timesheet ledger: `timesheet add` and `rm` for hours entered by hand,
+  `set` and `unset` to override an estimate (or suppress it with `0`), `entries`
+  to list them, and `lock`, `unlock` and `locks` to freeze a period as
+  submitted. A locked period keeps showing its snapshot, with one warning when
+  the live computation has drifted from it, until you pass `--ignore-locks`. The ledger
+  is `timesheet.json` beside the config file: atomically written, never
+  rebuilt from history, and never overwritten when it cannot be read.
+- `timesheet --export toggl|harvest|clockify|generic`: a CSV in the layout a
+  time tracker imports, with project, client, task and tags from the
+  engagement's `export` block and the `timesheet.person` name and email. Cells
+  are defused against spreadsheet formulas like the report's CSV.
+- Branch, issue and feature attribution. Sessions and commits now carry the Git
+  branch they were on, read from the few fields that hold it (Claude, Codex and
+  Copilot records, `record --branch`, and local Git ref names and branch
+  switches), and `--group-by branch|issue|feature` groups by it. An issue key is
+  cut from the branch name by configurable patterns (`ACME-123`, `#42`), a
+  feature is the issue or the branch's slug, and work with no known branch is
+  grouped as `—` rather than dropped. The integration branch is found from the
+  `branches` config or the repository's own default. See
+  [Branches and pull requests](docs/branches.md).
+- `workstats branch` and `workstats pr`: the human time, agent wall and
+  parallel time, tokens, list value and commits behind one branch or pull
+  request, summed from the pieces of one report so they never exceed the window
+  and never count parallel work on another branch. `--all` gives a row per
+  local branch, `pr --number N` finds the branches through the sessions that
+  mentioned the pull request (Claude `pr-link` and Copilot `session_refs`; the
+  number and repository are kept, never a URL), and Markdown output defuses
+  `#123` and `@name` so it can be pasted into a PR description.
+- `workstats insights`: focus (work blocks, longest stretch, context switches),
+  patterns (a weekday-by-hour heatmap with night and weekend shares),
+  leverage (agent wall per human hour, tokens and list value per commit,
+  sessions without commits) and models, over the last 28 days unless a window
+  is given. It reads nothing a report does not. `insights.night` and
+  `insights.weekend` in the config set what counts as night and weekend. See
+  [Insights and digest](docs/insights.md).
+- `workstats digest`: a weekly summary compared with the week before, with the
+  top repositories and features and progress against goals, in table, JSON,
+  Markdown and HTML.
+- `workstats now`: today and the week so far in one line for a prompt or status
+  bar. A fresh snapshot (`now.json` beside the index) is printed without
+  scanning anything; `--template` (or `now.template`) shapes the line,
+  `--max-age` and `--active-within` tune it, `--no-wait` prints the last result
+  and refreshes in the background, and `--quiet-errors` keeps a prompt clean.
+- Goals: a `goals` block in the config with `weekly_hours`, `daily_hours`,
+  `max_weekly_hours` and list-value caps per subscription pool and period, each
+  with a `warn_at` share. Progress appears in the digest, in `now`, and in the
+  report, and `--no-goals` leaves it out. A period the window only partly covers
+  is marked partial rather than prorated.
+- A calendar heatmap of human time per day: `workstats calendar` draws a year
+  grid in the terminal, and the same grid is in the HTML report, in Markdown
+  reports with `--daily`, and in the explorer. It is drawn from the per-day
+  figures the report already holds, so it adds no new reads. See
+  [Calendar heatmap](docs/calendar.md).
+- `--daily` adds human and agent figures for each local day to JSON output.
+- `workstats export` and `workstats merge`: a bundle of this machine's
+  structural evidence (no prompts, commit subjects, titles or absolute paths)
+  that another machine can fold into a report, either with `workstats merge
+  FILE...` or with `--import FILE` on any report command. Repositories are
+  matched across machines by normalised remote, so the same repository on two
+  machines is one row, and a repository with no shareable remote gets an opaque
+  per-machine key. `machine.json` beside the config holds a random id and a
+  label. Bundles are not encrypted. See [Merging machines](docs/merge.md).
+- Opt-in descriptions. `--describe commits` adds the subject lines of your own
+  commits and `--describe sessions[=PROVIDERS]` the titles your tools generated
+  (Claude, Pi, OpenCode and Copilot by default; Codex only when named, because
+  its titles are the first prompt) to timesheet entries and, with `branch` and
+  `pr`, to a branch's description. They are read only when asked for, bounded
+  and made safe, and never cached or put in a bundle.
+  `timesheet --summarize-with CMD` hands a digest of names and counts to a
+  command you choose and uses its first line as the description, with
+  `--summarize-timeout` and `--digest` to preview exactly what would be sent.
+- `workstats record --branch NAME` stores the branch the work was on, so tools
+  that are not read natively can still be grouped by branch, issue and feature.
+
+### Changed
+
+- The transcript cache is on parser version 5: it now holds branch names and
+  pull-request numbers, so entries from earlier releases are rebuilt on first
+  use.
+- `branches`, `issues`, `engagements`, `timesheet`, `goals`, `insights` and
+  `now` join `defaults` and `model_rates` as config blocks that are checked when
+  used: a misspelt key or a wrong type stops the run naming it. See
+  [Configuration](docs/configuration.md#blocks-for-the-newer-commands).
+- The terminal views of `insights`, `digest`, `branch`, `pr`, `timesheet` and
+  `calendar` are drawn by one shared renderer, as the Markdown and HTML views
+  already were; their output is unchanged.
+
+### Fixed
+
+- Report rows that tied on every figure came out in a different order from one
+  run to the next, because they were gathered in a hash map. Ties now fall back
+  to the row's key, so the same report is the same on every run.
+- `--no-git` no longer starts Git to look up branch names.
+
+## 1.10.0 — 2026-09-30
+
+### Added
+
 - ISO 8601 week periods. `--period week` and `--group-by week` cut a report
   into Monday-to-Sunday weeks labelled `2026-W09`, and `--week` narrows the
   window to one (`--week 2026-W09`, `--week last`, `--week current`), the way

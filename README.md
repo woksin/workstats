@@ -201,6 +201,20 @@ workstats --explain-human-time             # auditable signal and work-block led
 workstats classify src/main.rs             # which file area a path lands in, and why
 ```
 
+And the commands built on the same numbers:
+
+```bash
+workstats timesheet --month last           # suggested hours per day and client, rounded
+workstats branch                           # the effort behind the current branch
+workstats pr --number 123 --format markdown   # a block to paste into a pull request
+workstats insights                         # focus, patterns and leverage, last 28 days
+workstats digest                           # this week against the week before
+workstats now                              # a short line for a prompt or status bar
+workstats calendar                         # a year grid of human time per day
+workstats export --output laptop.json      # this machine's evidence, for another to merge
+workstats merge laptop.json desktop.json   # one report from several machines
+workstats --group-by branch,issue          # what the work was for
+```
 
 These are the everyday commands. [Usage](docs/usage.md) covers what decides the
 scope of a run (Git scope versus AI scope, branches, authors, nested
@@ -222,6 +236,25 @@ repositories) and every flag in detail.
   [Reports made for pipes](docs/usage.md#reports-made-for-pipes).
 - **Add any tool or API.** `workstats record` and `--events` take a small open
   JSONL format. See [Add any tool or API](docs/usage.md#add-any-tool-or-api).
+- **Timesheets.** `workstats timesheet` turns the human time into one rounded
+  entry per day per client, with manual entries, overrides, period locks and
+  CSV exports for Toggl, Harvest and Clockify. See [Timesheet](docs/timesheet.md).
+- **Branches and pull requests.** Group by `branch`, `issue` or `feature`, or
+  ask for the effort behind one branch or pull request with `workstats branch`
+  and `workstats pr`. See [Branches and pull requests](docs/branches.md).
+- **Insights and a weekly digest.** Focus, when you work, and what the agents
+  did with your time, plus a week-over-week summary with your goals. See
+  [Insights and digest](docs/insights.md).
+- **In your prompt.** `workstats now` prints today and the week so far from a
+  cached snapshot, cheaply enough for every redraw. See
+  [Usage](docs/usage.md#the-other-commands) and
+  [`now` in the configuration](docs/configuration.md#now).
+- **A year at a glance.** `workstats calendar` and the HTML and Markdown
+  reports draw a heatmap of human time per day. See
+  [Calendar heatmap](docs/calendar.md).
+- **Several machines.** `workstats export` writes a content-free bundle and
+  `workstats merge` (or `--import`) folds bundles into one report. See
+  [Merging machines](docs/merge.md).
 - **Agent-authored commits.** Shown apart from your own and never counted as
   human time. See [Agent-authored commits](docs/how-it-works.md#agent-authored-commits).
 - **Split the bill.** `workstats allocate` shares subscription cost across
@@ -235,8 +268,13 @@ repositories) and every flag in detail.
 | Guide | What is in it |
 | --- | --- |
 | [Install and update](docs/install.md) | Prebuilt binaries, building from source, `workstats update`, supported platforms |
-| [Usage](docs/usage.md) | Scope and authors, grouping and filtering, windows and `--compare`, output formats, the interactive explorer, `record` and `--events` |
-| [Configuration](docs/configuration.md) | The config file and its keys, `defaults`, inputs, the index, file-area categories |
+| [Usage](docs/usage.md) | Scope and authors, grouping and filtering, windows and `--compare`, output formats, the interactive explorer, `record` and `--events`, and a guide to the newer commands |
+| [Configuration](docs/configuration.md) | The config file and its keys, `defaults`, inputs, the index, file-area categories, and the blocks for engagements, issues, branches, timesheet, goals, insights and `now` |
+| [Timesheet](docs/timesheet.md) | Engagements, rounding, the ledger of manual entries and locks, vendor CSV exports, descriptions |
+| [Branches and pull requests](docs/branches.md) | How work is tied to a branch, issue and feature, and `workstats branch` and `pr` |
+| [Insights and digest](docs/insights.md) | Focus, patterns, leverage, models, and the weekly digest |
+| [Calendar heatmap](docs/calendar.md) | The year grid in the terminal, HTML, Markdown and the explorer |
+| [Merging machines](docs/merge.md) | `workstats export`, `merge` and `--import` |
 | [How it works](docs/how-it-works.md) | The human-time estimate, work composition, why it is fast, agent-authored commits, Copilot activity |
 | [Splitting the bill](docs/allocate.md) | `workstats allocate`: rates, currency, and missing history |
 | [Privacy boundary](docs/privacy.md) | What is read, what never is, and the diff viewer |

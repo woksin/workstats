@@ -316,6 +316,8 @@ pub fn parse_copilot_vscode_file(path: &Path, max_bytes: u64) -> ParsedFile {
         version: document
             .version
             .map(|value| format!("vscode-chat-v{}", value.round() as i64)),
+        branches: Vec::new(),
+        pull_requests: Vec::new(),
     });
     result
 }

@@ -688,6 +688,13 @@ pub fn print_table(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
             attribution.unresolved_checkouts
         );
     }
+    if let Some(goals) = &report.goals {
+        println!("Goals");
+        for line in goals.lines() {
+            println!("  {line}");
+        }
+        println!();
+    }
     for line in footer_notes(report, diagnostics) {
         println!("{line}");
     }
@@ -801,7 +808,7 @@ fn footer_notes(report: &Report, diagnostics: &Diagnostics) -> Vec<String> {
 /// often quotes a path, and the directory the user's name and client projects
 /// sit under is not the reader's to learn. The terminal shows its own user's
 /// paths untouched.
-fn warning_lines(diagnostics: &Diagnostics, home: Option<&Path>) -> Vec<String> {
+pub(crate) fn warning_lines(diagnostics: &Diagnostics, home: Option<&Path>) -> Vec<String> {
     let mut lines: Vec<String> = diagnostics
         .messages
         .iter()
@@ -1166,6 +1173,18 @@ fn report_document(report: &Report, diagnostics: &Diagnostics, top: usize, raw: 
         }
     }
 
+    if let Some(goals) = &report.goals {
+        blocks.push(Block::Section("Goals".to_string()));
+        blocks.push(Block::List(goals.lines()));
+    }
+
+    // The HTML page always has per-day figures and Markdown has them under
+    // `--daily`; a window shorter than 28 days is a list, not a calendar.
+    if let Some(heatmap) = crate::calendar::for_document(report) {
+        blocks.push(Block::Section("Calendar".to_string()));
+        blocks.push(Block::Heatmap(heatmap));
+    }
+
     blocks.push(Block::Section("Notes".to_string()));
     blocks.push(Block::List(
         footer_notes(report, diagnostics)
@@ -1377,7 +1396,7 @@ fn print_comparison(comparison: &Comparison) {
 }
 
 /// The same block for Markdown and HTML, from the same rows.
-fn push_comparison(blocks: &mut Vec<Block>, comparison: &Comparison) {
+pub(crate) fn push_comparison(blocks: &mut Vec<Block>, comparison: &Comparison) {
     let (current, previous) = comparison_windows(comparison);
     blocks.push(Block::Section("Comparison".to_string()));
     blocks.push(Block::Paragraph(format!(
@@ -1785,7 +1804,7 @@ fn named_month(value: &str) -> Option<String> {
 /// Spreadsheets read a leading `= + - @` as a formula. A negative number is not
 /// a formula though, and this output is made for pipes, so a cell that parses
 /// as a number is left exactly as it is.
-fn neutralize_formula(value: String) -> String {
+pub(crate) fn neutralize_formula(value: String) -> String {
     if value.starts_with(['=', '+', '-', '@']) && value.parse::<f64>().is_err() {
         format!("'{value}")
     } else {
@@ -1799,7 +1818,7 @@ fn local_date(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-fn hours(seconds: f64) -> String {
+pub(crate) fn hours(seconds: f64) -> String {
     let rounded = seconds.round().max(0.0) as u64;
     format!("{}h {:02}m", rounded / 3600, rounded % 3600 / 60)
 }
@@ -1815,7 +1834,7 @@ fn ledger_duration(seconds: f64) -> String {
 }
 
 /// A present-but-tiny share reads as `<1%` rather than rounding away to `0%`.
-fn percent(share: f64) -> String {
+pub(crate) fn percent(share: f64) -> String {
     if share > 0.0 && share < 0.005 {
         "<1%".to_string()
     } else {
@@ -1836,7 +1855,7 @@ fn test_to_source_ratio(composition: &[CompositionEntry]) -> Option<f64> {
     (source != 0).then(|| touched("test") as f64 / source as f64)
 }
 
-fn compact_tokens(value: u64) -> String {
+pub(crate) fn compact_tokens(value: u64) -> String {
     let value = value as f64;
     if value < 1000.0 {
         format!("{value:.0}")
@@ -2156,6 +2175,9 @@ mod tests {
                 cache: None,
             },
             comparison: None,
+            daily: None,
+            window: (None, None),
+            goals: None,
         }
     }
 
@@ -2464,6 +2486,56 @@ mod tests {
         assert!(!html.contains("<b>"), "{html}");
         assert!(html.contains("&lt;script&gt;&amp;&quot;x&quot;|y"));
         assert!(html.contains("Warning: bad &lt;b&gt;path&lt;/b&gt;·| x"));
+    }
+
+    fn day_figures(date: &str, human_seconds: f64) -> crate::model::DayFigures {
+        crate::model::DayFigures {
+            date: date.parse().expect("a date"),
+            human_seconds,
+            agent_wall_seconds: 0.0,
+            prompts: 0,
+            commits: 0,
+            sessions: 0,
+        }
+    }
+
+    #[test]
+    fn the_html_page_draws_a_calendar_when_the_window_is_open() {
+        let mut report = hostile_report();
+        report.daily = Some(vec![day_figures("2026-08-12", 5400.0)]);
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(html.contains("<h2>Calendar</h2>"), "{html}");
+        assert!(html.contains("<svg class=\"cal\""));
+        assert!(html.contains("<title>2026-08-12 · 1h 30m</title>"));
+        // The hostile repository name is still only ever escaped text.
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("href"), "{html}");
+
+        // Markdown gets the same block when per-day figures were asked for.
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(markdown.contains("## Calendar\n"), "{markdown}");
+        assert!(markdown.contains("```text\n"));
+    }
+
+    #[test]
+    fn no_calendar_without_daily_figures_or_for_a_short_window() {
+        let mut report = hostile_report();
+        let markdown = render_markdown(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!markdown.contains("Calendar"), "{markdown}");
+
+        report.daily = Some(vec![day_figures("2026-08-12", 5400.0)]);
+        let local = |text: &str| {
+            use chrono::TimeZone;
+            let date: chrono::NaiveDate = text.parse().unwrap();
+            chrono::Local
+                .from_local_datetime(&date.and_time(chrono::NaiveTime::MIN))
+                .earliest()
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        report.window = (Some(local("2026-08-10")), Some(local("2026-08-17")));
+        let html = render_html(&report_document(&report, &report.diagnostics, 0, false));
+        assert!(!html.contains("Calendar"), "{html}");
     }
 
     #[test]

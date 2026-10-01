@@ -247,6 +247,8 @@ pub fn parse_gemini_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
         is_subagent,
         approximate_cwd,
         version,
+        branches: Vec::new(),
+        pull_requests: Vec::new(),
     });
     result
 }
