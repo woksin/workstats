@@ -672,8 +672,6 @@ fn enrich_with(
 
 /// The integration branch of the repository at `repo`, by the same rule
 /// `enrich` uses; `None` when there is none. For the branch report.
-// Used by the `branch` and `pr` commands once they land.
-#[allow(dead_code)]
 pub(crate) fn integration_branch(
     repo: &Path,
     config: Option<&Value>,

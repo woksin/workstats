@@ -123,4 +123,62 @@ Only the branch name is read for issue keys. Commit subjects are not.
 
 ## The `branch` and `pr` commands
 
-_Coming in this release._
+What did one branch cost, and in whose time? `workstats branch` answers it for
+a branch; `workstats pr` answers it in a form you can paste into a pull request.
+
+```sh
+workstats branch                       # the branch HEAD is on
+workstats branch feat/ACME-1 --base develop
+workstats branch --all --month current # one row per local branch
+workstats pr                           # Markdown, for a PR description
+workstats pr --number 123              # the branch(es) whose sessions linked PR #123
+workstats branch --format json
+```
+
+Accepted formats are `table` (the default for `branch`), `markdown` (the
+default for `pr`), `json` and `html`. `--format csv` is refused. `--no-git` and
+`--compare` are refused too: the report is built from the repository's history.
+
+**The window.** It starts at the earliest of the fork point (the author time of
+`git merge-base BASE BRANCH`), the branch's first commit, the branch's creation
+in the reflog and the first session signal tagged with the branch in this
+repository, and ends now. `BASE` is `--base`, else the integration branch
+(above). `--since`, `--until`, `--month`, `--week` and `--year` override it; the
+start's source is reported as `since_source` in JSON. Without a fork point
+(the base branch itself, or unrelated histories) the command asks for `--base`
+or a window rather than guessing.
+
+**The figures** are sums over that one collected run, filtered to the branch
+and this repository:
+
+- **Human time** is the sum of the human-timeline pieces tagged with the branch.
+  Those pieces already partition the human timeline, so time spent on `main` in
+  parallel is not counted for the branch, and the rows of `--all` add up to no
+  more than the window's total.
+- **Agent wall time** is the union of the agent intervals on the branch;
+  **parallel agent time** is their plain sum, so the two differ when agents ran
+  at once.
+- **Tokens, models and list value** come from the sessions' token events, placed
+  on the branch at the moment they happened. List value is the tokens priced at
+  published rates (`rates as of` is shown), not a bill; models with no price are
+  counted in tokens and named in a warning.
+- **Commits** are `git rev-list --no-merges BASE..BRANCH`: yours are counted
+  with their lines changed, commits an agent authored are counted separately,
+  and anything else on the branch (other people's commits) is reported as
+  `other` in JSON.
+
+**`--all`** gives one row per local branch that shows any work; the number of
+branches left out for showing none is stated. **`pr --number N`** finds the
+branches through the sessions whose transcripts mentioned pull request N
+([pull-request references](privacy.md#pull-request-references)); if the work
+moved across several branches they are listed and also reported combined
+(a pooled computation, so parallel agents on two of them are not double-counted).
+`pr NAME --number N` names the branch yourself and warns if no session linked
+that number to it.
+
+**Markdown is safe to paste.** Branch names, model names and warnings go through
+the same escaping as the other Markdown reports, so `fix/#123` does not turn
+into a link to issue 123 and `@name` does not mention anyone.
+
+`--describe` (commit subjects and session titles per branch) is not available
+yet; passing it is an error.
