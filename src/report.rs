@@ -187,8 +187,6 @@ pub(crate) enum Purpose {
     Print,
     Explore,
     Allocate,
-    // Used by the commands built on `collect` in later changes.
-    #[allow(dead_code)]
     Query,
 }
 
@@ -235,7 +233,6 @@ pub(crate) struct Collected {
 /// Runs the whole pipeline for `arguments` and returns what it produced
 /// without presenting any of it.
 // The entry point for the commands built on collected data.
-#[allow(dead_code)]
 pub(crate) fn collect(arguments: ReportArguments, purpose: Purpose) -> Result<Collected> {
     let mut prepared = prepare(arguments, purpose)?;
     let collected = execute(&mut prepared)?;
@@ -539,7 +536,11 @@ fn prepare(mut arguments: ReportArguments, purpose: Purpose) -> Result<Prepared>
     // same way, by every interval, signal and commit that is grouped.
     classify::install(config.category_registry()?)?;
     issues::install(IssueRules::from_config(config.issues.as_ref())?)?;
-    engagement::install(Engagements::from_config(config.engagements.as_ref())?)?;
+    engagement::install(Engagements::compile(
+        config.engagements.as_ref(),
+        &config.project_aliases,
+        &home_dir(),
+    )?)?;
     let authors = resolve_authors(
         &arguments.author,
         env::var("WORKSTATS_AUTHOR").ok(),

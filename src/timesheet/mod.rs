@@ -1,18 +1,35 @@
 //! `workstats timesheet`: suggested hours per day and engagement, rounded the
 //! way a timesheet is, with a ledger for manual entries, overrides and locks.
-//! This module owns the command's clap shape; the behaviour lands in later
-//! changes, and until then every form of the command says so and stops.
+//! This module owns the command's clap shape and the plain `timesheet` run:
+//! collect the human timeline, compute suggested entries, filter, and present.
+//! The subcommands that change the ledger are dispatched from `run`.
 
+pub(crate) mod compute;
 pub(crate) mod ledger;
 pub(crate) mod model;
+pub(crate) mod presets;
+pub(crate) mod render;
+pub(crate) mod round;
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
-use clap::{Args, Subcommand};
+use anyhow::{Context, Result, bail};
+use clap::{Args, Subcommand, ValueEnum};
+use regex::Regex;
+use serde::Deserialize;
 
-use crate::cli::ReportArguments;
-use model::{Detail, ExportPreset, Rounding, SplitRule, TotalsBy, UnassignedMode};
+use crate::cli::{OutputFormat, ReportArguments};
+use crate::document::{render_html, render_markdown};
+use crate::engagement::{self, Engagements, UNASSIGNED};
+use crate::model::Diagnostics;
+use crate::paths::{Config, home_dir, load_config};
+use crate::report::{Purpose, collect};
+use model::{
+    Detail, ExportPreset, Rounding, SplitRule, Timesheet, TimesheetSettings, TotalsBy,
+    UnassignedMode,
+};
+use presets::Person;
 
 /// `workstats timesheet [OPTIONS]` or `workstats timesheet <ACTION>`. The
 /// report and timesheet flags belong to the first form; the actions take only
@@ -252,8 +269,396 @@ pub(crate) struct UnlockArguments {
     pub(crate) period: String,
 }
 
-pub(crate) fn run(_arguments: TimesheetArguments) -> Result<()> {
-    bail!("`workstats timesheet` is not yet implemented")
+/// The `timesheet` block of the config. Raw JSON in `Config`, checked here, so
+/// a misspelt key is refused by name instead of the whole file being ignored.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimesheetConfig {
+    increment: Option<String>,
+    rounding: Option<String>,
+    min_entry: Option<String>,
+    drop_below: Option<String>,
+    daily_cap: Option<String>,
+    split: Option<String>,
+    unassigned: Option<String>,
+    person: Option<PersonConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonConfig {
+    email: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
+}
+
+/// A flag, else the config's value, else the built-in default.
+fn pick<'a>(
+    flag: (&'static str, &'a Option<String>),
+    config: (&'static str, &'a Option<String>),
+) -> Option<(&'static str, &'a str)> {
+    flag.1
+        .as_deref()
+        .map(|value| (flag.0, value))
+        .or_else(|| config.1.as_deref().map(|value| (config.0, value)))
+}
+
+/// A duration in whole seconds: `15m`, `1h30m`, `90s`. Zero (`0`, `0m`) is
+/// allowed because it means "off" for the minimum and the drop threshold; the
+/// callers that cannot be zero say so.
+fn span_seconds(name: &str, value: &str) -> Result<u64> {
+    const LIMIT_SECONDS: f64 = 366.0 * 24.0 * 3600.0;
+    let invalid = || anyhow::anyhow!("invalid {name} {value:?}: use 30s, 15m, 2h or 1h30m");
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Ok(0);
+    }
+    let whole = Regex::new(r"(?i)^(?:\d+(?:\.\d+)?[smh])+$").expect("static regex");
+    if !whole.is_match(trimmed) {
+        return Err(invalid());
+    }
+    let part = Regex::new(r"(?i)(\d+(?:\.\d+)?)([smh])").expect("static regex");
+    let mut seconds = 0.0;
+    for captures in part.captures_iter(trimmed) {
+        let amount: f64 = captures[1].parse().map_err(|_| invalid())?;
+        seconds += amount
+            * match captures[2].to_ascii_lowercase().as_str() {
+                "h" => 3600.0,
+                "m" => 60.0,
+                _ => 1.0,
+            };
+    }
+    if !seconds.is_finite() || seconds > LIMIT_SECONDS {
+        bail!("{name} {value:?} must be at most 8784h (366 days)");
+    }
+    if (seconds - seconds.round()).abs() > 1e-9 {
+        bail!("{name} {value:?} must be a whole number of seconds");
+    }
+    Ok(seconds.round() as u64)
+}
+
+fn enum_value<T: ValueEnum>(name: &str, value: &str) -> Result<T> {
+    T::from_str(value.trim(), true).map_err(|_| {
+        let accepted = T::value_variants()
+            .iter()
+            .filter_map(|variant| variant.to_possible_value())
+            .map(|value| value.get_name().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!("invalid {name} {value:?}; expected one of {accepted}")
+    })
+}
+
+/// Everything the flags and the config decide before anything is scanned.
+pub(crate) struct Resolved {
+    pub(crate) settings: TimesheetSettings,
+    pub(crate) person: Person,
+}
+
+/// Flag > config > built-in default, validated. The increment is whole
+/// seconds and at least one; the daily cap is a multiple of it, so every
+/// estimate stays a whole number of increments.
+pub(crate) fn resolve(options: &TimesheetOptions, config: &Config) -> Result<Resolved> {
+    let file: TimesheetConfig = match &config.timesheet {
+        Some(value) => {
+            serde_json::from_value(value.clone()).context("invalid \"timesheet\" configuration")?
+        }
+        None => TimesheetConfig::default(),
+    };
+    let increment = match pick(
+        ("--increment", &options.increment),
+        ("timesheet.increment", &file.increment),
+    ) {
+        Some((name, value)) => span_seconds(name, value)?,
+        None => TimesheetSettings::default().increment_seconds,
+    };
+    if increment == 0 {
+        bail!("the increment must be at least one second");
+    }
+    let optional_span = |flag: (&'static str, &Option<String>),
+                         config: (&'static str, &Option<String>)| {
+        pick(flag, config)
+            .map(|(name, value)| span_seconds(name, value))
+            .transpose()
+    };
+    let min_entry = optional_span(
+        ("--min-entry", &options.min_entry),
+        ("timesheet.min_entry", &file.min_entry),
+    )?
+    .unwrap_or(0);
+    let drop_below = optional_span(
+        ("--drop-below", &options.drop_below),
+        ("timesheet.drop_below", &file.drop_below),
+    )?
+    .unwrap_or(0);
+    let daily_cap = pick(
+        ("--daily-cap", &options.daily_cap),
+        ("timesheet.daily_cap", &file.daily_cap),
+    )
+    .map(|(name, value)| {
+        let seconds = span_seconds(name, value)?;
+        if seconds == 0 {
+            bail!("{name} must be more than zero; leave it out for no cap");
+        }
+        if seconds % increment != 0 {
+            bail!(
+                "{name} ({}) must be a multiple of the increment ({})",
+                compute::span_text(seconds),
+                compute::span_text(increment)
+            );
+        }
+        Ok(seconds)
+    })
+    .transpose()?;
+    // The enum flags are typed by clap; only the config holds them as text.
+    let rounding = match (options.rounding, &file.rounding) {
+        (Some(rounding), _) => rounding,
+        (None, Some(value)) => enum_value::<Rounding>("timesheet.rounding", value)?,
+        (None, None) => Rounding::default(),
+    };
+    let split = match (options.split, &file.split) {
+        (Some(split), _) => split,
+        (None, Some(value)) => enum_value::<SplitRule>("timesheet.split", value)?,
+        (None, None) => SplitRule::default(),
+    };
+    let unassigned = match (options.unassigned, &file.unassigned) {
+        (Some(mode), _) => mode,
+        (None, Some(value)) => enum_value::<UnassignedMode>("timesheet.unassigned", value)?,
+        (None, None) => UnassignedMode::default(),
+    };
+    let person = file.person.unwrap_or_default();
+    Ok(Resolved {
+        settings: TimesheetSettings {
+            increment_seconds: increment,
+            rounding,
+            min_entry_seconds: min_entry,
+            drop_below_seconds: drop_below,
+            daily_cap_seconds: daily_cap,
+            split,
+            unassigned,
+            detail: options.detail,
+        },
+        person: Person {
+            email: person.email.unwrap_or_default(),
+            first_name: person.first_name.unwrap_or_default(),
+            last_name: person.last_name.unwrap_or_default(),
+        },
+    })
+}
+
+/// Whether the report flags name a window of their own.
+fn has_window(report: &ReportArguments) -> bool {
+    report.month.is_some()
+        || report.year.is_some()
+        || report.week.is_some()
+        || report.since.is_some()
+        || report.until.is_some()
+}
+
+/// `--engagement acme`, `(unassigned)` or `unassigned`.
+fn is_unassigned(key: &str) -> bool {
+    key == UNASSIGNED || key == "unassigned"
+}
+
+/// Applies `--engagement`, `--billable-only` and `--unassigned hide` after the
+/// whole computation: a day is rounded and capped over all its work, so
+/// filtering never changes any figure that is still shown. Returns what was
+/// left out.
+pub(crate) fn filter(
+    timesheet: &mut Timesheet,
+    options: &TimesheetOptions,
+    unassigned: UnassignedMode,
+) -> render::Hidden {
+    let wanted: Vec<&str> = options.engagement.iter().map(String::as_str).collect();
+    let keep = |engagement: &str, billable: Option<bool>| {
+        let is_unassigned_entry = engagement == UNASSIGNED;
+        let explicitly = wanted
+            .iter()
+            .any(|key| *key == engagement || (is_unassigned(key) && is_unassigned_entry));
+        (wanted.is_empty() || explicitly)
+            && (!options.billable_only || billable.unwrap_or(true))
+            && (unassigned == UnassignedMode::Show || !is_unassigned_entry || explicitly)
+    };
+    let mut hidden = render::Hidden::default();
+    let entries = std::mem::take(&mut timesheet.entries);
+    for entry in entries {
+        if keep(&entry.engagement, Some(entry.billable)) {
+            timesheet.entries.push(entry);
+        } else {
+            hidden.entries += 1;
+            hidden.seconds += entry.final_seconds;
+        }
+    }
+    // Dropped entries have no billing flag; only the engagement filters apply.
+    timesheet
+        .dropped
+        .retain(|entry| keep(&entry.engagement, None));
+    if hidden.entries > 0 {
+        if !wanted.is_empty() {
+            hidden
+                .reasons
+                .push(format!("--engagement {}", wanted.join(",")));
+        }
+        if options.billable_only {
+            hidden.reasons.push("--billable-only".to_string());
+        }
+        if unassigned == UnassignedMode::Hide {
+            hidden.reasons.push("--unassigned hide".to_string());
+        }
+    }
+    hidden
+}
+
+pub(crate) fn run(arguments: TimesheetArguments) -> Result<()> {
+    let TimesheetArguments {
+        action,
+        options,
+        report,
+    } = arguments;
+    // PLACEHOLDER (P3): the ledger actions are dispatched here. Each arm takes
+    // its own arguments and returns; only the plain `workstats timesheet` form
+    // reaches `run_report`.
+    match action {
+        None => {}
+        Some(_) => bail!("`workstats timesheet` subcommands are not yet implemented"),
+    }
+    run_report(options, report)
+}
+
+/// The report this command makes of its own: refused flags are refused before
+/// anything is scanned, and nothing is printed until everything has been
+/// computed.
+fn run_report(options: TimesheetOptions, mut report: ReportArguments) -> Result<()> {
+    // Flags that shape a report's rows mean nothing here, and ignoring them
+    // silently is how a number gets read as something it is not.
+    for (given, flag) in [
+        (
+            report.group_by.is_some() || report.by_repo || report.matrix || report.by_dir,
+            "--group-by",
+        ),
+        (report.period.is_some(), "--period"),
+        (report.compare.is_some(), "--compare"),
+        (report.explain_human_time, "--explain-human-time"),
+        (
+            report.explain_repository_attribution,
+            "--explain-repository-attribution",
+        ),
+    ] {
+        if given {
+            bail!(
+                "{flag} does not apply to `workstats timesheet`; it groups by day and engagement"
+            );
+        }
+    }
+    let explicit_format = report.output_format;
+    if options.export.is_some()
+        && let Some(format) = explicit_format
+        && format != OutputFormat::Csv
+    {
+        bail!(
+            "--export writes CSV and cannot be combined with --format {}; drop one of them",
+            format.name()
+        );
+    }
+
+    // Read early, so a bad flag or config value fails before a long scan.
+    let mut diagnostics = Diagnostics::default();
+    let config = load_config(report.config.as_deref(), &mut diagnostics);
+    let resolved = resolve(&options, &config)?;
+    let configured = Engagements::compile(
+        config.engagements.as_ref(),
+        &config.project_aliases,
+        &home_dir(),
+    )?;
+    for key in &options.engagement {
+        if !is_unassigned(key) && configured.get(key).is_none() {
+            let known: Vec<_> = configured.keys().collect();
+            bail!(
+                "unknown engagement {key:?} in --engagement; configured: {}",
+                if known.is_empty() {
+                    "none".to_string()
+                } else {
+                    known.join(", ")
+                }
+            );
+        }
+    }
+
+    let default_window = !has_window(&report);
+    if default_window {
+        report.month = Some("current".to_string());
+    }
+    let collected = collect(report, Purpose::Query)?;
+
+    let format = match (explicit_format, options.export) {
+        (Some(format), _) => format,
+        (None, Some(_)) => OutputFormat::Csv,
+        (None, None) => collected
+            .report
+            .inputs
+            .config_defaults
+            .get("format")
+            .and_then(|name| OutputFormat::from_str(name, true).ok())
+            .unwrap_or(OutputFormat::Table),
+    };
+
+    let mut computation = compute::compute(&compute::Input {
+        timeline: &collected.timeline,
+        engagements: engagement::active(),
+        settings: &resolved.settings,
+        window: collected.window,
+        report_human_seconds: collected.report.summary.human_estimated_seconds,
+    })?;
+    render::describe_entries(&options, &mut computation.timesheet.entries)?;
+    let hidden = filter(
+        &mut computation.timesheet,
+        &options,
+        resolved.settings.unassigned,
+    );
+
+    let mut extra_warnings = Vec::new();
+    let reading = collected.report.diagnostics.warning_count;
+    if reading > 0 {
+        extra_warnings.push(format!(
+            "{reading} warning(s) while reading history; run `workstats` for the details"
+        ));
+    }
+    let view = render::View {
+        computation: &computation,
+        show_evidence: !options.no_evidence,
+        show_description: !options.describe.is_empty() || options.summarize_with.is_some(),
+        totals_by: options.totals_by.unwrap_or_default(),
+        default_window,
+        hidden: &hidden,
+        extra_warnings: &extra_warnings,
+    };
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    match format {
+        OutputFormat::Table => write!(out, "{}", render::render_text(&render::document(&view)))?,
+        OutputFormat::Markdown => write!(out, "{}", render_markdown(&render::document(&view)))?,
+        OutputFormat::Html => write!(out, "{}", render_html(&render::document(&view)))?,
+        OutputFormat::Json => {
+            serde_json::to_writer_pretty(&mut out, &render::json(&view)?)?;
+            writeln!(out)?;
+        }
+        OutputFormat::Csv => {
+            presets::write_csv(
+                &mut out,
+                &computation.timesheet.entries,
+                options.export.unwrap_or(ExportPreset::Generic),
+                engagement::active(),
+                &resolved.person,
+                view.show_evidence,
+            )?;
+            // The CSV is for a pipe or a file; what a reader of the table
+            // would have seen below it goes to stderr so it is not lost.
+            for warning in view.warnings() {
+                eprintln!("workstats: {warning}");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -348,8 +753,230 @@ mod tests {
     }
 
     #[test]
-    fn the_command_says_it_is_not_implemented_yet() {
-        let error = run(parse(&[]).unwrap()).unwrap_err();
+    fn the_ledger_actions_are_not_yet_dispatched() {
+        let error = run(parse(&["locks"]).unwrap()).unwrap_err();
         assert!(error.to_string().contains("not yet implemented"));
+    }
+
+    fn config(timesheet: serde_json::Value) -> Config {
+        Config {
+            timesheet: Some(timesheet),
+            ..Config::default()
+        }
+    }
+
+    fn options(arguments: &[&str]) -> TimesheetOptions {
+        parse(arguments).unwrap().options
+    }
+
+    #[test]
+    fn settings_come_from_the_flag_then_the_config_then_the_defaults() {
+        let nothing = resolve(&options(&[]), &Config::default()).unwrap();
+        assert_eq!(TimesheetSettings::default(), nothing.settings);
+
+        let file = config(serde_json::json!({
+            "increment": "30m", "rounding": "balanced", "daily_cap": "8h",
+            "min_entry": "0m", "split": "signals", "unassigned": "hide",
+            "person": {"email": "me@example.com", "first_name": "Ada"}
+        }));
+        let from_file = resolve(&options(&[]), &file).unwrap();
+        assert_eq!(1800, from_file.settings.increment_seconds);
+        assert_eq!(Rounding::Balanced, from_file.settings.rounding);
+        assert_eq!(Some(8 * 3600), from_file.settings.daily_cap_seconds);
+        assert_eq!(SplitRule::Signals, from_file.settings.split);
+        assert_eq!(UnassignedMode::Hide, from_file.settings.unassigned);
+        assert_eq!("me@example.com", from_file.person.email);
+
+        let flagged = resolve(
+            &options(&[
+                "--increment",
+                "6m",
+                "--rounding",
+                "up",
+                "--split",
+                "agent",
+                "--daily-cap",
+                "6h",
+            ]),
+            &file,
+        )
+        .unwrap();
+        assert_eq!(360, flagged.settings.increment_seconds);
+        assert_eq!(Rounding::Up, flagged.settings.rounding);
+        assert_eq!(SplitRule::Agent, flagged.settings.split);
+        assert_eq!(Some(6 * 3600), flagged.settings.daily_cap_seconds);
+    }
+
+    #[test]
+    fn bad_settings_are_refused_naming_the_flag_or_the_config_key() {
+        let message = |arguments: &[&str], config: &Config| {
+            format!("{:#}", resolve(&options(arguments), config).err().unwrap())
+        };
+        let none = Config::default();
+        assert!(message(&["--increment", "soon"], &none).contains("--increment"));
+        assert!(message(&["--increment", "0m"], &none).contains("increment"));
+        assert!(message(&["--increment", "7m", "--daily-cap", "1h"], &none).contains("multiple"));
+        assert!(message(&["--daily-cap", "0"], &none).contains("--daily-cap"));
+        assert!(message(&["--increment", "1.5s"], &none).contains("whole number of seconds"));
+        let file = config(serde_json::json!({"rounding": "sideways"}));
+        assert!(message(&[], &file).contains("timesheet.rounding"));
+        let file = config(serde_json::json!({"incremnt": "15m"}));
+        assert!(message(&[], &file).contains("timesheet"));
+        let file = config(serde_json::json!({"daily_cap": "10m", "increment": "15m"}));
+        assert!(message(&[], &file).contains("timesheet.daily_cap"));
+    }
+
+    #[test]
+    fn durations_may_be_compound_and_must_be_whole_seconds() {
+        for (value, seconds) in [
+            ("15m", 900),
+            ("1h30m", 5400),
+            ("90s", 90),
+            ("2H", 7200),
+            ("0", 0),
+            ("0m", 0),
+            ("1.5m", 90),
+        ] {
+            assert_eq!(seconds, span_seconds("--x", value).unwrap(), "{value}");
+        }
+        for value in ["", "15", "m", "1h 30m", "-5m", "1.5s", "9999h"] {
+            assert!(span_seconds("--x", value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn zero_is_off_for_the_minimum_and_the_drop_threshold() {
+        let settings = resolve(
+            &options(&["--min-entry", "0", "--drop-below", "0s"]),
+            &Config::default(),
+        )
+        .unwrap()
+        .settings;
+        assert_eq!(0, settings.min_entry_seconds);
+        assert_eq!(0, settings.drop_below_seconds);
+    }
+
+    #[test]
+    fn a_window_flag_replaces_the_default_month() {
+        assert!(!has_window(&parse(&[]).unwrap().report));
+        for flag in [
+            ["--month", "2026-08"],
+            ["--week", "last"],
+            ["--since", "2026-08"],
+            ["--year", "2026"],
+        ] {
+            assert!(has_window(&parse(&flag).unwrap().report), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn export_conflicts_with_an_explicit_non_csv_format_at_run_time() {
+        let error = run(parse(&["--export", "toggl", "--format", "json"]).unwrap()).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("--export") && message.contains("--format json"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn flags_that_mean_nothing_to_a_timesheet_are_refused() {
+        for flag in [
+            ["--group-by", "repo"],
+            ["--period", "month"],
+            ["--compare", "previous"],
+        ] {
+            let error = run(parse(&flag).unwrap()).unwrap_err();
+            assert!(error.to_string().contains(flag[0]), "{flag:?}: {error}");
+        }
+    }
+
+    fn entry(engagement: &str, billable: bool, seconds: u64) -> model::TimesheetEntry {
+        use crate::timesheet::model::{EntryStatus, Evidence};
+        model::TimesheetEntry {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 8, 12).unwrap(),
+            engagement: engagement.to_string(),
+            detail: None,
+            label: engagement.to_string(),
+            client: None,
+            billable,
+            raw_seconds: seconds as f64,
+            estimated_seconds: seconds,
+            manual_seconds: 0,
+            override_seconds: None,
+            final_seconds: seconds,
+            first_start: None,
+            last_end: None,
+            evidence: Evidence::default(),
+            rate: None,
+            currency: None,
+            amount: None,
+            notes: Vec::new(),
+            description: None,
+            status: EntryStatus::Suggested,
+            adjustments: Vec::new(),
+            lock_drift_seconds: None,
+        }
+    }
+
+    fn sheet() -> Timesheet {
+        Timesheet {
+            window: model::TimesheetWindow::default(),
+            settings: TimesheetSettings::default(),
+            entries: vec![
+                entry("acme", true, 3600),
+                entry("internal", false, 1800),
+                entry(UNASSIGNED, false, 900),
+            ],
+            dropped: Vec::new(),
+            cross_check: Vec::new(),
+            warnings: Vec::new(),
+            methodology: model::TimesheetMethodology {
+                status: "suggested",
+                split_rule: String::new(),
+                rounding: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn filters_leave_out_entries_and_say_what_they_left_out() {
+        let mut timesheet = sheet();
+        let hidden = filter(
+            &mut timesheet,
+            &options(&["--billable-only"]),
+            UnassignedMode::Show,
+        );
+        assert_eq!(1, timesheet.entries.len());
+        assert_eq!((2, 2700), (hidden.entries, hidden.seconds));
+        assert_eq!(vec!["--billable-only"], hidden.reasons);
+
+        let mut timesheet = sheet();
+        let hidden = filter(
+            &mut timesheet,
+            &options(&["--engagement", "internal"]),
+            UnassignedMode::Show,
+        );
+        assert_eq!("internal", timesheet.entries[0].engagement);
+        assert_eq!(2, hidden.entries);
+
+        let mut timesheet = sheet();
+        let hidden = filter(&mut timesheet, &options(&[]), UnassignedMode::Hide);
+        assert_eq!(2, timesheet.entries.len());
+        assert_eq!(vec!["--unassigned hide"], hidden.reasons);
+
+        // Naming the unassigned work explicitly overrides hiding it.
+        let mut timesheet = sheet();
+        filter(
+            &mut timesheet,
+            &options(&["--engagement", "unassigned"]),
+            UnassignedMode::Hide,
+        );
+        assert_eq!(UNASSIGNED, timesheet.entries[0].engagement);
+
+        let mut timesheet = sheet();
+        let hidden = filter(&mut timesheet, &options(&[]), UnassignedMode::Show);
+        assert_eq!(3, timesheet.entries.len());
+        assert_eq!(0, hidden.entries);
     }
 }
