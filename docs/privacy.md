@@ -185,6 +185,23 @@ A session keeps at most 64 references. They are cached with the session and are
 used to find the branch a pull request was worked on; they are not shown in an
 ordinary report.
 
+### `insights` and `digest` read nothing new
+
+`workstats insights` and `workstats digest` are computed from the data a report
+is built from: no additional file, database column or Git command is read. What
+they add is presentation, and some of it is worth knowing before you share it:
+
+- `digest` lists the **top repositories and features** by name. A feature is the
+  issue key or branch name (see above), so a digest pasted into a PR or a status
+  update carries those names. Warnings in the Markdown and HTML have your home
+  directory redacted, as in the report.
+- `insights --section heatmap` shows when you work (weekday and hour, late
+  nights, weekends). That is a pattern of your life, not just your projects.
+- `models` shows which providers and models you used and their list value.
+  List value is the tokens priced at published rates, not a bill.
+
+Nothing from a prompt or a response is involved, and nothing is sent anywhere.
+
 ### Opt-in descriptions
 
 _Coming in this release._
