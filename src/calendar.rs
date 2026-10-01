@@ -24,7 +24,7 @@ use clap::Args;
 use crate::cli::{OutputFormat, ReportArguments, ReportWindow};
 use crate::document::{Block, Document, HeatCell, HeatGrid, Heatmap, render_html, render_markdown};
 use crate::model::{DayFigures, Report};
-use crate::report::{Purpose, collect};
+use crate::report::{Purpose, collect_with};
 use crate::timesheet::render::render_text;
 
 /// The longest span drawn, so a window opened with `--since 0001-01` cannot ask
@@ -61,7 +61,9 @@ pub(crate) fn run(arguments: CalendarArguments) -> Result<()> {
         report.since = Some((today - Duration::days(DEFAULT_DAYS - 1)).to_string());
         report.until = Some(today.to_string());
     }
-    let collected = collect(report, Purpose::Query)?;
+    // A calendar shows neither goals nor branches.
+    report.no_goals = true;
+    let collected = collect_with(report, Purpose::Query, Some(false))?;
     // A configured default format may be one a grid cannot take; the grid then
     // falls back to the terminal rather than failing a command that was not
     // given the flag.

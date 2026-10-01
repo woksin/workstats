@@ -195,6 +195,12 @@ impl Engagements {
         self.items.is_empty()
     }
 
+    /// Whether any engagement is matched by a branch or an issue, so labelling
+    /// work needs the branches it was done on.
+    pub fn uses_branches(&self) -> bool {
+        !self.issue_prefixes.is_empty() || !self.branch_globs.is_empty()
+    }
+
     /// A digest of the configuration the engagements were compiled from, so a
     /// lock can tell that the rules changed after it was taken.
     pub fn fingerprint(&self) -> &str {

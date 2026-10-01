@@ -347,12 +347,14 @@ fn args_hash(
     config_path: &Path,
     config_fingerprint: &str,
     needs_month: bool,
+    needs_branch: bool,
 ) -> String {
     let mut parts = vec![
         format!("workstats {}", env!("CARGO_PKG_VERSION")),
         format!("{report:?}"),
         format!("config {} {config_fingerprint}", config_path.display()),
         format!("month {needs_month}"),
+        format!("branch {needs_branch}"),
         format!("cwd {:?}", env::current_dir().ok()),
     ];
     for name in [
@@ -501,25 +503,34 @@ fn lock_is_live(path: &Path, now: SystemTime) -> bool {
         })
 }
 
-/// Starts a detached copy of this command that only refreshes the snapshot.
-///
-/// The arguments are this process's own, minus `--no-wait` and
-/// `--rebuild-cache` (the first would loop, the second would rebuild the index
-/// a second time) and plus `--refresh-only`, so the copy computes exactly what
-/// the caller asked for. It does not wait for the child: the caller is a
-/// prompt and has to return now.
-// The child outlives this process on purpose, so there is nothing to wait for.
-#[allow(clippy::zombie_processes)]
-fn spawn_refresh(lock: &Path) -> Result<()> {
-    if lock_is_live(lock, SystemTime::now()) {
-        return Ok(());
-    }
-    let mut arguments: Vec<OsString> = env::args_os()
-        .skip(1)
+/// The arguments of the background copy: the caller's own, minus `--no-wait`
+/// and `--rebuild-cache` (the first would loop, the second would rebuild the
+/// index a second time) and plus `--refresh-only`, so the copy computes exactly
+/// what the caller asked for.
+fn refresh_arguments(arguments: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut arguments: Vec<OsString> = arguments
+        .into_iter()
         .filter(|argument| argument != "--no-wait" && argument != "--rebuild-cache")
         .collect();
     arguments.push("--refresh-only".into());
-    let mut command = Command::new(env::current_exe().context("cannot find this executable")?);
+    arguments
+}
+
+/// The command for the background copy, set up so it holds nothing of its
+/// caller's: all three standard streams are the null device on every platform,
+/// so a prompt that captures this process's output (`$(workstats now
+/// --no-wait)`) sees it close when this process exits, however long the
+/// refresh runs.
+///
+/// On Unix the child gets its own process group, so the shell's Ctrl-C and the
+/// terminal closing do not take it down with the prompt. On Windows it is
+/// detached from the console (`DETACHED_PROCESS`, `CREATE_NO_WINDOW`) and in
+/// its own process group (`CREATE_NEW_PROCESS_GROUP`), for the same reasons.
+/// Windows still lets a child inherit the parent's other inheritable handles,
+/// which std cannot restrict without an allow-list; a parent whose stdout is an
+/// inheritable pipe is the case that could keep a capturing prompt waiting.
+fn refresh_command(executable: PathBuf, arguments: Vec<OsString>) -> Command {
+    let mut command = Command::new(executable);
     command
         .args(arguments)
         .stdin(Stdio::null())
@@ -528,19 +539,35 @@ fn spawn_refresh(lock: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // Its own process group, so the shell's Ctrl-C and the terminal closing
-        // do not take the refresh down with the prompt that started it.
         command.process_group(0);
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW
-        command.creation_flags(0x0000_0008 | 0x0800_0000);
+        command.creation_flags(WINDOWS_DETACHED_FLAGS);
     }
     command
-        .spawn()
-        .context("cannot start the background refresh")?;
+}
+
+/// `DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`.
+#[cfg(windows)]
+const WINDOWS_DETACHED_FLAGS: u32 = 0x0000_0008 | 0x0800_0000 | 0x0000_0200;
+
+/// Starts a detached copy of this command that only refreshes the snapshot.
+/// It does not wait for the child: the caller is a prompt and has to return now.
+// The child outlives this process on purpose, so there is nothing to wait for.
+#[allow(clippy::zombie_processes)]
+fn spawn_refresh(lock: &Path) -> Result<()> {
+    if lock_is_live(lock, SystemTime::now()) {
+        return Ok(());
+    }
+    let arguments = refresh_arguments(env::args_os().skip(1));
+    refresh_command(
+        env::current_exe().context("cannot find this executable")?,
+        arguments,
+    )
+    .spawn()
+    .context("cannot start the background refresh")?;
     Ok(())
 }
 
@@ -639,6 +666,9 @@ fn build_snapshot(inputs: &SnapshotInputs<'_>) -> Snapshot {
 struct Settings {
     goals: Option<Goals>,
     needs_month: bool,
+    /// The template or the JSON shows the active session's branch, which is
+    /// the one thing in a snapshot that Git has to be asked for.
+    needs_branch: bool,
 }
 
 /// Collects the week so far (and the month so far when something needs it)
@@ -663,7 +693,7 @@ fn compute(
     report.no_progress = true;
     report.no_update_check = true;
     report.no_goals = true;
-    let collected = report::collect(report, Purpose::Query)?;
+    let collected = report::collect_with(report, Purpose::Query, Some(settings.needs_branch))?;
     let daily = collected.report.daily.as_deref().unwrap_or_default();
     Ok(build_snapshot(&SnapshotInputs {
         daily,
@@ -907,6 +937,7 @@ fn run_at(arguments: NowArguments, now: DateTime<Utc>) -> Result<Option<String>>
         needs_month: json
             || template.uses(Token::ValueMonth)
             || goals.as_ref().is_some_and(Goals::has_month_cap),
+        needs_branch: json || template.uses(Token::ActiveBranch),
         goals,
     };
     let hash = args_hash(
@@ -914,6 +945,7 @@ fn run_at(arguments: NowArguments, now: DateTime<Utc>) -> Result<Option<String>>
         &config_path,
         &config_fingerprint(&config_path),
         settings.needs_month,
+        settings.needs_branch,
     );
     let path = snapshot_path(report.cache.as_deref());
     let lock = lock_path(&path);
@@ -1258,15 +1290,24 @@ mod tests {
     #[test]
     fn the_hash_follows_the_flags_and_the_month_need_not_the_template_or_age() {
         let path = Path::new("/nonexistent/config.json");
-        let hash =
-            |flags: &[&str], month: bool| args_hash(&parse(flags).report, path, "none", month);
+        let hash = |flags: &[&str], month: bool| {
+            args_hash(&parse(flags).report, path, "none", month, false)
+        };
         let base = hash(&[], false);
         assert_eq!(base, hash(&[], false));
         assert_ne!(base, hash(&["--no-git"], false));
         assert_ne!(base, hash(&["--provider", "claude"], false));
         assert_ne!(base, hash(&["--no-goals"], false));
         assert_ne!(base, hash(&[], true));
-        assert_ne!(base, args_hash(&parse(&[]).report, path, "1:2", false));
+        assert_ne!(
+            base,
+            args_hash(&parse(&[]).report, path, "1:2", false, false)
+        );
+        // A template that shows the branch needs the snapshot to carry one.
+        assert_ne!(
+            base,
+            args_hash(&parse(&[]).report, path, "none", false, true)
+        );
         // Presentation and freshness settings are not part of what is computed.
         assert_eq!(
             base,
@@ -1284,6 +1325,40 @@ mod tests {
                 false
             )
         );
+    }
+
+    #[test]
+    fn the_background_copy_takes_the_callers_arguments_without_the_looping_ones() {
+        let arguments = refresh_arguments(
+            [
+                "--no-wait",
+                "--template",
+                "{human}",
+                "--rebuild-cache",
+                "--no-git",
+            ]
+            .map(OsString::from),
+        );
+        let arguments: Vec<_> = arguments
+            .iter()
+            .map(|argument| argument.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            vec!["--template", "{human}", "--no-git", "--refresh-only"],
+            arguments
+        );
+        let command = refresh_command(PathBuf::from("workstats"), vec![OsString::from("now")]);
+        assert_eq!(Path::new("workstats"), Path::new(command.get_program()));
+        assert_eq!(
+            vec![OsString::from("now")],
+            command.get_args().map(OsString::from).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_copy_is_detached_without_a_window_in_its_own_group() {
+        assert_eq!(0x0800_0208, WINDOWS_DETACHED_FLAGS);
     }
 
     #[test]

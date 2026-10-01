@@ -231,7 +231,18 @@ pub(crate) struct Collected {
 /// Runs the whole pipeline for `arguments` and returns what it produced
 /// without presenting any of it.
 pub(crate) fn collect(arguments: ReportArguments, purpose: Purpose) -> Result<Collected> {
-    let mut prepared = prepare(arguments, purpose)?;
+    collect_with(arguments, purpose, None)
+}
+
+/// `collect`, with the caller deciding whether branches are filled in from Git
+/// (`Some`), for a command that knows what it will show. `None` lets the run
+/// decide: see `Prepared::needs_branches`.
+pub(crate) fn collect_with(
+    arguments: ReportArguments,
+    purpose: Purpose,
+    needs_branches: Option<bool>,
+) -> Result<Collected> {
+    let mut prepared = prepare(arguments, purpose, needs_branches)?;
     let collected = execute(&mut prepared)?;
     finish_progress(prepared.progress, &collected.report);
     Ok(collected)
@@ -247,7 +258,7 @@ pub(crate) fn run(
     } else {
         presentation.into()
     };
-    let mut prepared = prepare(arguments, purpose)?;
+    let mut prepared = prepare(arguments, purpose, None)?;
     let collected = execute(&mut prepared)?;
     finish_progress(prepared.progress, &collected.report);
     let Prepared {
@@ -325,6 +336,10 @@ struct Prepared {
     window: ReportWindow,
     compare: Option<ComparePlan>,
     dimensions: Vec<String>,
+    /// Whether anything in the output reads a branch, so Git is asked for the
+    /// ones the providers did not record. A plain report is not one of them,
+    /// and spawns no `git` process for this.
+    needs_branches: bool,
     progress: Progress,
     directory: PathBuf,
     history_paths: BTreeMap<String, Vec<PathBuf>>,
@@ -345,7 +360,11 @@ struct Prepared {
 /// Reads the config, applies the defaults, validates the flags against each
 /// other and against `purpose`, and works out the window and the sources.
 /// Nothing is scanned.
-fn prepare(mut arguments: ReportArguments, purpose: Purpose) -> Result<Prepared> {
+fn prepare(
+    mut arguments: ReportArguments,
+    purpose: Purpose,
+    needs_branches: Option<bool>,
+) -> Result<Prepared> {
     // The config is read first because its `defaults` decide what several of
     // the checks below are checking: flag > environment > config > built-in.
     let mut diagnostics = Diagnostics::default();
@@ -538,6 +557,17 @@ fn prepare(mut arguments: ReportArguments, purpose: Purpose) -> Result<Prepared>
         &config.project_aliases,
         &home_dir(),
     )?)?;
+    // Branches are filled from Git only for what reads them: the branch, issue
+    // and feature groupings, engagement rules that match on a branch or an
+    // issue, and the commands built on the timeline (timesheet, branch, pr,
+    // insights, digest, export, now). A plain report reads none of them.
+    let needs_branches = needs_branches.unwrap_or_else(|| {
+        purpose == Purpose::Query
+            || dimensions
+                .iter()
+                .any(|name| matches!(name.as_str(), "branch" | "issue" | "feature"))
+            || engagement::active().uses_branches()
+    });
     let authors = resolve_authors(
         &arguments.author,
         env::var("WORKSTATS_AUTHOR").ok(),
@@ -585,6 +615,7 @@ fn prepare(mut arguments: ReportArguments, purpose: Purpose) -> Result<Prepared>
         window,
         compare,
         dimensions,
+        needs_branches,
         progress,
         directory,
         history_paths,
@@ -1030,8 +1061,9 @@ fn scan_window(
     resolver.validate_project_aliases()?;
     // Branches the providers did not record, filled from Git while every
     // checkout is still known by its own path. `--no-git` means no `git`
-    // process at all, so branches stay as the providers recorded them.
-    if !arguments.no_git {
+    // process at all, so branches stay as the providers recorded them; so does
+    // a run that reads no branch.
+    if !arguments.no_git && scan.needs_branches {
         branches::enrich(
             &mut sessions,
             &mut commits,

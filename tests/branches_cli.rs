@@ -256,3 +256,148 @@ fn a_session_before_a_switch_is_on_the_branch_the_switch_left() {
     assert_eq!(1, rows.len(), "{rows:?}");
     assert_eq!("main", rows[0]["key"]["branch"]);
 }
+
+/// A `git` that appends its arguments to `log` and then runs the real one, so
+/// a test can see which Git questions a run asked. `WORKSTATS_GIT` points the
+/// program at it.
+#[cfg(unix)]
+fn logging_git(directory: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let log = directory.join("git-calls.log");
+    let script = directory.join("logging-git.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nexec git \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    (script, log)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_plain_report_asks_git_for_no_branches_but_a_branch_grouping_does() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "project");
+    commit_on(&path, "a.txt", "a\n", "2026-02-27");
+    git_at(
+        &path,
+        "2026-03-01T10:00:00Z",
+        &["checkout", "-q", "-b", "feature/ACME-7-login"],
+    );
+    commit_on(&path, "b.txt", "b\n", "2026-03-02");
+    let (script, log) = logging_git(temporary.path());
+    let script = script.to_str().unwrap().to_string();
+
+    let calls = |extra: &[&str]| -> String {
+        let _ = fs::remove_file(&log);
+        let mut arguments = vec!["--dir", path.as_str()];
+        arguments.extend(extra);
+        let mut command = Command::new(binary());
+        command.env("WORKSTATS_GIT", &script);
+        let history = temporary.path().join("pi-sessions");
+        pi_session(&history, "s1", Path::new(&path), "claude-opus-5", 10);
+        let history = format!("pi={}", history.display());
+        let config = temporary.path().join("missing-config.json");
+        command.args(arguments).args([
+            "--author",
+            "fixture@example.com",
+            "--no-cache",
+            "--no-progress",
+            "--no-default-events",
+            "--no-update-check",
+            "--provider",
+            "pi",
+            "--history",
+            history.as_str(),
+            "--config",
+            config.to_str().unwrap(),
+            "--month",
+            "2026-03",
+            "--format",
+            "json",
+        ]);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::read_to_string(&log).unwrap_or_default()
+    };
+
+    // The questions only the branch enrichment asks.
+    let asks_for_branches = |log: &str| {
+        log.contains("for-each-ref") || log.contains(" -g ") || log.contains("--source")
+    };
+    let plain = calls(&[]);
+    assert!(plain.contains("log"), "Git was read at all: {plain}");
+    assert!(!asks_for_branches(&plain), "{plain}");
+    let by_repo = calls(&["--group-by", "repo,day"]);
+    assert!(!asks_for_branches(&by_repo), "{by_repo}");
+    for grouping in ["branch", "issue", "feature"] {
+        let grouped = calls(&["--group-by", grouping]);
+        assert!(asks_for_branches(&grouped), "{grouping}: {grouped}");
+    }
+}
+
+#[test]
+fn a_detached_head_recorded_by_the_provider_leaves_the_branch_to_the_checkout() {
+    let temporary = tempdir().unwrap();
+    let path = repository_on_main(temporary.path(), "project");
+    commit_on(&path, "a.txt", "a\n", "2026-02-27");
+    git_at(
+        &path,
+        "2026-03-01T10:00:00Z",
+        &["checkout", "-q", "-b", "feature/ACME-7-login"],
+    );
+    let history = temporary.path().join("claude");
+    fs::create_dir_all(history.join("project")).unwrap();
+    let line = |kind: &str, time: &str| {
+        serde_json::json!({
+            "type": kind, "timestamp": format!("2026-03-02T{time}Z"), "cwd": path,
+            "sessionId": "c1", "gitBranch": "HEAD",
+            "message": {"model": "claude-x", "content": "go"}
+        })
+        .to_string()
+    };
+    fs::write(
+        history.join("project/session.jsonl"),
+        [line("user", "09:00:00"), line("assistant", "09:01:00")].join("\n"),
+    )
+    .unwrap();
+    let history = format!("claude={}", history.display());
+    let config = temporary.path().join("missing-config.json");
+    let report = json_stdout(&run(&[
+        "--dir",
+        &path,
+        "--author",
+        "fixture@example.com",
+        "--no-cache",
+        "--no-progress",
+        "--no-default-events",
+        "--no-update-check",
+        "--provider",
+        "claude",
+        "--history",
+        &history,
+        "--config",
+        config.to_str().unwrap(),
+        "--month",
+        "2026-03",
+        "--format",
+        "json",
+        "--group-by",
+        "branch",
+    ]));
+    let rows = report["rows"].as_array().unwrap();
+    let branches: Vec<&str> = rows
+        .iter()
+        .map(|row| row["key"]["branch"].as_str().unwrap())
+        .collect();
+    assert!(!branches.contains(&"HEAD"), "{branches:?}");
+    assert!(branches.contains(&"feature/ACME-7-login"), "{branches:?}");
+}
