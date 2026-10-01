@@ -1,3 +1,126 @@
 # Branches and pull requests
 
-Coming in this release.
+`workstats` can say which branch, issue and feature work belonged to. The
+`branch`, `issue` and `feature` dimensions work with `--group-by` like any
+other:
+
+```sh
+workstats --month last --group-by issue
+workstats --week current --group-by feature,repo
+workstats --month 2026-03 --group-by branch
+```
+
+- `branch` is the branch name, or `—` when none is known.
+- `issue` is the issue key the branch names (`ACME-123`, `#45`), or `—`.
+- `feature` is the issue key when there is one, otherwise the branch with its
+  prefixes stripped (`feature/login-page` is `login-page`), or `—`. The
+  integration branch is `main` (or whatever it is called), not a dash.
+
+Branch names can carry client or ticket names. They are stored in the cache and
+printed in reports; review a report before sharing it
+([privacy](privacy.md#branch-names-are-read-cached-and-reported)).
+
+## Where the branch comes from
+
+**Sessions.** In order:
+
+1. A branch the provider recorded (`recorded`), when it writes one. A session that moved between branches keeps one entry per change, so
+   time is split at the moment of the switch.
+2. Otherwise the checkout's HEAD reflog (`reflog`): the branch it was on at the
+   moment, read from the `checkout: moving from X to Y` entries. Before the
+   first entry on record, it was on the branch that entry left.
+3. Otherwise, for a session after the checkout's last switch (or one whose
+   checkout never switched), the branch that is checked out now (`head`).
+4. Otherwise nothing: the session shows `—`.
+
+Every worktree has its own HEAD reflog, and a session's working directory
+identifies exactly one checkout, so a session in a worktree gets that
+worktree's branch.
+
+**Commits.** The commit's author date is what places it in time.
+
+1. Find the integration branch. It is the first of `branches.integration`
+   (default `main`, `master`, `trunk`, `develop`) that exists as a local
+   branch; failing that, the local branch that `refs/remotes/origin/HEAD`
+   points at. That ref is read as local metadata: there is no fetch. If there
+   is none, every branch commit counts as unique to its branch.
+2. A commit reachable from exactly one local branch other than the integration
+   branch is on that branch (`unique`).
+3. A commit only on the integration branch has usually been merged. The HEAD
+   reflogs of the repository's checkouts known to the run (the scanned
+   directory, and the checkouts sessions ran in) say which branches were out at
+   the commit's time. If exactly one branch other than the integration branch
+   was, the commit is on it (`reflog`). That is how a merged and deleted
+   branch is recovered.
+4. If several were, or none was, the commit is on the integration branch
+   (`integration`). Parallel worktrees on different branches make a commit
+   ambiguous, and `integration` is the honest answer.
+5. A commit only a detached HEAD holds has no branch.
+
+## Configuration
+
+```json
+{
+  "branches": { "integration": ["main", "trunk"] },
+  "issues": {
+    "patterns": [
+      "(?i)\\bgh-(?P<num>\\d+)",
+      "(?P<key>[A-Z][A-Z0-9]+-\\d+)",
+      "#(?P<num>\\d+)",
+      "^(?P<num>\\d+)-"
+    ],
+    "projects": ["ACME", "PLAT"],
+    "strip_prefixes": ["feature/", "feat/", "fix/", "bugfix/", "hotfix/", "chore/", "refactor/", "users/*/"],
+    "fallback": "slug"
+  }
+}
+```
+
+Everything is optional. The `issues` values above are the defaults, except
+`projects`, which is empty.
+
+- `branches.integration`: a branch name or a list of names, in order of
+  preference.
+- `issues.patterns`: regular expressions ([`regex` syntax](https://docs.rs/regex/latest/regex/#syntax))
+  applied to the branch name in order; the first that matches wins. Each needs a
+  `key` group or a `num` group. A `key` is upper-cased (`acme-1` is `ACME-1`);
+  a `num` becomes `#N` (`GH-12` and `gh-012` are `#12`). Naming `patterns`
+  replaces the defaults.
+- `issues.projects`: adds a case-insensitive `\b(ACME|PLAT)-\d+` matcher after
+  the patterns, so `acme-123-login` is `ACME-123`. Without it, Jira-style keys
+  are matched case-sensitively so that `release-2` is not an issue.
+- `issues.strip_prefixes`: removed from the start of the branch to make its
+  slug, repeatedly (`users/ada/feature/login` is `login`). `*` stands for one
+  path segment. Naming it replaces the defaults.
+- `issues.fallback`: `"slug"` (default), or `"branch"` to use the whole branch
+  name for a feature with no issue.
+
+Limits: at most 32 patterns, projects and prefixes, each at most 256 bytes. An
+invalid pattern, an unknown key or a wrongly typed value stops the run with an
+error naming the key — a misspelled rule set that matched nothing would
+report every branch as having no issue.
+
+Only the branch name is read for issue keys. Commit subjects are not.
+
+## Limits worth knowing
+
+- **Stacked branches.** When a commit is reachable from several non-integration
+  branches, Git's `--source` names the one it walked first, which is not always
+  the one you would pick.
+- **Squash merges.** A squash-merged branch leaves no merge commit, and its
+  original commits are gone from the integration branch. What is left are the
+  squash commit, which is attributed like any commit on the integration
+  branch, and the reflog, which can recover the branch if it has not expired.
+- **Reflogs expire** (about 90 days by default), so old work on a deleted
+  branch reads as the integration branch.
+- **Tags checked out by name** look like branches in the reflog. Bare commit
+  ids and `HEAD~n` are recognised as a detached HEAD.
+- **The integration branch is one branch.** A repository with separate long-lived
+  `develop` and `main` branches names only one of them as the integration branch.
+- **Process cost.** Per checkout, at most three `git` processes: refs, the
+  `--source` pass and the reflog. Nothing is run for a session that recorded
+  its branch or whose working directory is no longer a checkout.
+
+## The `branch` and `pr` commands
+
+_Coming in this release._

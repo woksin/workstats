@@ -83,7 +83,32 @@ exactly what is read, what is stored, and what is never read.
 
 ### Branch names are read, cached and reported
 
-_Coming in this release._
+**From Git.** To say which branch a commit or a session belongs to,
+`workstats` reads local ref names and nothing else, with no network call and
+no fetch:
+
+- the names of the local branches, which branch is checked out, and the *name*
+  `refs/remotes/origin/HEAD` points at (`git for-each-ref`);
+- the local branch each recent commit not on the integration branch is
+  reachable from (`git log --source`, asking for the hash and the ref name
+  only, over the window widened as the commit listing is, and for every author:
+  other people's hashes are matched against yours and nothing else is kept);
+- the checkout's HEAD reflog, filtered by Git itself with
+  `--grep-reflog='^checkout: moving from '` so that only branch switches come
+  back. The other reflog entries hold your commit messages (`commit: <subject>`)
+  and are never delivered to `workstats`; the switch entries hold two ref
+  names.
+
+At most three `git` processes run per checkout. Commit messages, bodies and
+file contents are not read for this.
+
+**What is stored and shown.** Branch names are cached with the sessions they
+belong to, and reported under the `branch`, `issue` and `feature` groupings.
+Branch names can carry client or ticket names, so review a report before
+sharing it. Issue keys are cut from the branch name only. See
+[Branches and pull requests](branches.md).
+
+_The fields read from AI tools' own records are described with the providers._
 
 ### Pull-request references
 
