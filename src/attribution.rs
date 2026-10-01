@@ -8,8 +8,6 @@ use crate::issues;
 
 /// What an engagement can be matched on: the repository, the checkout and the
 /// branch the work happened on.
-// `repo_id` and `cwd` are read by the engagement matcher once it lands.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Ctx<'a> {
     pub repo_id: &'a str,

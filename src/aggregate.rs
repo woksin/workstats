@@ -86,7 +86,6 @@ pub struct BuiltReport {
 /// is what timesheets, branch reports and insights are computed over, so they
 /// sum the same pieces the report did and cannot double count.
 // Consumed by the timesheet, branch and insights work packages.
-#[allow(dead_code)]
 pub struct Timeline {
     /// Non-overlapping human pieces, each labelled by the nearest signal. The
     /// piece's `session_id` is its work block (`work-block:N`).
