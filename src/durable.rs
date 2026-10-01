@@ -7,7 +7,6 @@
 //! been submitted, so it (and the small state files beside it) is written with
 //! the file synced before the rename and the directory synced after it.
 
-use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -29,7 +28,7 @@ fn sync_parent(path: &Path) {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    if let Ok(directory) = File::open(parent) {
+    if let Ok(directory) = std::fs::File::open(parent) {
         let _ = directory.sync_all();
     }
 }
