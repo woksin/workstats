@@ -84,19 +84,22 @@ fn valid_name(name: &str) -> bool {
 /// free of control characters, not `HEAD` or `@` (what a detached checkout
 /// reports), and not a name Git forbids. Branch names obey Git's ref rules,
 /// which exclude spaces, `~ ^ : ? * [ \`, `..`, `@{`, a leading `-` and a
-/// trailing `/`, `.` or `.lock`, so a name that breaks them is not a branch.
-/// All-digit and all-hex names (ticket numbers, `deadbeef`) are legal branch
-/// names and are kept.
+/// trailing `/`, `.` or `.lock`, and per `/`-separated component an empty
+/// component or one that starts with `.` or ends in `.lock`, so a name that
+/// breaks them is not a branch. All-digit and all-hex names (ticket numbers,
+/// `deadbeef`) are legal branch names and are kept.
 pub(crate) fn recordable_branch(name: &str) -> bool {
     valid_name(name)
         && name != "HEAD"
         && name != "@"
         && !name.starts_with('-')
         && !name.ends_with(['/', '.'])
-        && !name.ends_with(".lock")
         && !name.contains("..")
         && !name.contains("@{")
         && !name.contains(['~', '^', ':', '?', '*', '[', '\\', ' '])
+        && name.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
 }
 
 /// Whether a reflog destination reads as a branch rather than a detached HEAD.
@@ -892,6 +895,10 @@ mod tests {
 
     #[test]
     fn recorded_branch_names_reject_what_git_forbids_but_keep_digits_and_hex() {
+        for component_rule in ["/a", ".a", "a//b", "a/.b", "a.lock/b", "a/b.lock"] {
+            assert!(!recordable_branch(component_rule), "{component_rule}");
+        }
+        assert!(recordable_branch("feat/ACME-1.2"));
         for name in [
             "main",
             "feat/x",

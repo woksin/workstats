@@ -49,7 +49,7 @@
       "format": "date-time"
     },
     "branch": {
-      "description": "The branch the work was on. Stored in the cache and shown in branch groupings, so it must be a plain name; a value that is longer than 256 bytes or contains control characters is ignored.",
+      "description": "The branch the work was on. Stored in the cache and shown in branch groupings, so it must be a plain name; a value that is longer than 256 bytes or contains control characters is ignored, and so is `HEAD`, `@` or a name Git does not allow for a branch (spaces, ~ ^ : ? * [ \\, '..', '@{', a leading '-', a trailing '/', '.' or '.lock', or a '/'-separated part that is empty, starts with '.' or ends in '.lock').",
       "type": "string",
       "minLength": 1,
       "maxLength": 256,

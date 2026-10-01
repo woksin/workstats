@@ -110,9 +110,10 @@ Only the branch name is read for issue keys. Commit subjects are not.
   branches, Git's `--source` names the one it walked first, which is not always
   the one you would pick.
 - **Squash merges.** A squash-merged branch leaves no merge commit, and its
-  original commits are gone from the integration branch. What is left are the
+  original commits are gone from the integration branch. What is left is the
   squash commit, which is attributed like any commit on the integration
-  branch, and the reflog, which can recover the branch if it has not expired.
+  branch. The time spent on the feature is still attributed through the
+  sessions' recorded branch, or their reflog branch while the reflog keeps it.
 - **Reflogs expire.** Entries are dropped by age when Git runs `gc`, and
   switches to branches nothing reaches any more expire after about 30 days. A
   session's reflog branch is therefore trusted back only 30 days from now
@@ -124,7 +125,9 @@ Only the branch name is read for issue keys. Commit subjects are not.
   branch.
 - **A provider that records `HEAD`** for a detached checkout (or `@`, or a name
   Git forbids) is read as having recorded no branch, so the checkout's reflog
-  can still fill it in. Digit-only and hex-only names such as ticket numbers
+  can still fill it in. Git's rules are checked per `/`-separated part too: an
+  empty part, or one starting with `.` or ending in `.lock`, is not a branch.
+  Digit-only and hex-only names such as ticket numbers
   are legal branch names and are kept.
 - **Tags checked out by name** look like branches in the reflog. Bare commit
   ids and `HEAD~n` are recognised as a detached HEAD, which also means a
