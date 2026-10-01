@@ -444,6 +444,11 @@ impl BranchTracker {
             self.refused += 1;
             return;
         };
+        // `HEAD` and a bare commit id are what a detached checkout records, not
+        // a branch. Skipped without a note, so the reflog can fill the gap.
+        if !crate::branches::plausible_branch(branch) {
+            return;
+        }
         if self.marks.last().is_some_and(|last| last.branch == branch) {
             return;
         }
@@ -487,6 +492,7 @@ impl BranchTracker {
 pub(crate) fn whole_session_branch(branch: Option<&str>) -> Vec<BranchMark> {
     branch
         .and_then(safe_branch)
+        .filter(|branch| crate::branches::plausible_branch(branch))
         .map(|branch| {
             vec![BranchMark {
                 from: None,
@@ -977,6 +983,30 @@ mod tests {
         assert_eq!(2, marks.len());
         assert_eq!(None, marks[0].from);
         assert_eq!(Some(utc("2026-01-01T00:10:00Z")), marks[1].from);
+    }
+
+    #[test]
+    fn a_detached_checkout_is_not_a_recorded_branch() {
+        let mut tracker = BranchTracker::default();
+        tracker.observe(utc("2026-01-01T00:01:00Z"), "HEAD");
+        tracker.observe(
+            utc("2026-01-01T00:02:00Z"),
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        tracker.observe(utc("2026-01-01T00:03:00Z"), &"ab".repeat(32));
+        let mut diagnostics = Diagnostics::default();
+        let marks = tracker.finish(&mut diagnostics, Path::new("x"));
+        assert!(marks.is_empty(), "{marks:?}");
+        // Not a refusal worth a note: the checkout simply had no branch.
+        assert_eq!(0, diagnostics.note_count);
+        assert!(whole_session_branch(Some("HEAD")).is_empty());
+        assert_eq!(1, whole_session_branch(Some("main")).len());
+
+        let mut tracker = BranchTracker::default();
+        tracker.observe(utc("2026-01-01T00:01:00Z"), "main");
+        tracker.observe(utc("2026-01-01T00:02:00Z"), "HEAD");
+        let marks = tracker.finish(&mut Diagnostics::default(), Path::new("x"));
+        assert_eq!(1, marks.len());
     }
 
     #[test]

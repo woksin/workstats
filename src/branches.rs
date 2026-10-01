@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use anyhow::{Result, bail};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::Value;
 
 use crate::git::{COMMITTER_DATE_SKEW, git_executable};
@@ -87,7 +87,11 @@ fn valid_name(name: &str) -> bool {
 /// `~ ^ : ? * [ \`, spaces, `..` and `@{`, so those are told apart for free; a
 /// bare commit id is told apart by its shape. A tag checked out by name cannot
 /// be, and reads as a branch: the one blur this rule accepts.
-fn plausible_branch(name: &str) -> bool {
+///
+/// The provider readers apply the same rule to the branch a transcript records
+/// (`gitBranch` is `HEAD` for a detached checkout), so those sessions stay
+/// open to the reflog fallback.
+pub(crate) fn plausible_branch(name: &str) -> bool {
     let detached_id = name.len() >= 7 && name.chars().all(|c| c.is_ascii_hexdigit());
     valid_name(name)
         && !detached_id
@@ -269,6 +273,11 @@ fn parse_refs(output: &str, names: &[String]) -> Refs {
     refs
 }
 
+/// How far before the oldest retained switch the branch it left is still
+/// believed: Git's default reflog expiry, so an expired switch cannot sit
+/// inside it.
+const EXPIRY_GRACE: Duration = Duration::days(90);
+
 /// One branch switch of one checkout. `None` is a detached HEAD.
 #[derive(Debug)]
 struct Switch {
@@ -319,12 +328,17 @@ fn parse_reflog(output: &str) -> Reflog {
 
 impl Reflog {
     /// The branch the checkout was on at `at`: the destination of the last
-    /// switch by then, or, before the first switch on record, the branch that
-    /// switch left. `None` when detached or when the reflog is empty.
+    /// switch by then. Before the first switch on record, the branch that
+    /// switch left, but only for `EXPIRY_GRACE` before it: reflogs expire, so
+    /// the switches before the oldest one kept are invisible, and how long the
+    /// checkout had been on the branch it left is not known. Older than that
+    /// reads as unknown. `None` also when detached or when the reflog is empty.
     fn branch_at(&self, at: DateTime<Utc>) -> Option<&str> {
         let first = self.switches.first()?;
         if at < first.at {
-            return first.from.as_deref();
+            return (first.at - at <= EXPIRY_GRACE)
+                .then_some(first.from.as_deref())
+                .flatten();
         }
         let passed = self.switches.partition_point(|switch| switch.at <= at);
         self.switches[passed - 1].to.as_deref()
@@ -621,10 +635,19 @@ fn enrich_with(
             continue;
         }
         // The commit sits on the integration branch now, so the branch it was
-        // made on has to come from where the checkouts were then. If exactly
-        // one branch other than the integration branch was checked out
-        // anywhere, that is the one; two or none cannot be told apart from
-        // work done on the integration branch itself.
+        // made on has to come from where the checkouts were then.
+        //
+        // The checkout the commit was found in comes first. If it was on the
+        // integration branch at that moment, the commit stays there: a hotfix
+        // made on `main` while a worktree had a feature branch out is not the
+        // feature's. That checkout is on its current branch after its last
+        // recorded switch (or if it never switched), as for a session.
+        // Otherwise, or when its reflog cannot say (no entry that old, or a
+        // detached HEAD), the checkouts vote: if exactly one branch other than
+        // the integration branch was checked out anywhere, that is the one;
+        // two or none cannot be told apart from work done on the integration
+        // branch itself.
+        let own = context.reflog(root);
         let mut timelines = Vec::new();
         for sibling in siblings.get(&common).into_iter().flatten() {
             if let Some(reflog) = context.reflog(sibling) {
@@ -633,11 +656,23 @@ fn enrich_with(
         }
         for index in on_integration {
             let commit = &mut *commits[index];
-            let candidates: BTreeSet<&str> = timelines
-                .iter()
-                .filter_map(|reflog| reflog.branch_at(commit.timestamp))
-                .filter(|branch| *branch != integration)
-                .collect();
+            let on_integration_itself = own.as_ref().is_some_and(|reflog| {
+                let branch = if reflog.is_after_last(commit.timestamp) {
+                    refs.current.as_deref()
+                } else {
+                    reflog.branch_at(commit.timestamp)
+                };
+                branch == Some(integration)
+            });
+            let candidates: BTreeSet<&str> = if on_integration_itself {
+                BTreeSet::new()
+            } else {
+                timelines
+                    .iter()
+                    .filter_map(|reflog| reflog.branch_at(commit.timestamp))
+                    .filter(|branch| *branch != integration)
+                    .collect()
+            };
             if let [only] = candidates.iter().collect::<Vec<_>>()[..] {
                 commit.branch = Some((*only).to_string());
                 commit.branch_source = BranchSource::Reflog;
@@ -1113,6 +1148,75 @@ mod tests {
         // only checkout on another branch, but with no switch on record it has
         // no vote, and the commit falls back to the integration branch.
         assert_eq!(BranchSource::Integration, commits[0].branch_source);
+    }
+
+    #[test]
+    fn a_commit_made_while_its_own_checkout_was_on_main_stays_on_main() {
+        let repo = Repo::new();
+        repo.commit("2026-03-01T08:30:00Z", "base");
+        let worktree = repo.path.with_file_name("feature");
+        repo.run(
+            "2026-03-01T09:00:00Z",
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        repo.git(
+            &worktree,
+            "2026-03-01T09:05:00Z",
+            &["checkout", "-q", "-b", "feat/x"],
+        );
+        // A hotfix straight on main while the worktree has a feature out.
+        let hotfix = repo.commit("2026-03-01T10:00:00Z", "hotfix");
+        let mut commits = vec![commit_record(&repo.path, &hotfix, "2026-03-01T10:00:00Z")];
+        // The worktree is known to the run through a session in it.
+        let mut sessions = vec![session(
+            &worktree,
+            "2026-03-01T10:00:00Z",
+            "2026-03-01T10:10:00Z",
+        )];
+        enrich_commits(&mut commits, &mut sessions);
+        assert_eq!(Some("main"), commits[0].branch.as_deref());
+        assert_eq!(BranchSource::Integration, commits[0].branch_source);
+    }
+
+    #[test]
+    fn work_older_than_the_reflog_is_unknown_rather_than_the_first_branch_left() {
+        let switch = Utc.timestamp_opt(200 * 86_400, 0).unwrap();
+        let reflog = Reflog {
+            switches: vec![Switch {
+                at: switch,
+                from: Some("feat/old".to_string()),
+                to: Some("main".to_string()),
+            }],
+        };
+        // Just before the oldest switch kept: still on the branch it left.
+        assert_eq!(
+            Some("feat/old"),
+            reflog.branch_at(switch - Duration::days(30))
+        );
+        assert_eq!(Some("feat/old"), reflog.branch_at(switch - EXPIRY_GRACE));
+        // Further back than any expired switch could hide: unknown.
+        assert_eq!(
+            None,
+            reflog.branch_at(switch - EXPIRY_GRACE - Duration::seconds(1))
+        );
+        assert_eq!(None, reflog.branch_at(switch - Duration::days(150)));
+        assert_eq!(Some("main"), reflog.branch_at(switch));
+
+        // So a session that old gets no marks from the reflog.
+        let (marks, source) = session_marks(
+            &reflog,
+            Some("main"),
+            switch - Duration::days(150),
+            switch - Duration::days(149),
+        );
+        assert!(marks.is_empty());
+        assert_eq!(BranchSource::None, source);
     }
 
     #[test]
