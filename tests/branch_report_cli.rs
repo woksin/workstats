@@ -296,12 +296,12 @@ fn describe_adds_commit_subjects_and_session_titles_only_when_asked() {
     // record that must never be read as a title.
     let path = fixture.history.trim_start_matches("claude=").to_string() + "/project/feature.jsonl";
     let mut text = fs::read_to_string(&path).unwrap();
-    text.push_str("\n");
+    text.push('\n');
     text.push_str(
         &serde_json::json!({"type": "ai-title", "sessionId": "feat1", "aiTitle": "Add the ACME widget"})
             .to_string(),
     );
-    text.push_str("\n");
+    text.push('\n');
     text.push_str(
         &serde_json::json!({"type": "last-prompt", "sessionId": "feat1", "lastPrompt": "SECRET PROMPT TEXT"})
             .to_string(),
