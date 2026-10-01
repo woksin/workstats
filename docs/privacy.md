@@ -253,6 +253,33 @@ a path on your machine, so nothing scans it as one.
 
 ### The `now` snapshot
 
-_Coming in this release._
+`workstats now` keeps its last result in `now.json`, beside the index
+(`WORKSTATS_NOW_CACHE` overrides the path), so a prompt can print it without
+scanning anything. It is written with owner-only permissions, replaced
+atomically, and holds:
+
+- the figures: today's human and agent time, prompts, commits and sessions, the
+  week's human time, and the list value of today, the week and (only when a
+  template, JSON output or a month cap asks for it) the month;
+- the goals status derived from them: the week's share of its target, the
+  highest cap share, and short warnings such as `⚠ claude 88%`;
+- for the most recent foreground session: its provider, **repository label and
+  branch name**, and when it was last seen;
+- a hash of the flags, working directory and config file stamp the figures were
+  computed for (not the flags themselves), the local date and the time.
+
+It holds no prompt text, session id, file path or commit message. The
+repository label and branch name are as sensitive as they are in a report
+grouped by branch (see above): a branch such as `acme/ACME-123-login` is stored
+in the clear. A refresh that runs in the background (`--no-wait`) is this same
+command started detached; it reads exactly what a foreground run reads and
+makes no network call. While it runs it holds an empty `now.lock` beside the
+snapshot; a lock older than two minutes is ignored.
+
+`--rebuild-cache` on any command deletes `now.json`. Deleting it by hand is
+always safe; the next call recomputes it.
+
+The `goals` config block is read for the goals section and for `now`; it holds
+numbers only and nothing from your history.
 
 See [SECURITY.md](../SECURITY.md) for private vulnerability reporting.

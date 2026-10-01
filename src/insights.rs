@@ -1783,15 +1783,16 @@ fn ranking_block(blocks: &mut Vec<Block>, title: &str, first: &str, ranking: &Ra
     }
 }
 
-/// The goals section of a digest. The goal report fills in with the goals
-/// work; until it has figures the digest says where to find them.
-fn goal_blocks(_goals: &GoalReport) -> Vec<Block> {
-    vec![
-        Block::Section("Goals".to_string()),
-        Block::Paragraph(
-            "Goals are configured for this window; the progress figures are in the `goals` block of `--format json` and in the plain report.".to_string(),
-        ),
-    ]
+/// The goals section of a digest: hours per week against the target and
+/// each cap's share, the same lines the plain report prints.
+fn goal_blocks(goals: &GoalReport) -> Vec<Block> {
+    let lines = goals.lines();
+    let body = if lines.is_empty() {
+        Block::Paragraph("No goal figures fall in this window.".to_string())
+    } else {
+        Block::List(lines)
+    };
+    vec![Block::Section("Goals".to_string()), body]
 }
 
 #[allow(clippy::too_many_arguments)]
