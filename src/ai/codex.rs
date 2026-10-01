@@ -371,6 +371,8 @@ pub fn parse_codex_file(
             is_subagent,
             approximate_cwd,
             version: None,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
         });
     }
     result

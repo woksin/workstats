@@ -338,6 +338,8 @@ pub fn parse_copilot_file(
             is_subagent: false,
             approximate_cwd,
             version: version.clone(),
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
         });
     }
     for (subagent_id, subagent_cwd, interval) in subagent_intervals {
@@ -359,6 +361,8 @@ pub fn parse_copilot_file(
             is_subagent: true,
             approximate_cwd,
             version: version.clone(),
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
         });
     }
     report_copilot_repository_disagreement(&mut result, store_entry, &base_id, path);

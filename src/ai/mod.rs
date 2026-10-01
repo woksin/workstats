@@ -520,6 +520,8 @@ mod tests {
             is_subagent: false,
             approximate_cwd: false,
             version: None,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
         };
         let (minimum, maximum) = file_time_range(std::slice::from_ref(&session));
         assert_eq!(parse_timestamp("2026-01-01T23:00:00Z"), minimum);

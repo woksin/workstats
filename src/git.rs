@@ -11,7 +11,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use tempfile::tempfile;
 
 use crate::classify::{CategoryTally, classify};
-use crate::model::{Authorship, Diagnostics, GitCommit};
+use crate::model::{Authorship, BranchSource, Diagnostics, GitCommit};
 use crate::paths::{PathResolver, disambiguated_repository_label};
 
 pub const DEFAULT_IGNORES: &[&str] = &[
@@ -761,6 +761,8 @@ fn parse_git_log(
                     ignored_deletions: pending.ignored_deletions,
                     categories: pending.categories,
                     authorship: pending.authorship,
+                    branch: None,
+                    branch_source: BranchSource::None,
                 });
             }
         };

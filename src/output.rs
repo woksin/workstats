@@ -2156,6 +2156,8 @@ mod tests {
                 cache: None,
             },
             comparison: None,
+            daily: None,
+            goals: None,
         }
     }
 

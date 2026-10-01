@@ -1,12 +1,13 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 
+use crate::attribution::{self, Ctx};
 use crate::classify::{CategoryTally, ShapeTally, active_registry, change_shape};
 use crate::model::{
-    CompositionEntry, GitCommit, HumanSignal, HumanTimeExplanation, Interval, Methodology,
-    Observed, ReportRow, Session, ShapeEntry, Summary, TokenUsage,
+    CompositionEntry, DayFigures, GitCommit, HumanSignal, HumanTimeExplanation, Interval,
+    Methodology, Observed, ReportRow, Session, ShapeEntry, Summary, TokenUsage,
 };
 use crate::timeutil::{
     build_session_intervals, calculate_human_time, calendar_days, clip_interval, local_date,
@@ -14,7 +15,18 @@ use crate::timeutil::{
 };
 
 pub const DIMENSIONS: &[&str] = &[
-    "repo", "root", "cwd", "provider", "model", "day", "week", "month",
+    "repo",
+    "root",
+    "cwd",
+    "provider",
+    "model",
+    "day",
+    "week",
+    "month",
+    "branch",
+    "issue",
+    "feature",
+    "engagement",
 ];
 
 type SessionKey = (String, String);
@@ -65,6 +77,26 @@ pub struct BuiltReport {
     pub summary: Summary,
     pub group_by: Vec<String>,
     pub rows: Vec<ReportRow>,
+    /// Per local day, only when asked for (HTML, the explorer, `--daily`).
+    pub daily: Option<Vec<DayFigures>>,
+    // Read by `report::collect` in the next commit.
+    #[allow(dead_code)]
+    pub timeline: Timeline,
+}
+
+/// The clipped, filtered vectors the report was built from. Not serialized: it
+/// is what timesheets, branch reports and insights are computed over, so they
+/// sum the same pieces the report did and cannot double count.
+// Consumed by the timesheet, branch and insights work packages.
+#[allow(dead_code)]
+pub struct Timeline {
+    /// Non-overlapping human pieces, each labelled by the nearest signal. The
+    /// piece's `session_id` is its work block (`work-block:N`).
+    pub human_intervals: Vec<Interval>,
+    /// The effective human signals inside the window.
+    pub human_signals: Vec<HumanSignal>,
+    /// Agent intervals inside the window; they may overlap one another.
+    pub ai_intervals: Vec<Interval>,
 }
 
 fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
@@ -83,6 +115,7 @@ fn foreground_human_signals(sessions: &[Session]) -> Vec<HumanSignal> {
                 root: session.root.clone(),
                 kind: kind.to_string(),
                 model: model.to_string(),
+                branch: session.branch_at(timestamp).map(str::to_string),
             });
         };
         for point in &session.human_points {
@@ -157,6 +190,7 @@ pub fn build_report(
         human_idle,
         review_credit,
         false,
+        false,
     )
 }
 
@@ -172,6 +206,7 @@ pub fn build_report_with_human_time_explanation(
     human_idle: Duration,
     review_credit: Duration,
     explain_human_time: bool,
+    daily: bool,
 ) -> BuiltReport {
     let intervals: Vec<_> = sessions
         .iter()
@@ -191,6 +226,7 @@ pub fn build_report_with_human_time_explanation(
         .flat_map(|session| {
             session.token_events.iter().map(move |event| TokenRecord {
                 timestamp: event.timestamp,
+                branch: session.branch_at(event.timestamp).map(str::to_string),
                 repo: session.repo.clone(),
                 repo_id: session.repo_id.clone(),
                 root: session.root.clone(),
@@ -276,7 +312,7 @@ pub fn build_report_with_human_time_explanation(
     }
 
     for signal in &filtered_human_signals {
-        let values = signal_values(signal);
+        let values = signal_values(signal, dimensions);
         let (group_key, key) = dimension_keys(&values, &signal.repo_id, dimensions);
         let row = bucket(&mut buckets, group_key, key, dimensions);
         row.human_signals.insert((
@@ -293,6 +329,7 @@ pub fn build_report_with_human_time_explanation(
         .collect();
     let mut eligible_session_keys = active_session_keys.clone();
     let mut single_point_dates = HashSet::new();
+    let mut single_point_sessions: Vec<(NaiveDate, SessionKey)> = Vec::new();
     for session in sessions {
         let session_key = (session.provider.clone(), session.session_id.clone());
         let Some(first) = session.first_seen() else {
@@ -310,7 +347,7 @@ pub fn build_report_with_human_time_explanation(
             .first()
             .map(|point| point.model.clone())
             .unwrap_or_else(|| "unknown".to_string());
-        let values = session_values(session, &model, first);
+        let values = session_values(session, &model, first, dimensions);
         let (group_key, key) = dimension_keys(&values, &session.repo_id, dimensions);
         let row = bucket(&mut buckets, group_key, key, dimensions);
         row.sessions.insert(session_key.clone());
@@ -323,6 +360,9 @@ pub fn build_report_with_human_time_explanation(
         row.models.insert(model);
         let day = local_date(first);
         row.active_days.insert(day.clone());
+        if let Ok(date) = NaiveDate::parse_from_str(&day, "%Y-%m-%d") {
+            single_point_sessions.push((date, session_key_for_daily(session)));
+        }
         single_point_dates.insert(day);
         include_time(row, first, first);
     }
@@ -664,6 +704,16 @@ pub fn build_report_with_human_time_explanation(
             .map(|token| (token.repo_id.clone(), token.cwd.clone())),
     );
 
+    let daily_figures = daily.then(|| {
+        compute_daily_figures(
+            &human_intervals,
+            &intervals,
+            &filtered_human_signals,
+            &filtered_commits,
+            &single_point_sessions,
+        )
+    });
+
     BuiltReport {
         methodology: Methodology {
             human_work: "human prompts, foreground session boundaries, and authored commits clustered into non-overlapping involvement blocks",
@@ -756,7 +806,80 @@ pub fn build_report_with_human_time_explanation(
         },
         group_by: dimensions.to_vec(),
         rows,
+        daily: daily_figures,
+        timeline: Timeline {
+            human_intervals,
+            human_signals: filtered_human_signals,
+            ai_intervals: intervals,
+        },
     }
+}
+
+/// Human and agent figures per local calendar day. Days with nothing on them
+/// are left out; whoever draws a calendar fills them in.
+fn compute_daily_figures(
+    human_intervals: &[Interval],
+    ai_intervals: &[Interval],
+    signals: &[HumanSignal],
+    commits: &[&GitCommit],
+    single_point_sessions: &[(NaiveDate, SessionKey)],
+) -> Vec<DayFigures> {
+    #[derive(Default)]
+    struct Day {
+        human: f64,
+        agent: Vec<Interval>,
+        prompts: HashSet<(DateTime<Utc>, String)>,
+        commits: HashSet<CommitIdentity>,
+        sessions: HashSet<SessionKey>,
+    }
+    let mut days: BTreeMap<NaiveDate, Day> = BTreeMap::new();
+    let parse = |label: &str| NaiveDate::parse_from_str(label, "%Y-%m-%d").ok();
+    for interval in human_intervals {
+        for (label, piece) in split_interval(interval, "day") {
+            if let Some(date) = parse(&label) {
+                days.entry(date).or_default().human += piece.seconds();
+            }
+        }
+    }
+    for interval in ai_intervals {
+        for (label, piece) in split_interval(interval, "day") {
+            if let Some(date) = parse(&label) {
+                let day = days.entry(date).or_default();
+                day.sessions
+                    .insert((piece.provider.clone(), piece.session_id.clone()));
+                day.agent.push(piece);
+            }
+        }
+    }
+    for signal in signals.iter().filter(|s| s.kind.ends_with("_prompt")) {
+        if let Some(date) = parse(&local_date(signal.timestamp)) {
+            days.entry(date)
+                .or_default()
+                .prompts
+                .insert((signal.timestamp, signal.session_id.clone()));
+        }
+    }
+    for commit in commits {
+        if let Some(date) = parse(&local_date(commit.timestamp)) {
+            days.entry(date)
+                .or_default()
+                .commits
+                .insert((commit.repo_member_id.clone(), commit.sha.clone()));
+        }
+    }
+    for (date, key) in single_point_sessions {
+        days.entry(*date).or_default().sessions.insert(key.clone());
+    }
+    days.into_iter()
+        .map(|(date, day)| DayFigures {
+            date,
+            human_seconds: round3(day.human),
+            agent_wall_seconds: round3(union_seconds(&day.agent)),
+            prompts: day.prompts.len(),
+            commits: day.commits.len(),
+            sessions: day.sessions.len(),
+        })
+        .collect()
 }
 
 /// Distinct changed paths and changed lines per file area, largest first.
@@ -876,6 +999,10 @@ fn foreground_session_output(
     (with.len(), comparable.len() - with.len())
 }
 
+fn session_key_for_daily(session: &Session) -> SessionKey {
+    (session.provider.clone(), session.session_id.clone())
+}
+
 fn bucket<'a>(
     buckets: &'a mut HashMap<Vec<String>, Bucket>,
     group_key: Vec<String>,
@@ -938,50 +1065,107 @@ fn keys_for_interval(
     pieces
         .into_iter()
         .map(|(calendar_key, piece)| {
-            let values = interval_values(&piece, &calendar_key);
+            let values = interval_values(&piece, &calendar_key, dimensions);
             let (group_key, key) = dimension_keys(&values, &piece.repo_id, dimensions);
             (group_key, key, piece)
         })
         .collect()
 }
 
-fn interval_values(interval: &Interval, calendar_key: &str) -> HashMap<String, String> {
-    HashMap::from([
-        ("repo".into(), interval.repo.clone()),
-        ("root".into(), interval.root.clone()),
-        ("cwd".into(), interval.cwd.clone()),
-        ("provider".into(), interval.provider.clone()),
-        ("model".into(), interval.model.clone()),
-        ("day".into(), calendar_key.to_string()),
-        ("week".into(), calendar_key.to_string()),
-        ("month".into(), calendar_key.to_string()),
-    ])
+/// The label for one of the attribution dimensions, which are all derived from
+/// the branch and the checkout rather than from a timestamp.
+fn attributed_value(dimension: &str, context: &Ctx<'_>) -> Option<String> {
+    match dimension {
+        "branch" => Some(attribution::branch_label(context.branch)),
+        "issue" => Some(attribution::issue_label(context.branch)),
+        "feature" => Some(attribution::feature_label(context.branch)),
+        "engagement" => Some(attribution::engagement_label(context)),
+        _ => None,
+    }
 }
 
-fn signal_values(signal: &HumanSignal) -> HashMap<String, String> {
-    HashMap::from([
-        ("repo".into(), signal.repo.clone()),
-        ("root".into(), signal.root.clone()),
-        ("cwd".into(), signal.cwd.clone()),
-        ("provider".into(), signal.provider.clone()),
-        ("model".into(), signal.model.clone()),
-        ("day".into(), local_date(signal.timestamp)),
-        ("week".into(), local_week(signal.timestamp)),
-        ("month".into(), local_month(signal.timestamp)),
-    ])
+/// Only the requested dimensions are computed: the attribution ones are not
+/// free, and most runs group by one or two.
+fn interval_values(
+    interval: &Interval,
+    calendar_key: &str,
+    dimensions: &[String],
+) -> HashMap<String, String> {
+    let context = Ctx {
+        repo_id: &interval.repo_id,
+        cwd: &interval.cwd,
+        branch: interval.branch.as_deref(),
+    };
+    dimensions
+        .iter()
+        .map(|name| {
+            let value = match name.as_str() {
+                "repo" => interval.repo.clone(),
+                "root" => interval.root.clone(),
+                "cwd" => interval.cwd.clone(),
+                "provider" => interval.provider.clone(),
+                "model" => interval.model.clone(),
+                "day" | "week" | "month" => calendar_key.to_string(),
+                other => attributed_value(other, &context).unwrap_or_default(),
+            };
+            (name.clone(), value)
+        })
+        .collect()
 }
 
-fn session_values(session: &Session, model: &str, first: DateTime<Utc>) -> HashMap<String, String> {
-    HashMap::from([
-        ("repo".into(), session.repo.clone()),
-        ("root".into(), session.root.clone()),
-        ("cwd".into(), session.cwd.clone()),
-        ("provider".into(), session.provider.clone()),
-        ("model".into(), model.to_string()),
-        ("day".into(), local_date(first)),
-        ("week".into(), local_week(first)),
-        ("month".into(), local_month(first)),
-    ])
+fn signal_values(signal: &HumanSignal, dimensions: &[String]) -> HashMap<String, String> {
+    let context = Ctx {
+        repo_id: &signal.repo_id,
+        cwd: &signal.cwd,
+        branch: signal.branch.as_deref(),
+    };
+    dimensions
+        .iter()
+        .map(|name| {
+            let value = match name.as_str() {
+                "repo" => signal.repo.clone(),
+                "root" => signal.root.clone(),
+                "cwd" => signal.cwd.clone(),
+                "provider" => signal.provider.clone(),
+                "model" => signal.model.clone(),
+                "day" => local_date(signal.timestamp),
+                "week" => local_week(signal.timestamp),
+                "month" => local_month(signal.timestamp),
+                other => attributed_value(other, &context).unwrap_or_default(),
+            };
+            (name.clone(), value)
+        })
+        .collect()
+}
+
+fn session_values(
+    session: &Session,
+    model: &str,
+    first: DateTime<Utc>,
+    dimensions: &[String],
+) -> HashMap<String, String> {
+    let context = Ctx {
+        repo_id: &session.repo_id,
+        cwd: &session.cwd,
+        branch: session.branch_at(first),
+    };
+    dimensions
+        .iter()
+        .map(|name| {
+            let value = match name.as_str() {
+                "repo" => session.repo.clone(),
+                "root" => session.root.clone(),
+                "cwd" => session.cwd.clone(),
+                "provider" => session.provider.clone(),
+                "model" => model.to_string(),
+                "day" => local_date(first),
+                "week" => local_week(first),
+                "month" => local_month(first),
+                other => attributed_value(other, &context).unwrap_or_default(),
+            };
+            (name.clone(), value)
+        })
+        .collect()
 }
 
 fn commit_value(commit: &GitCommit, dimension: &str) -> String {
@@ -1004,7 +1188,15 @@ fn commit_value(commit: &GitCommit, dimension: &str) -> String {
         "day" => local_date(commit.timestamp),
         "week" => local_week(commit.timestamp),
         "month" => local_month(commit.timestamp),
-        _ => String::new(),
+        other => attributed_value(
+            other,
+            &Ctx {
+                repo_id: &commit.repo_id,
+                cwd: &commit.cwd,
+                branch: commit.branch.as_deref(),
+            },
+        )
+        .unwrap_or_default(),
     }
 }
 
@@ -1016,6 +1208,7 @@ struct TokenRecord {
     cwd: String,
     provider: String,
     model: String,
+    branch: Option<String>,
     usage: TokenUsage,
 }
 
@@ -1029,7 +1222,15 @@ fn token_value(token: &TokenRecord, dimension: &str) -> String {
         "day" => local_date(token.timestamp),
         "week" => local_week(token.timestamp),
         "month" => local_month(token.timestamp),
-        _ => String::new(),
+        other => attributed_value(
+            other,
+            &Ctx {
+                repo_id: &token.repo_id,
+                cwd: &token.cwd,
+                branch: token.branch.as_deref(),
+            },
+        )
+        .unwrap_or_default(),
     }
 }
 
@@ -1121,6 +1322,8 @@ mod tests {
             ignored_deletions: 0,
             categories,
             authorship: Authorship::default(),
+            branch: None,
+            branch_source: crate::model::BranchSource::None,
         }
     }
 
@@ -1149,6 +1352,10 @@ mod tests {
             human_points: human,
             token_events: vec![],
             is_subagent: false,
+            branch_source: crate::model::BranchSource::None,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
+            source_file: std::path::PathBuf::new(),
         }
     }
 
@@ -1219,6 +1426,7 @@ mod tests {
             Duration::seconds(1),
             Duration::zero(),
             true,
+            false,
         );
         let explanation = report.human_time_explanation.unwrap();
         assert_eq!(0.062, report.summary.human_estimated_seconds);
@@ -1232,6 +1440,114 @@ mod tests {
             explanation.unrounded_block_seconds_total
                 + explanation.total_rounding_adjustment_seconds
         );
+    }
+
+    fn branched_session() -> Session {
+        let mut value = session(
+            "branched",
+            "repo",
+            vec![],
+            vec![
+                point("2026-01-01T10:00:00Z"),
+                point("2026-01-01T10:10:00Z"),
+                point("2026-01-01T10:25:00Z"),
+                point("2026-01-01T10:30:00Z"),
+            ],
+        );
+        value.branches = vec![
+            crate::model::BranchMark {
+                from: None,
+                branch: "feat/a".into(),
+            },
+            crate::model::BranchMark {
+                from: Some(parse_timestamp("2026-01-01T10:20:00Z").unwrap()),
+                branch: "feat/b".into(),
+            },
+        ];
+        value
+    }
+
+    fn built_with_dimensions(dimensions: &[&str], daily: bool) -> BuiltReport {
+        let dimensions: Vec<String> = dimensions.iter().map(|name| (*name).to_string()).collect();
+        build_report_with_human_time_explanation(
+            &[branched_session()],
+            &[],
+            &[],
+            Duration::minutes(5),
+            None,
+            None,
+            &dimensions,
+            Duration::hours(1),
+            Duration::minutes(10),
+            false,
+            daily,
+        )
+    }
+
+    #[test]
+    fn human_time_is_split_by_the_branch_in_force_at_each_signal() {
+        let report = built_with_dimensions(&["branch"], false);
+        let by_branch: BTreeMap<_, _> = report
+            .rows
+            .iter()
+            .map(|row| (row.key["branch"].clone(), row.human_estimated_seconds))
+            .collect();
+        assert_eq!(
+            vec!["feat/a", "feat/b"],
+            by_branch.keys().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report.summary.human_estimated_seconds,
+            by_branch.values().sum::<f64>(),
+            "branches partition the human timeline, they never add to it"
+        );
+        assert!(report.timeline.human_intervals.iter().all(|piece| {
+            piece
+                .branch
+                .as_deref()
+                .is_some_and(|branch| branch.starts_with("feat/"))
+        }));
+    }
+
+    #[test]
+    fn the_attribution_dimensions_fall_back_to_their_placeholders() {
+        let report = built_with_dimensions(&["issue", "feature", "engagement"], false);
+        assert!(!report.rows.is_empty());
+        for row in &report.rows {
+            assert_eq!("—", row.key["issue"]);
+            assert_eq!("(unassigned)", row.key["engagement"]);
+        }
+        let features: BTreeSet<_> = report
+            .rows
+            .iter()
+            .map(|row| row.key["feature"].as_str())
+            .collect();
+        assert_eq!(BTreeSet::from(["feat/a", "feat/b"]), features);
+    }
+
+    #[test]
+    fn the_timeline_is_the_vectors_the_report_was_built_from() {
+        let report = built_with_dimensions(&["repo"], false);
+        let piece_seconds: f64 = report
+            .timeline
+            .human_intervals
+            .iter()
+            .map(Interval::seconds)
+            .sum();
+        assert!((piece_seconds - report.summary.human_estimated_seconds).abs() < 0.001);
+        // Four prompts and the two session edges.
+        assert_eq!(6, report.timeline.human_signals.len());
+        assert!(report.daily.is_none(), "daily is computed only on request");
+    }
+
+    #[test]
+    fn daily_figures_account_for_the_whole_human_timeline_when_asked() {
+        let report = built_with_dimensions(&["repo"], true);
+        let daily = report.daily.expect("requested");
+        assert!(!daily.is_empty());
+        let human: f64 = daily.iter().map(|day| day.human_seconds).sum();
+        assert!((human - report.summary.human_estimated_seconds).abs() < 0.01);
+        assert_eq!(4, daily.iter().map(|day| day.prompts).sum::<usize>());
     }
 
     #[test]

@@ -362,6 +362,8 @@ mod tests {
                 is_subagent: true,
                 approximate_cwd: false,
                 version: None,
+                branches: Vec::new(),
+                pull_requests: Vec::new(),
             }],
             diagnostics: Diagnostics::default(),
             ..ParsedFile::default()

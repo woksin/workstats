@@ -378,6 +378,8 @@ pub fn parse_claude_file(path: &Path, root: &Path, max_line_bytes: usize) -> Par
             .any(|part| part.as_os_str() == "subagents"),
         approximate_cwd,
         version,
+        branches: Vec::new(),
+        pull_requests: Vec::new(),
     });
     result
 }

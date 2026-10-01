@@ -676,6 +676,8 @@ impl PiSessionState {
             is_subagent: self.parent_session.is_some(),
             approximate_cwd,
             version: self.version,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
         });
     }
 }

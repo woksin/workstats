@@ -155,6 +155,8 @@ pub fn parse_event_file(path: &Path, max_line_bytes: usize) -> ParsedFile {
                 is_subagent,
                 approximate_cwd: false,
                 version: Some("workstats-events-v1".to_string()),
+                branches: Vec::new(),
+                pull_requests: Vec::new(),
             });
             let point = ActivityPoint {
                 timestamp,

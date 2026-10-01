@@ -527,6 +527,8 @@ pub(crate) fn run(
                 .as_ref()
                 .map(|cache| cache.path().to_string_lossy().into_owned()),
         },
+        daily: built.daily,
+        goals: None,
     };
     let cache_summary = if diagnostics.cache_hits == 0 && diagnostics.cache_misses == 0 {
         String::new()
@@ -891,6 +893,7 @@ fn scan_window(
         human_idle,
         review_credit,
         explain_human_time,
+        false,
     );
     let attribution = resolver.repository_attribution(&built.active_repository_checkouts);
     Ok(WindowRun {
@@ -1223,6 +1226,10 @@ mod tests {
             human_points: Vec::new(),
             token_events: Vec::new(),
             is_subagent: false,
+            branch_source: crate::model::BranchSource::None,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
+            source_file: std::path::PathBuf::new(),
         };
 
         assert_eq!(

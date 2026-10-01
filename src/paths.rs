@@ -10,7 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::classify::{CategoryMode, CategoryRegistry, CategoryRules};
-use crate::model::{Diagnostics, RawSession, Session};
+use crate::model::{BranchSource, Diagnostics, RawSession, Session};
 
 #[derive(Clone, Debug)]
 pub struct SourceRule {
@@ -609,6 +609,11 @@ impl PathResolver {
             self.observe(&raw_cwd, &resolution);
         }
         self.note_attribution(&cwd, &resolution);
+        let branch_source = if raw.branches.is_empty() {
+            BranchSource::None
+        } else {
+            BranchSource::Recorded
+        };
         Session {
             provider: raw.provider,
             session_id: raw.session_id,
@@ -621,6 +626,10 @@ impl PathResolver {
             human_points: raw.human_points,
             token_events: raw.token_events,
             is_subagent: raw.is_subagent,
+            source_file: raw.source_file,
+            branches: raw.branches,
+            branch_source,
+            pull_requests: raw.pull_requests,
         }
     }
 
@@ -1138,6 +1147,8 @@ mod tests {
             is_subagent: false,
             approximate_cwd: false,
             version: None,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
         }
     }
 
@@ -1188,6 +1199,8 @@ mod tests {
             is_subagent: true,
             approximate_cwd: false,
             version: None,
+            branches: Vec::new(),
+            pull_requests: Vec::new(),
         };
         let mut resolver = PathResolver::with_home(Vec::new(), temporary.path().to_path_buf());
 

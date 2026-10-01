@@ -240,6 +240,8 @@ pub fn parse_opencode_database(path: &Path) -> ParsedFile {
                     is_subagent: session.is_subagent,
                     approximate_cwd: false,
                     version: session.version,
+                    branches: Vec::new(),
+                    pull_requests: Vec::new(),
                 })
                 .collect(),
             skipped_rows,

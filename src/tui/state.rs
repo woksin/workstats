@@ -974,6 +974,8 @@ pub(super) fn sample_commit(sha: &str, cwd: &str, files: &[(&str, u64, u64)]) ->
         // `main` never passes it the agent-authorship pass — so every commit
         // that reaches a `Dataset` is one the configured author wrote.
         authorship: Authorship::default(),
+        branch: None,
+        branch_source: crate::model::BranchSource::None,
     }
 }
 
