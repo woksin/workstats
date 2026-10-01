@@ -14,6 +14,7 @@ mod events;
 mod gemini;
 mod opencode;
 mod pi;
+pub(crate) mod titles;
 
 pub use claude::read_claude_sessions_indexed;
 pub use codex::read_codex_sessions_indexed;

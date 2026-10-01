@@ -13,7 +13,6 @@ pub struct IssueRules {}
 impl IssueRules {
     /// Compiles the `issues` config block. The stub accepts anything.
     // Called from `report::prepare` once the pipeline split lands.
-    #[allow(dead_code)]
     pub fn from_config(_config: Option<&Value>) -> Result<Self> {
         Ok(Self::default())
     }
@@ -37,8 +36,6 @@ pub fn active() -> &'static IssueRules {
 }
 
 /// Installs the configured rules. Must run before anything is attributed.
-// Called from `report::prepare` once the pipeline split lands.
-#[allow(dead_code)]
 pub fn install(rules: IssueRules) -> Result<()> {
     ACTIVE
         .set(rules)

@@ -79,8 +79,6 @@ pub struct BuiltReport {
     pub rows: Vec<ReportRow>,
     /// Per local day, only when asked for (HTML, the explorer, `--daily`).
     pub daily: Option<Vec<DayFigures>>,
-    // Read by `report::collect` in the next commit.
-    #[allow(dead_code)]
     pub timeline: Timeline,
 }
 

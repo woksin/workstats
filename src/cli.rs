@@ -76,6 +76,25 @@ pub(crate) enum Command {
     /// Apportion flat-rate subscription spend to one project, as in
     /// `workstats allocate -p Ada --sub claude=2 --sub codex=4 --month 2026-08`
     Allocate(Box<AllocateArguments>),
+    /// Suggested hours per day and engagement, rounded for a timesheet, with
+    /// manual entries, overrides and locks
+    Timesheet(Box<crate::timesheet::TimesheetArguments>),
+    /// The effort behind one branch
+    Branch(Box<crate::branch_report::BranchArguments>),
+    /// The effort behind a pull request, ready to paste into its description
+    Pr(Box<crate::branch_report::PrArguments>),
+    /// Focus, patterns and leverage over a window (default: the last 28 days)
+    Insights(Box<crate::insights::InsightsArguments>),
+    /// A weekly summary compared with the week before
+    Digest(Box<crate::insights::DigestArguments>),
+    /// Today and the week so far, cheap enough for a prompt or status bar
+    Now(Box<crate::now::NowArguments>),
+    /// Write this machine's evidence as a bundle another machine can merge
+    Export(Box<crate::bundle::ExportArguments>),
+    /// Merge bundles from several machines into one report
+    Merge(Box<crate::bundle::MergeArguments>),
+    /// A year grid of human time per day, drawn in the terminal
+    Calendar(Box<crate::calendar::CalendarArguments>),
 }
 
 #[derive(Debug, Args)]
@@ -311,7 +330,7 @@ pub(crate) struct ReportArguments {
         long = "group-by",
         visible_alias = "by",
         conflicts_with_all = ["by_repo", "matrix", "by_dir"],
-        help = "Comma-separated grouping dimensions: root,repo,cwd,provider,model,day,week,month (default: repo; config: \"defaults.group_by\")"
+        help = "Comma-separated grouping dimensions: root,repo,cwd,provider,model,day,week,month,branch,issue,feature,engagement (default: repo; config: \"defaults.group_by\")"
     )]
     pub(crate) group_by: Option<String>,
     #[arg(
@@ -345,6 +364,23 @@ pub(crate) struct ReportArguments {
     pub(crate) no_git: bool,
     #[arg(long, help = "Skip all AI histories")]
     pub(crate) no_ai: bool,
+    #[arg(
+        long,
+        value_name = "FILE",
+        action = clap::ArgAction::Append,
+        help = "Fold a bundle written by `workstats export` into this report; repeatable"
+    )]
+    pub(crate) import: Vec<PathBuf>,
+    #[arg(
+        long,
+        help = "Include human and agent figures per day (always on for HTML and the explorer)"
+    )]
+    pub(crate) daily: bool,
+    #[arg(
+        long,
+        help = "Leave out weekly-hours and spend-cap goals from the config"
+    )]
+    pub(crate) no_goals: bool,
     #[arg(long, hide = true)]
     pub(crate) no_codex: bool,
     #[arg(long, hide = true)]

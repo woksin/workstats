@@ -76,4 +76,37 @@ direction-override characters in the patch are replaced before it is drawn, so
 a file cannot repaint or reorder your terminal. Binary files come back as
 Git's own `Binary files … differ` line — no bytes are ever emitted.
 
+## Branch names, pull requests, descriptions, bundles and snapshots
+
+These sections are filled in by the changes that add each read. Each states
+exactly what is read, what is stored, and what is never read.
+
+### Branch names are read, cached and reported
+
+_Coming in this release._
+
+### Pull-request references
+
+_Coming in this release._
+
+### Opt-in descriptions
+
+_Coming in this release._
+
+### `--summarize-with` hands a digest to a command you choose
+
+_Coming in this release._
+
+### Files beside the config: the timesheet ledger and the machine id
+
+_Coming in this release._
+
+### Bundles
+
+_Coming in this release._
+
+### The `now` snapshot
+
+_Coming in this release._
+
 See [SECURITY.md](../SECURITY.md) for private vulnerability reporting.

@@ -56,7 +56,7 @@ fn normalize_backreferences(value: &str) -> String {
     backref.replace_all(value, "$$${1}").into_owned()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub source_roots: Vec<ConfigRule>,
@@ -96,6 +96,34 @@ pub struct Config {
     /// the whole config being ignored with a warning.
     #[serde(default)]
     pub defaults: Option<serde_json::Value>,
+    /// Which client or contract work bills to. Raw JSON, compiled and checked
+    /// by `engagement`, so one bad entry is refused by name instead of the
+    /// whole file being ignored.
+    #[serde(default)]
+    pub engagements: Option<serde_json::Value>,
+    /// Issue-key patterns applied to branch names; compiled by `issues`.
+    #[serde(default)]
+    pub issues: Option<serde_json::Value>,
+    /// Integration-branch settings; read by `branches`.
+    #[serde(default)]
+    pub branches: Option<serde_json::Value>,
+    /// Rounding and export settings for `workstats timesheet`.
+    // The next four are read by the commands they configure, in later changes.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub timesheet: Option<serde_json::Value>,
+    /// Weekly-hours and list-value-cap goals; read by `goals`.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub goals: Option<serde_json::Value>,
+    /// Night and weekend definitions for `workstats insights`.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub insights: Option<serde_json::Value>,
+    /// Template and freshness settings for `workstats now`.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub now: Option<serde_json::Value>,
 }
 
 impl Config {
@@ -146,13 +174,13 @@ impl Config {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ConfigRule {
     pub pattern: String,
     pub replacement: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectAliasConfig {
     pub label: String,
@@ -249,6 +277,26 @@ impl ProjectAliases {
             });
         }
         Ok(Self { aliases })
+    }
+
+    /// The project alias that names `natural_id` (a `remote:` identity) among
+    /// its remotes, as the `repo_id` and label a session in that repository
+    /// gets locally. Only remotes are consulted: path membership describes a
+    /// checkout on this machine, which an imported session does not have. Two
+    /// aliases claiming the identity cannot happen after validation, but would
+    /// answer `None` here rather than guess.
+    // Used by bundle import, which lands in a later change.
+    #[allow(dead_code)]
+    pub fn alias_for_natural_id(&self, natural_id: &str) -> Option<(String, String)> {
+        let mut matches = self
+            .aliases
+            .iter()
+            .filter(|alias| alias.remotes.contains(natural_id));
+        let alias = matches.next()?;
+        matches
+            .next()
+            .is_none()
+            .then(|| (format!("project:{}", alias.key), alias.label.clone()))
     }
 
     fn resolve<'a>(
@@ -918,7 +966,7 @@ pub fn disambiguated_repository_label(label: &str, repo_id: &str) -> String {
     format!("{label} [{suffix}]")
 }
 
-fn remote_repository(remote: &str, repo: &Path) -> Option<(String, String)> {
+pub(crate) fn remote_repository(remote: &str, repo: &Path) -> Option<(String, String)> {
     let remote = remote.trim().trim_end_matches('/');
     if remote.is_empty() {
         return None;
@@ -1369,6 +1417,30 @@ mod tests {
         assert_eq!(api.repo_id, web.repo_id);
         assert_ne!(api.cwd, web.cwd);
         resolver.validate_project_aliases().unwrap();
+    }
+
+    #[test]
+    fn an_alias_is_found_by_remote_identity_alone() {
+        let config = BTreeMap::from([(
+            "acme".to_string(),
+            ProjectAliasConfig {
+                label: "Acme Product".into(),
+                remotes: vec!["https://github.com/acme/api.git".into()],
+                paths: vec!["/work/acme".into()],
+            },
+        )]);
+        let aliases = ProjectAliases::compile(&config, Path::new("/home")).unwrap();
+        assert_eq!(
+            Some(("project:acme".to_string(), "Acme Product".to_string())),
+            aliases.alias_for_natural_id("remote:github.com/acme/api")
+        );
+        // A path says where a checkout lives here, which an import has no
+        // checkout to say.
+        assert_eq!(None, aliases.alias_for_natural_id("git:/work/acme/.git"));
+        assert_eq!(
+            None,
+            aliases.alias_for_natural_id("remote:github.com/acme/other")
+        );
     }
 
     #[test]

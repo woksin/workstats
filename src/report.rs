@@ -7,28 +7,32 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
-use crate::aggregate::{BuiltReport, build_report_with_human_time_explanation};
+use crate::aggregate::{BuiltReport, Timeline, build_report_with_human_time_explanation};
 use crate::ai::{
     read_claude_sessions_indexed, read_codex_sessions_indexed, read_copilot_sessions_indexed,
     read_copilot_vscode_sessions_indexed, read_event_sessions_indexed,
     read_gemini_sessions_indexed, read_opencode_sessions_indexed, read_pi_sessions_indexed,
 };
 use crate::allocate;
+use crate::branches;
+use crate::bundle;
 use crate::cache::TranscriptCache;
 use crate::classify;
 use crate::cli::{
-    AllocateArguments, OutputFormat, ReportArguments, agent_author_patterns, compare_windows,
-    csv_globs, duration_flag, grouping_dimensions, report_window, resolve_authors, scan_directory,
-    valid_provider_identifier,
+    AllocateArguments, ComparePlan, OutputFormat, ReportArguments, ReportWindow, ResolvedDefaults,
+    agent_author_patterns, compare_windows, csv_globs, duration_flag, grouping_dimensions,
+    report_window, resolve_authors, scan_directory, valid_provider_identifier,
 };
 use crate::compare::{Comparison, Period};
+use crate::engagement::{self, Engagements};
 use crate::git::{default_git_author, read_agent_commits, read_git_commits};
+use crate::issues::{self, IssueRules};
 use crate::model::{self, Diagnostics, Inputs, Report, Session};
 use crate::output::{print_csv, print_html, print_json, print_markdown, print_table};
 use crate::paths::{
-    PathResolver, ProjectAliases, SourceRule, configured_rules, default_cache_path,
+    Config, PathResolver, ProjectAliases, SourceRule, configured_rules, default_cache_path,
     default_update_check_path, disambiguated_repository_label, home_dir, load_config,
 };
 use crate::pricing;
@@ -174,18 +178,187 @@ pub(crate) fn run_allocation(command: AllocateArguments) -> Result<()> {
     )
 }
 
+/// Why a run is being collected. It decides which checks guard the output: a
+/// report that is printed, browsed or apportioned must be able to carry what
+/// was asked for, while a run whose data another command consumes does its own
+/// output and is checked by that command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Purpose {
+    Print,
+    Explore,
+    Allocate,
+    // Used by the commands built on `collect` in later changes.
+    #[allow(dead_code)]
+    Query,
+}
+
+impl From<Presentation> for Purpose {
+    fn from(presentation: Presentation) -> Self {
+        match presentation {
+            Presentation::Print => Self::Print,
+            Presentation::Explore => Self::Explore,
+        }
+    }
+}
+
+/// The settings a collected run was made with, kept so a command built on it
+/// can apply the same ones to anything it computes further.
+// Read by the commands built on `collect` in later changes.
+#[allow(dead_code)]
+pub(crate) struct RunSettings {
+    pub(crate) gap_cap: Duration,
+    pub(crate) human_idle: Duration,
+    pub(crate) review_credit: Duration,
+    pub(crate) rate_overrides: pricing::RateOverrides,
+    pub(crate) config: Config,
+    pub(crate) now: DateTime<Utc>,
+}
+
+/// Everything a run produced, before any of it is presented: the report as it
+/// would be printed, and the pieces it was built from. Commands that need more
+/// than the report's rows (a timesheet, a branch report, insights) are
+/// computed over the timeline and the sessions and commits here, so they sum
+/// the same pieces the report did and cannot count anything twice.
+// Read by the commands built on `collect` in later changes.
+#[allow(dead_code)]
+pub(crate) struct Collected {
+    pub(crate) report: Report,
+    pub(crate) timeline: Timeline,
+    pub(crate) sessions: Vec<Session>,
+    /// The retained human commits.
+    pub(crate) commits: Vec<model::GitCommit>,
+    pub(crate) agent_commits: Vec<model::GitCommit>,
+    pub(crate) window: ReportWindow,
+    pub(crate) settings: RunSettings,
+}
+
+/// Runs the whole pipeline for `arguments` and returns what it produced
+/// without presenting any of it.
+// The entry point for the commands built on collected data.
+#[allow(dead_code)]
+pub(crate) fn collect(arguments: ReportArguments, purpose: Purpose) -> Result<Collected> {
+    let mut prepared = prepare(arguments, purpose)?;
+    let collected = execute(&mut prepared)?;
+    finish_progress(prepared.progress, &collected.report);
+    Ok(collected)
+}
+
 pub(crate) fn run(
-    mut arguments: ReportArguments,
+    arguments: ReportArguments,
     presentation: Presentation,
     allocation: Option<allocate::AllocationOptions>,
 ) -> Result<()> {
+    let purpose = if allocation.is_some() {
+        Purpose::Allocate
+    } else {
+        presentation.into()
+    };
+    let mut prepared = prepare(arguments, purpose)?;
+    let collected = execute(&mut prepared)?;
+    finish_progress(prepared.progress, &collected.report);
+    let Prepared {
+        arguments,
+        output_format,
+        update_check_opt_in,
+        ..
+    } = prepared;
+    let Collected {
+        report,
+        commits,
+        settings,
+        ..
+    } = collected;
+    if presentation == Presentation::Explore {
+        // Nothing above this line knows about the explorer: it browses the
+        // report the default command would have printed, and `commits` carries
+        // the per-commit detail the report itself aggregates away.
+        return tui::run(&report, commits);
+    }
+    if let Some(mut options) = allocation {
+        options.rate_overrides = settings.rate_overrides;
+        // A different presentation of the report that was just built, so the
+        // numbers behind a claim are the numbers `workstats` would print.
+        let mut allocation = allocate::build(&report.rows, &options);
+        allocation.config_defaults = report.inputs.config_defaults.clone();
+        match output_format {
+            OutputFormat::Json => allocate::print_json(&allocation)?,
+            OutputFormat::Csv => allocate::print_csv(&allocation)?,
+            OutputFormat::Table => allocate::print_table(&allocation),
+            OutputFormat::Markdown => allocate::print_markdown(&allocation),
+            OutputFormat::Html => allocate::print_html(&allocation),
+        }
+        return Ok(());
+    }
+    let diagnostics = &report.diagnostics;
+    match output_format {
+        OutputFormat::Json => print_json(&report)?,
+        OutputFormat::Csv => print_csv(&report)?,
+        // Like json and csv, and unlike the table: no update notice. A document
+        // is going into a file, a PR, or a pipe, and a "new version available"
+        // line would end up published with it.
+        OutputFormat::Markdown => {
+            print_markdown(&report, diagnostics, arguments.top, arguments.raw)
+        }
+        OutputFormat::Html => print_html(&report, diagnostics, arguments.top, arguments.raw),
+        OutputFormat::Table => {
+            print_table(&report, diagnostics, arguments.top, arguments.raw);
+            let update_notice =
+                update::maybe_check_for_update(&default_update_check_path(), update_check_opt_in);
+            if let Some(latest) = update_notice {
+                println!(
+                    "\nworkstats {latest} is available (you have {}) — run `workstats update`.",
+                    update::current_version()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Everything a run needs that does not depend on the window: the flags with
+/// the config's defaults applied, the validated settings, the sources to read,
+/// and what was installed process-wide (categories, issue rules, engagements).
+struct Prepared {
+    arguments: ReportArguments,
+    purpose: Purpose,
+    config: Config,
+    resolved: ResolvedDefaults,
+    output_format: OutputFormat,
+    gap_cap: Duration,
+    human_idle: Duration,
+    review_credit: Duration,
+    now: DateTime<Utc>,
+    window: ReportWindow,
+    compare: Option<ComparePlan>,
+    dimensions: Vec<String>,
+    progress: Progress,
+    directory: PathBuf,
+    history_paths: BTreeMap<String, Vec<PathBuf>>,
+    codex_db: PathBuf,
+    event_paths: Vec<PathBuf>,
+    included: BTreeSet<String>,
+    excluded: BTreeSet<String>,
+    update_check_opt_in: bool,
+    authors: Vec<String>,
+    agent_authors: Vec<String>,
+    rules: Vec<SourceRule>,
+    aliases: ProjectAliases,
+    rate_overrides: pricing::RateOverrides,
+    diagnostics: Diagnostics,
+    transcript_cache: Option<TranscriptCache>,
+}
+
+/// Reads the config, applies the defaults, validates the flags against each
+/// other and against `purpose`, and works out the window and the sources.
+/// Nothing is scanned.
+fn prepare(mut arguments: ReportArguments, purpose: Purpose) -> Result<Prepared> {
     // The config is read first because its `defaults` decide what several of
     // the checks below are checking: flag > environment > config > built-in.
     let mut diagnostics = Diagnostics::default();
     let config = load_config(arguments.config.as_deref(), &mut diagnostics);
     let defaults = config.config_defaults(&home_dir())?;
     let configured_authors = config.configured_authors()?;
-    let mut resolved = defaults.resolve(&mut arguments, presentation == Presentation::Explore);
+    let mut resolved = defaults.resolve(&mut arguments, purpose == Purpose::Explore);
     let output_format = resolved.format;
     // Where the format came from decides what a refusal can usefully suggest:
     // `--format csv` is fixed by dropping the flag, a configured one is not.
@@ -198,7 +371,7 @@ pub(crate) fn run(
     // Refused before any scanning: `workstats ui --format json` can only mean
     // the user wanted one of the two, and picking silently is how --by-repo
     // used to lose an explicit --group-by.
-    if presentation == Presentation::Explore
+    if purpose == Purpose::Explore
         && arguments
             .output_format
             .is_some_and(|format| format != OutputFormat::Table)
@@ -207,7 +380,7 @@ pub(crate) fn run(
             "`workstats ui` is interactive and writes no machine-readable output; drop --format, or run workstats without `ui` for json, csv, markdown, or html"
         );
     }
-    if presentation == Presentation::Explore
+    if purpose == Purpose::Explore
         && (arguments.explain_human_time || arguments.explain_repository_attribution)
     {
         bail!(
@@ -216,10 +389,12 @@ pub(crate) fn run(
     }
     // A ledger is one-to-many relative to a row, which CSV cannot hold, and the
     // Markdown and HTML documents deliberately mirror only the report itself.
-    if matches!(
-        output_format,
-        OutputFormat::Csv | OutputFormat::Markdown | OutputFormat::Html
-    ) && (arguments.explain_human_time || arguments.explain_repository_attribution)
+    if purpose != Purpose::Query
+        && matches!(
+            output_format,
+            OutputFormat::Csv | OutputFormat::Markdown | OutputFormat::Html
+        )
+        && (arguments.explain_human_time || arguments.explain_repository_attribution)
     {
         let fix = if format_from_config {
             "pass --format table or --format json"
@@ -233,13 +408,13 @@ pub(crate) fn run(
     // CSV is one flat table with no way to hold two windows without changing
     // its columns — so all three are refused rather than shown half a
     // comparison. The other formats can carry it.
-    if arguments.compare.is_some() {
-        if presentation == Presentation::Explore {
+    if arguments.compare.is_some() && purpose != Purpose::Query {
+        if purpose == Purpose::Explore {
             bail!(
                 "--compare is not available in `workstats ui`; run workstats without `ui` for table, json, markdown, or html"
             );
         }
-        if allocation.is_some() {
+        if purpose == Purpose::Allocate {
             bail!(
                 "--compare is not available with `workstats allocate`; an allocation covers one period, so run it once per period"
             );
@@ -360,8 +535,11 @@ pub(crate) fn run(
             || env::var_os("WORKSTATS_CHECK_UPDATES").is_some()
             || check_updates_configured);
     // Before anything classifies a path, so every commit in this run is read
-    // through the same registry.
+    // through the same registry. The issue rules and engagements are read the
+    // same way, by every interval, signal and commit that is grouped.
     classify::install(config.category_registry()?)?;
+    issues::install(IssueRules::from_config(config.issues.as_ref())?)?;
+    engagement::install(Engagements::from_config(config.engagements.as_ref())?)?;
     let authors = resolve_authors(
         &arguments.author,
         env::var("WORKSTATS_AUTHOR").ok(),
@@ -383,7 +561,7 @@ pub(crate) fn run(
     } else if !arguments.no_ai && !arguments.no_cache {
         progress.set("Opening transcript index");
     }
-    let mut transcript_cache = if arguments.no_ai || arguments.no_cache {
+    let transcript_cache = if arguments.no_ai || arguments.no_cache {
         None
     } else {
         match TranscriptCache::open(&cache_path, arguments.rebuild_cache) {
@@ -394,7 +572,43 @@ pub(crate) fn run(
             }
         }
     };
+    let agent_authors = agent_author_patterns(arguments.agent_commits.as_deref());
+    Ok(Prepared {
+        arguments,
+        purpose,
+        config,
+        resolved,
+        output_format,
+        gap_cap,
+        human_idle,
+        review_credit,
+        now,
+        window,
+        compare,
+        dimensions,
+        progress,
+        directory,
+        history_paths,
+        codex_db,
+        event_paths,
+        included,
+        excluded,
+        update_check_opt_in,
+        authors,
+        agent_authors,
+        rules,
+        aliases,
+        rate_overrides,
+        diagnostics,
+        transcript_cache,
+    })
+}
 
+/// Scans the selected window (and the baseline window under `--compare`) and
+/// assembles the report from them.
+fn execute(prepared: &mut Prepared) -> Result<Collected> {
+    let mut diagnostics = std::mem::take(&mut prepared.diagnostics);
+    let mut transcript_cache = prepared.transcript_cache.take();
     // Each window is produced by the same code a standalone run of that window
     // uses — sources, Git, labels, filters and all — so `--compare` can only
     // ever show what two separate runs would have. A single read over both
@@ -402,39 +616,25 @@ pub(crate) fn run(
     // `--repo-exact`, the discovery bounds of some readers and the checkouts
     // inferred from sessions all depend on which data was read. The parse cache
     // keeps the second pass cheap.
-    let agent_authors = agent_author_patterns(arguments.agent_commits.as_deref());
-    let scan = WindowScan {
-        arguments: &arguments,
-        directory: &directory,
-        depth: resolved.depth,
-        history_paths: &history_paths,
-        codex_db: &codex_db,
-        event_paths: &event_paths,
-        included: &included,
-        excluded: &excluded,
-        authors: &authors,
-        agent_authors: &agent_authors,
-        rules: &rules,
-        aliases: &aliases,
-        dimensions: &dimensions,
-        gap_cap,
-        human_idle,
-        review_credit,
-        progress: &progress,
-    };
+    let daily = prepared.arguments.daily
+        || prepared.purpose == Purpose::Explore
+        || prepared.output_format == OutputFormat::Html;
     let WindowRun {
         built,
+        sessions,
         commits,
+        agent_commits,
         scan_roots,
         attribution,
     } = scan_window(
-        &scan,
-        window,
-        arguments.explain_human_time,
+        prepared,
+        prepared.window,
+        prepared.arguments.explain_human_time,
+        daily,
         &mut transcript_cache,
         &mut diagnostics,
     )?;
-    let comparison = match compare {
+    let comparison = match &prepared.compare {
         Some(plan) => {
             // The baseline's own counters and warnings describe a window the
             // report is not about; one line says when it had trouble of its
@@ -445,8 +645,9 @@ pub(crate) fn run(
             // warning pointing at a run that finds nothing.
             let mut baseline_diagnostics = Diagnostics::default();
             let earlier = scan_window(
-                &scan,
+                prepared,
                 (Some(plan.previous.0), Some(plan.previous.1)),
+                false,
                 false,
                 &mut transcript_cache,
                 &mut baseline_diagnostics,
@@ -460,11 +661,68 @@ pub(crate) fn run(
             Some(Comparison::new(
                 Period::new(plan.current, &built.summary),
                 Period::new(plan.previous, &earlier.built.summary),
-                plan.basis,
+                plan.basis.clone(),
             ))
         }
         None => None,
     };
+    let (report, timeline) = assemble_report(
+        prepared,
+        built,
+        scan_roots,
+        attribution,
+        comparison,
+        &diagnostics,
+        transcript_cache.as_ref(),
+    );
+    Ok(Collected {
+        report,
+        timeline,
+        sessions,
+        commits,
+        agent_commits,
+        window: prepared.window,
+        settings: RunSettings {
+            gap_cap: prepared.gap_cap,
+            human_idle: prepared.human_idle,
+            review_credit: prepared.review_credit,
+            rate_overrides: prepared.rate_overrides.clone(),
+            config: prepared.config.clone(),
+            now: prepared.now,
+        },
+    })
+}
+
+/// Ends the progress line with what the run analyzed.
+fn finish_progress(progress: Progress, report: &Report) {
+    let diagnostics = &report.diagnostics;
+    let cache_summary = if diagnostics.cache_hits == 0 && diagnostics.cache_misses == 0 {
+        String::new()
+    } else {
+        format!(
+            " · {} cached, {} refreshed",
+            diagnostics.cache_hits, diagnostics.cache_misses
+        )
+    };
+    progress.finish(format!(
+        "Analyzed {} commits and {} AI sessions{cache_summary}",
+        report.summary.commit_count, report.summary.session_count
+    ));
+}
+
+/// Turns one window's built figures into the report, with the run's inputs
+/// recorded beside them, and hands back the timeline they were built from.
+fn assemble_report(
+    prepared: &Prepared,
+    built: BuiltReport,
+    scan_roots: Vec<PathBuf>,
+    attribution: model::RepositoryAttribution,
+    comparison: Option<Comparison>,
+    diagnostics: &Diagnostics,
+    transcript_cache: Option<&TranscriptCache>,
+) -> (Report, Timeline) {
+    let arguments = &prepared.arguments;
+    let mut diagnostics = diagnostics.clone();
     diagnostics.repository_history_hits = attribution.history_hits;
     diagnostics.repository_history_ambiguities = attribution.history_ambiguities;
     diagnostics.unresolved_repository_cwds = attribution.unresolved_checkouts as u64;
@@ -479,10 +737,10 @@ pub(crate) fn run(
         summary: built.summary,
         group_by: built.group_by,
         rows: built.rows,
-        diagnostics: diagnostics.clone(),
+        diagnostics,
         comparison,
         inputs: Inputs {
-            git_root: directory.to_string_lossy().into_owned(),
+            git_root: prepared.directory.to_string_lossy().into_owned(),
             git_scan_roots: if arguments.no_git {
                 Vec::new()
             } else {
@@ -491,7 +749,8 @@ pub(crate) fn run(
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect()
             },
-            history_sources: history_paths
+            history_sources: prepared
+                .history_paths
                 .iter()
                 .map(|(provider, paths)| {
                     (
@@ -502,118 +761,44 @@ pub(crate) fn run(
                             .collect(),
                     )
                 })
-                .chain((!event_paths.is_empty()).then(|| {
+                .chain((!prepared.event_paths.is_empty()).then(|| {
                     (
                         "events".to_string(),
-                        event_paths
+                        prepared
+                            .event_paths
                             .iter()
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect(),
                     )
                 }))
                 .collect(),
-            included_providers: included.into_iter().collect(),
-            excluded_providers: excluded.into_iter().collect(),
-            author: authors.join(", "),
-            authors,
-            agent_authors,
+            included_providers: prepared.included.iter().cloned().collect(),
+            excluded_providers: prepared.excluded.iter().cloned().collect(),
+            author: prepared.authors.join(", "),
+            authors: prepared.authors.clone(),
+            agent_authors: prepared.agent_authors.clone(),
             co_authors: arguments.co_authors,
-            repo_filter: arguments.repo,
-            repo_exact_filter: arguments.repo_exact,
-            human_idle: resolved.human_idle,
-            review_credit: resolved.review_credit,
-            config_defaults: resolved.from_config,
-            cache: transcript_cache
-                .as_ref()
-                .map(|cache| cache.path().to_string_lossy().into_owned()),
+            repo_filter: arguments.repo.clone(),
+            repo_exact_filter: arguments.repo_exact.clone(),
+            human_idle: prepared.resolved.human_idle.clone(),
+            review_credit: prepared.resolved.review_credit.clone(),
+            config_defaults: prepared.resolved.from_config.clone(),
+            cache: transcript_cache.map(|cache| cache.path().to_string_lossy().into_owned()),
         },
         daily: built.daily,
         goals: None,
     };
-    let cache_summary = if diagnostics.cache_hits == 0 && diagnostics.cache_misses == 0 {
-        String::new()
-    } else {
-        format!(
-            " · {} cached, {} refreshed",
-            diagnostics.cache_hits, diagnostics.cache_misses
-        )
-    };
-    progress.finish(format!(
-        "Analyzed {} commits and {} AI sessions{cache_summary}",
-        report.summary.commit_count, report.summary.session_count
-    ));
-    if presentation == Presentation::Explore {
-        // Nothing above this line knows about the explorer: it browses the
-        // report the default command would have printed, and `commits` carries
-        // the per-commit detail the report itself aggregates away.
-        return tui::run(&report, commits);
-    }
-    if let Some(mut options) = allocation {
-        options.rate_overrides = rate_overrides;
-        // A different presentation of the report that was just built, so the
-        // numbers behind a claim are the numbers `workstats` would print.
-        let mut allocation = allocate::build(&report.rows, &options);
-        allocation.config_defaults = report.inputs.config_defaults.clone();
-        match output_format {
-            OutputFormat::Json => allocate::print_json(&allocation)?,
-            OutputFormat::Csv => allocate::print_csv(&allocation)?,
-            OutputFormat::Table => allocate::print_table(&allocation),
-            OutputFormat::Markdown => allocate::print_markdown(&allocation),
-            OutputFormat::Html => allocate::print_html(&allocation),
-        }
-        return Ok(());
-    }
-    match output_format {
-        OutputFormat::Json => print_json(&report)?,
-        OutputFormat::Csv => print_csv(&report)?,
-        // Like json and csv, and unlike the table: no update notice. A document
-        // is going into a file, a PR, or a pipe, and a "new version available"
-        // line would end up published with it.
-        OutputFormat::Markdown => {
-            print_markdown(&report, &diagnostics, arguments.top, arguments.raw)
-        }
-        OutputFormat::Html => print_html(&report, &diagnostics, arguments.top, arguments.raw),
-        OutputFormat::Table => {
-            print_table(&report, &diagnostics, arguments.top, arguments.raw);
-            let update_notice =
-                update::maybe_check_for_update(&default_update_check_path(), update_check_opt_in);
-            if let Some(latest) = update_notice {
-                println!(
-                    "\nworkstats {latest} is available (you have {}) — run `workstats update`.",
-                    update::current_version()
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Everything a window's scan needs that does not depend on the window.
-struct WindowScan<'a> {
-    arguments: &'a ReportArguments,
-    directory: &'a Path,
-    depth: usize,
-    history_paths: &'a BTreeMap<String, Vec<PathBuf>>,
-    codex_db: &'a Path,
-    event_paths: &'a [PathBuf],
-    included: &'a BTreeSet<String>,
-    excluded: &'a BTreeSet<String>,
-    authors: &'a [String],
-    agent_authors: &'a [String],
-    rules: &'a [SourceRule],
-    aliases: &'a ProjectAliases,
-    dimensions: &'a [String],
-    gap_cap: chrono::Duration,
-    human_idle: chrono::Duration,
-    review_credit: chrono::Duration,
-    progress: &'a Progress,
+    (report, built.timeline)
 }
 
 /// What scanning one window produced.
 struct WindowRun {
     built: BuiltReport,
+    /// Every retained session, labelled.
+    sessions: Vec<Session>,
     /// The retained human commits, which the explorer lists individually.
     commits: Vec<model::GitCommit>,
+    agent_commits: Vec<model::GitCommit>,
     scan_roots: Vec<PathBuf>,
     attribution: model::RepositoryAttribution,
 }
@@ -623,13 +808,14 @@ struct WindowRun {
 /// `--compare` makes a second for the baseline, so a window is never built any
 /// other way.
 fn scan_window(
-    scan: &WindowScan,
-    window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+    scan: &Prepared,
+    window: ReportWindow,
     explain_human_time: bool,
+    daily: bool,
     transcript_cache: &mut Option<TranscriptCache>,
     diagnostics: &mut Diagnostics,
 ) -> Result<WindowRun> {
-    let WindowScan {
+    let Prepared {
         arguments,
         directory,
         history_paths,
@@ -640,12 +826,10 @@ fn scan_window(
         authors,
         agent_authors,
         dimensions,
-        gap_cap,
-        human_idle,
-        review_credit,
         progress,
         ..
-    } = *scan;
+    } = scan;
+    let (gap_cap, human_idle, review_credit) = (scan.gap_cap, scan.human_idle, scan.review_credit);
     let repository_history = if let Some(cache) = transcript_cache.as_ref() {
         match cache.load_repository_history() {
             Ok(history) => history,
@@ -685,7 +869,7 @@ fn scan_window(
                         path,
                         &mut resolver,
                         diagnostics,
-                        Some(codex_db),
+                        Some(codex_db.as_path()),
                         transcript_cache.as_mut(),
                         window.0,
                         window.1,
@@ -777,7 +961,7 @@ fn scan_window(
             // Everything but the configured directory got here by being the
             // checkout of a retained session.
             let from_session = scan_root != configured_root;
-            let depth = if from_session { 0 } else { scan.depth };
+            let depth = if from_session { 0 } else { scan.resolved.depth };
             // Re-applying the filter to such a root would reject it: the filter
             // matched the session's own working directory, which may be deep
             // inside the repository, while the repository is described by its
@@ -832,6 +1016,24 @@ fn scan_window(
         });
     }
     resolver.validate_project_aliases()?;
+    // Branches the providers did not record, filled from Git while every
+    // checkout is still known by its own path.
+    branches::enrich(
+        &mut sessions,
+        &mut commits,
+        &mut agent_commits,
+        scan.config.branches.as_ref(),
+        diagnostics,
+    );
+    // Imported bundles join before labels are made unique, so a repository
+    // that arrives from another machine is labelled with the rest.
+    bundle::merge_imports(
+        &arguments.import,
+        &mut sessions,
+        &mut commits,
+        &scan.aliases,
+        diagnostics,
+    )?;
     let display_labels =
         disambiguate_repository_labels(&mut sessions, &mut commits, &mut agent_commits);
     resolver.apply_display_labels(&display_labels);
@@ -893,12 +1095,14 @@ fn scan_window(
         human_idle,
         review_credit,
         explain_human_time,
-        false,
+        daily,
     );
     let attribution = resolver.repository_attribution(&built.active_repository_checkouts);
     Ok(WindowRun {
         built,
+        sessions,
         commits,
+        agent_commits,
         scan_roots,
         attribution,
     })
