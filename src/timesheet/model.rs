@@ -2,9 +2,6 @@
 //! are, and the settings that produced them. Computation, rendering and the
 //! ledger all speak these types, so they are defined once and before any of
 //! them exist.
-// Contract types: computed by the timesheet core and the ledger in later
-// changes, so most of this is not constructed yet.
-#![allow(dead_code)]
 
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::ValueEnum;
@@ -205,6 +202,23 @@ pub(crate) struct CrossCheckRow {
     pub(crate) agent_seconds: f64,
 }
 
+/// One day and engagement where a lock's snapshot and the current
+/// computation disagree, with the most likely reason.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct DriftRow {
+    /// The locked period the snapshot belongs to.
+    pub(crate) period: String,
+    pub(crate) date: NaiveDate,
+    pub(crate) engagement: String,
+    pub(crate) detail: Option<String>,
+    /// What was submitted: zero when the entry did not exist at lock time.
+    pub(crate) locked_seconds: u64,
+    /// What the computation says now: zero when the entry no longer exists.
+    pub(crate) current_seconds: u64,
+    pub(crate) difference_seconds: i64,
+    pub(crate) cause: String,
+}
+
 /// How the figures were arrived at, stated on every output.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct TimesheetMethodology {
@@ -224,6 +238,10 @@ pub(crate) struct Timesheet {
     pub(crate) cross_check: Vec<CrossCheckRow>,
     pub(crate) warnings: Vec<String>,
     pub(crate) methodology: TimesheetMethodology,
+    /// Where locked periods and the current computation disagree.
+    pub(crate) drift: Vec<DriftRow>,
+    /// The locks whose snapshots stand in for the computation, one line each.
+    pub(crate) applied_locks: Vec<String>,
 }
 
 #[cfg(test)]

@@ -83,7 +83,16 @@ impl Fixture {
             self.config.to_str().unwrap(),
         ]);
         arguments.extend(extra);
-        run(&arguments)
+        // Never the developer's own ledger: its entries would change the
+        // expected figures.
+        std::process::Command::new(binary())
+            .args(&arguments)
+            .env(
+                "WORKSTATS_TIMESHEET",
+                self._directory.path().join("timesheet.json"),
+            )
+            .output()
+            .unwrap()
     }
 
     fn timesheet(&self, extra: &[&str]) -> Output {

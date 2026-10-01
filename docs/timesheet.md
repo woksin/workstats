@@ -152,6 +152,7 @@ totals.
 | `--billable-only` | only billable engagements |
 | `--unassigned show\|hide` | list or hide work matching no engagement |
 | `--totals-by day\|week` | subtotal by day (default) or ISO week |
+| `--ignore-locks` | show the live computation for locked periods instead of their snapshots |
 | `--no-evidence` | leave prompts, commits and sessions out |
 | `--format table\|json\|csv\|markdown\|html` | output format |
 | `--export toggl\|harvest\|clockify\|generic` | a vendor CSV; implies `--format csv` and conflicts with any other explicit `--format` |
@@ -198,10 +199,129 @@ leading `=`, `+`, `-` or `@` defused, like the report's CSV.
 - `--format csv` without `--export` is the `generic` layout. Warnings go to
   standard error so a pipe stays clean.
 
+## The ledger: manual entries, overrides and locks
+
+Estimates are not always the whole story: a meeting with no keyboard in it, a
+day you were out, an hour the tool got wrong. The **ledger** is where those
+live, in `timesheet.json` beside the config file (override the location with
+`WORKSTATS_TIMESHEET`). It is your file: workstats changes it only when you run
+one of these commands, and it is never the cache, so `--no-cache` and
+`--rebuild-cache` leave it alone.
+
+```console
+$ workstats timesheet add yesterday acme 1h30m "Steering meeting" --start 09:00
+Added 7f3a2c1e: 2026-08-11 acme 1h30m (Steering meeting)
+$ workstats timesheet set mon acme 2h "Adjusted after review"
+$ workstats timesheet set 2026-08-14 internal 0 "Out sick"
+$ workstats timesheet entries --month 2026-08
+$ workstats timesheet rm 7f3a2c1e
+$ workstats timesheet unset mon acme
+```
+
+| Command | Does |
+| --- | --- |
+| `add DATE ENGAGEMENT DURATION [NOTE]` | add hours by hand on top of the estimate. `--start HH:MM` gives the CSV a start time; `--billable` / `--non-billable` overrides the engagement's billing for this entry |
+| `set DATE ENGAGEMENT DURATION [NOTE]` | **override**: the entry for that day and engagement becomes this value, whatever was estimated. `0` suppresses the estimate |
+| `unset DATE ENGAGEMENT` | remove an override; the estimate applies again |
+| `rm ID` | remove a manual entry (ids come from `add` and `entries`) |
+| `entries [--month …\|--week …\|--since …]` | list manual entries and overrides, marking those in locked periods; the output says how many are outside the window |
+| `lock PERIOD`, `unlock PERIOD`, `locks` | freeze, release and list periods (below) |
+
+**DATE** is `YYYY-MM-DD`, `today`, `yesterday`, or a weekday name (`mon` …
+`sun`, or in full): the most recent such day, today included. **DURATION** is
+written like the other timesheet durations (`90m`, `1h30m`); an entry is at most
+24h, a note one line of at most 1,024 bytes. The engagement must exist in the
+config; the error lists the configured keys. Everything is validated before
+anything is written, and the ledger holds at most 10,000 entries and overrides
+and 500 locks.
+
+### How the ledger composes with the estimate
+
+1. The estimate is computed and rounded as usual.
+2. An **override** replaces the estimate for its day and engagement. With
+   `--detail`, an engagement has several rows on a day; the override covers the
+   engagement's day, so it sits on the first row and the others are zeroed.
+3. **Manual entries** are added on top (`manual_seconds`), override or not. An
+   entry whose billing differs from its engagement's (`--billable` /
+   `--non-billable`) is shown as a row of its own, detail `manual, billable` or
+   `manual, non-billable`, so it does not change how the estimate is billed.
+4. The **daily cap** is enforced again, with manual hours and overrides counted
+   first and never reduced. A cap already applied to estimates is not undone: an
+   override that frees room does not give another estimate its capped increment
+   back.
+5. Hours, amounts and totals are computed last, from the entries as shown, as
+   everywhere else.
+
+Status says where a row's figure came from: `suggested` (estimate only),
+`overridden`, `manual` (hours by hand with no activity behind them) or
+`locked`. The notes column carries your notes and the entry ids. Manual hours
+and overrides are not activity, so the reconciliation line, which compares raw
+estimates with the report, is unaffected by them.
+
+A ledger item for an engagement that is no longer in the config is still
+counted, under its key, with a warning. An item outside the window is not
+shown.
+
+### Locks
+
+`workstats timesheet lock 2026-08` freezes a period as submitted. `PERIOD` is
+`YYYY-MM`, `YYYY-Www` (ISO week) or `A..B` (two dates, both inclusive); the
+window comes from it, so window flags are refused, and so are `--engagement`,
+`--billable-only` and `--export`: a lock freezes every entry. The settings
+flags (`--increment`, `--rounding`, `--daily-cap` …) apply as for a report.
+
+A lock stores, per entry, what was submitted (hours, billing, rate, currency,
+amount, notes, and the description if one was requested), the totals, and the
+settings that produced them: increment, rounding, split, minimum entry, daily
+cap, `human_idle`, `review_credit`, `gap_cap`, plus fingerprints of the
+engagement configuration and of the ledger's entries and overrides.
+
+Viewing a locked period shows the snapshot's entries with status `locked`: what
+was submitted stays what is displayed, in the table, the JSON and the CSV, even
+if the history, the settings or the engagement rules have since changed. The
+live computation is still made, and where it disagrees a **DRIFT** section
+lists each day and engagement with the locked value, the current value, the
+difference and the likely cause, in this order:
+
+| Cause | When |
+| --- | --- |
+| `settings changed (…)` | the increment, rounding, split, cap, idle settings … differ from the lock's (the ones that changed are named) |
+| `engagement config changed` | the engagement configuration's fingerprint differs |
+| `ledger edited after lock` | the ledger changed, and holds a write to that day and engagement made after the lock (a forced write or a newer entry) |
+| `new or pruned history` | none of the above: sessions or commits appeared, or the tool that held them pruned them |
+
+The cause is the likeliest, not a proof. Drift in the selected window raises
+one warning; no drift raises none. `--ignore-locks` shows the live computation
+instead.
+
+- A write into a locked day (`add`, `set`, `unset`, `rm`) is **refused** unless
+  `--force`. A forced write is recorded in the ledger and shows up as drift,
+  because the locked figures do not change.
+- Locking a period already locked needs `--force` and replaces the snapshot
+  with the current figures; this is how you accept drift. A lock may not
+  overlap a lock of a different period: unlock one first.
+- `unlock PERIOD` removes a lock; the days are computed live again. `locks`
+  lists what is held: period, when it was locked, entry count, totals and
+  settings.
+- With a window that covers part of a lock, only the days in both are replaced.
+
+### Storage and safety
+
+The ledger is written atomically (a temporary file in the same directory, then
+a rename). **A ledger that cannot be read is a hard error** naming the file,
+for every command that would use it, and the file is left untouched:
+ignoring it would silently change hours that may already have been submitted.
+The same goes for a file written by a newer version. There is no locking
+between processes. Like the saved views, the path ignores `--config`
+(`WORKSTATS_CONFIG` still moves it, being where "beside the config" points), so
+every command sees the same ledger; set `WORKSTATS_TIMESHEET` to keep a
+separate ledger, for instance per client.
+
+Back it up like any other record of submitted hours. What it contains is
+described in [privacy](privacy.md).
+
 ## What is not here yet
 
 Descriptions (`--describe`, `--summarize-with`, `--digest`) are refused until
-they land, and the ledger actions (`add`, `set`, `unset`, `rm`, `entries`,
-`lock`, `unlock`, `locks`), `--ignore-locks` and the manual-entry columns
-arrive with the ledger. See [privacy](privacy.md) for what the engagement
-configuration and the outputs contain.
+they land. See [privacy](privacy.md) for what the engagement configuration, the
+ledger and the outputs contain.

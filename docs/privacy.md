@@ -195,7 +195,37 @@ _Coming in this release._
 
 ### Files beside the config: the timesheet ledger and the machine id
 
-_Coming in this release._
+**`timesheet.json`** is a file you write through `workstats timesheet add`,
+`set`, `lock` and their siblings; workstats never fills it from history. It
+sits beside the config file (or at `WORKSTATS_TIMESHEET`) and holds:
+
+- **manual entries and overrides**: date, engagement key, hours, your note, an
+  optional start time and billing flag, and when each was made;
+- **locks**: for each locked period, a snapshot of every entry as it was
+  submitted (engagement, hours, billing, rate, currency, amount, notes) and the
+  settings that produced them. A snapshot also keeps an entry's description *if
+  one was requested at lock time*, because that is what was submitted;
+- **forced writes**: a date, engagement and action for each write made into a
+  locked day with `--force`.
+
+What this means:
+
+- It holds client keys, hours, rates, amounts and your own free-text notes. Treat
+  it like the timesheet itself: back it up deliberately, and do not commit it
+  or share it without reading it first. Notes are yours; workstats does not
+  inspect them beyond refusing control characters.
+- It is **not a cache.** `--no-cache` and `--rebuild-cache` never touch it, and
+  deleting the cache cannot lose it. It is never sent anywhere.
+- Nothing from history is written into it except what a lock freezes, which is
+  the figures you could already see in the output (entries, hours, amounts);
+  no prompt, response, file, commit message or path is read to build it.
+- It is written atomically (a temporary file in the same directory, then a
+  rename). An unreadable or invalid ledger is a hard error and is never
+  overwritten, because ignoring it would silently change hours that may
+  already have been submitted. There is no locking between processes: two
+  commands writing at the same instant, the last one wins.
+
+_`machine.json`: coming in this release._
 
 ### Bundles
 
