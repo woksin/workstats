@@ -413,7 +413,7 @@ impl SavedViews {
             .with_context(|| format!("cannot write to {}", parent.display()))?;
         file.write_all(&encoded)?;
         file.flush()?;
-        file.persist(path)
+        crate::durable::persist(file, path)
             .with_context(|| format!("cannot replace {}", path.display()))?;
         Ok(())
     }

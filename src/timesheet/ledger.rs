@@ -252,7 +252,7 @@ impl Ledger {
         file.write_all(&encoded)?;
         file.write_all(b"\n")?;
         file.flush()?;
-        file.persist(path)
+        crate::durable::persist(file, path)
             .with_context(|| format!("cannot replace {}", path.display()))?;
         Ok(())
     }

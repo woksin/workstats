@@ -627,6 +627,9 @@ pub(crate) fn compute_live(
         report.month = Some("current".to_string());
     }
     let describe_context = describe::Context::from_report(&report);
+    // A timesheet shows no goals; their warnings would otherwise be counted
+    // below as trouble reading history.
+    report.no_goals = true;
     let collected = collect(report, Purpose::Query)?;
 
     let current = lock::LockSettings::current(

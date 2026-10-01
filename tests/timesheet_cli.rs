@@ -440,3 +440,33 @@ fn a_hostile_engagement_label_cannot_break_the_csv() {
     let generic = text(&fixture.timesheet(&["--format", "csv"]));
     assert!(generic.contains("'=HYPERLINK"), "{generic}");
 }
+
+#[test]
+fn goal_warnings_are_not_reported_as_trouble_reading_history() {
+    let fixture = fixture(standard);
+    // A cap on weekly hours far below the fixture's, so a goal warning would
+    // be raised if goals were evaluated at all.
+    let mut config: Value = serde_json::from_slice(&fs::read(&fixture.config).unwrap()).unwrap();
+    config["goals"] = json!({"max_weekly_hours": 0.001});
+    fs::write(&fixture.config, config.to_string()).unwrap();
+
+    // The ordinary report does warn: the setup is real.
+    let report = fixture.run(&[], &["--month", "2026-03", "--format", "json"]);
+    let report = json_stdout(&report);
+    assert!(
+        report["diagnostics"]["messages"]
+            .to_string()
+            .contains("max_weekly_hours"),
+        "{}",
+        report["diagnostics"]
+    );
+
+    let output = fixture.timesheet(&[]);
+    let printed = format!(
+        "{}{}",
+        text(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!printed.contains("while reading history"), "{printed}");
+    assert!(!printed.contains("max_weekly_hours"), "{printed}");
+}

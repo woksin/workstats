@@ -13,6 +13,7 @@ mod commands;
 mod compare;
 mod describe;
 mod document;
+mod durable;
 mod engagement;
 mod git;
 mod goals;
