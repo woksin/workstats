@@ -111,7 +111,8 @@ pub(crate) enum Adjustment {
     Capped,
     /// Raised to the minimum entry.
     RaisedToMinimum,
-    /// Received a leftover increment while balancing the day.
+    /// Balancing the day gave it a different number of increments than
+    /// rounding it alone would have (one more or one fewer).
     Balanced,
 }
 

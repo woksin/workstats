@@ -108,20 +108,19 @@ pub struct Config {
     #[serde(default)]
     pub branches: Option<serde_json::Value>,
     /// Rounding and export settings for `workstats timesheet`.
-    // The next four are read by the commands they configure, in later changes.
-    #[allow(dead_code)]
     #[serde(default)]
     pub timesheet: Option<serde_json::Value>,
     /// Weekly-hours and list-value-cap goals; read by `goals`.
-    #[allow(dead_code)]
     #[serde(default)]
     pub goals: Option<serde_json::Value>,
     /// Night and weekend definitions for `workstats insights`.
-    #[allow(dead_code)]
     #[serde(default)]
     pub insights: Option<serde_json::Value>,
     /// Template and freshness settings for `workstats now`.
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "`now` reads the file itself so its fast path skips the full config load; the field keeps the key a known one"
+    )]
     #[serde(default)]
     pub now: Option<serde_json::Value>,
 }

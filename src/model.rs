@@ -153,8 +153,6 @@ pub struct Session {
 impl Session {
     /// The branch the session was on at `at`: the last mark that starts at or
     /// before it. Marks must be sorted by `from`, with `None` first.
-    // Used by the attribution passes that read branch marks.
-    #[allow(dead_code)]
     pub fn branch_at(&self, at: DateTime<Utc>) -> Option<&str> {
         branch_at(&self.branches, at)
     }

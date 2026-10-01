@@ -1804,7 +1804,7 @@ fn named_month(value: &str) -> Option<String> {
 /// Spreadsheets read a leading `= + - @` as a formula. A negative number is not
 /// a formula though, and this output is made for pipes, so a cell that parses
 /// as a number is left exactly as it is.
-fn neutralize_formula(value: String) -> String {
+pub(crate) fn neutralize_formula(value: String) -> String {
     if value.starts_with(['=', '+', '-', '@']) && value.parse::<f64>().is_err() {
         format!("'{value}")
     } else {

@@ -203,8 +203,6 @@ impl From<Presentation> for Purpose {
 
 /// The settings a collected run was made with, kept so a command built on it
 /// can apply the same ones to anything it computes further.
-// `gap_cap` and `review_credit` are read by the timesheet and branch reports.
-#[allow(dead_code)]
 pub(crate) struct RunSettings {
     pub(crate) gap_cap: Duration,
     pub(crate) human_idle: Duration,

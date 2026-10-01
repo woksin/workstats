@@ -13,7 +13,7 @@ use chrono::{Duration, Local, NaiveDateTime, NaiveTime};
 
 use super::model::{Adjustment, EntryStatus, ExportPreset, TimesheetEntry};
 use crate::engagement::Engagements;
-use crate::output::safe_text;
+use crate::output::{neutralize_formula, safe_text};
 
 /// Who the hours are for, from `timesheet.person` in the config.
 #[derive(Clone, Debug, Default)]
@@ -226,16 +226,6 @@ fn start(entry: &TimesheetEntry) -> NaiveDateTime {
 /// activity: the hours are rounded and the day's time is not contiguous.
 fn end(entry: &TimesheetEntry) -> NaiveDateTime {
     start(entry) + Duration::seconds(entry.final_seconds as i64)
-}
-
-/// The same rule as the report's CSV: a leading `= + - @` is read as a
-/// formula by a spreadsheet, unless the whole cell is a number.
-fn neutralize_formula(value: String) -> String {
-    if value.starts_with(['=', '+', '-', '@']) && value.parse::<f64>().is_err() {
-        format!("'{value}")
-    } else {
-        value
-    }
 }
 
 fn cell(value: &str) -> String {
