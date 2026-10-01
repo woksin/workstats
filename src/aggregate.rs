@@ -954,7 +954,7 @@ fn shape_entries(tally: &ShapeTally) -> Vec<ShapeEntry> {
 /// would otherwise inflate the "no commit" side. What remains genuinely covers
 /// reading, review, and uncommitted work, which local structure cannot tell
 /// apart without reading transcript text.
-fn foreground_session_output(
+pub(crate) fn foreground_session_output(
     sessions: &[Session],
     commits: &[&GitCommit],
     eligible: &HashSet<SessionKey>,

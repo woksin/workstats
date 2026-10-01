@@ -801,7 +801,7 @@ fn footer_notes(report: &Report, diagnostics: &Diagnostics) -> Vec<String> {
 /// often quotes a path, and the directory the user's name and client projects
 /// sit under is not the reader's to learn. The terminal shows its own user's
 /// paths untouched.
-fn warning_lines(diagnostics: &Diagnostics, home: Option<&Path>) -> Vec<String> {
+pub(crate) fn warning_lines(diagnostics: &Diagnostics, home: Option<&Path>) -> Vec<String> {
     let mut lines: Vec<String> = diagnostics
         .messages
         .iter()
@@ -1377,7 +1377,7 @@ fn print_comparison(comparison: &Comparison) {
 }
 
 /// The same block for Markdown and HTML, from the same rows.
-fn push_comparison(blocks: &mut Vec<Block>, comparison: &Comparison) {
+pub(crate) fn push_comparison(blocks: &mut Vec<Block>, comparison: &Comparison) {
     let (current, previous) = comparison_windows(comparison);
     blocks.push(Block::Section("Comparison".to_string()));
     blocks.push(Block::Paragraph(format!(
@@ -1799,7 +1799,7 @@ fn local_date(value: &str) -> String {
         .unwrap_or_else(|_| value.to_string())
 }
 
-fn hours(seconds: f64) -> String {
+pub(crate) fn hours(seconds: f64) -> String {
     let rounded = seconds.round().max(0.0) as u64;
     format!("{}h {:02}m", rounded / 3600, rounded % 3600 / 60)
 }
@@ -1815,7 +1815,7 @@ fn ledger_duration(seconds: f64) -> String {
 }
 
 /// A present-but-tiny share reads as `<1%` rather than rounding away to `0%`.
-fn percent(share: f64) -> String {
+pub(crate) fn percent(share: f64) -> String {
     if share > 0.0 && share < 0.005 {
         "<1%".to_string()
     } else {
@@ -1836,7 +1836,7 @@ fn test_to_source_ratio(composition: &[CompositionEntry]) -> Option<f64> {
     (source != 0).then(|| touched("test") as f64 / source as f64)
 }
 
-fn compact_tokens(value: u64) -> String {
+pub(crate) fn compact_tokens(value: u64) -> String {
     let value = value as f64;
     if value < 1000.0 {
         format!("{value:.0}")

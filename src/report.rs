@@ -187,8 +187,6 @@ pub(crate) enum Purpose {
     Print,
     Explore,
     Allocate,
-    // Used by the commands built on `collect` in later changes.
-    #[allow(dead_code)]
     Query,
 }
 
@@ -203,7 +201,7 @@ impl From<Presentation> for Purpose {
 
 /// The settings a collected run was made with, kept so a command built on it
 /// can apply the same ones to anything it computes further.
-// Read by the commands built on `collect` in later changes.
+// `gap_cap` and `review_credit` are read by the timesheet and branch reports.
 #[allow(dead_code)]
 pub(crate) struct RunSettings {
     pub(crate) gap_cap: Duration,
@@ -219,8 +217,6 @@ pub(crate) struct RunSettings {
 /// than the report's rows (a timesheet, a branch report, insights) are
 /// computed over the timeline and the sessions and commits here, so they sum
 /// the same pieces the report did and cannot count anything twice.
-// Read by the commands built on `collect` in later changes.
-#[allow(dead_code)]
 pub(crate) struct Collected {
     pub(crate) report: Report,
     pub(crate) timeline: Timeline,
@@ -234,8 +230,6 @@ pub(crate) struct Collected {
 
 /// Runs the whole pipeline for `arguments` and returns what it produced
 /// without presenting any of it.
-// The entry point for the commands built on collected data.
-#[allow(dead_code)]
 pub(crate) fn collect(arguments: ReportArguments, purpose: Purpose) -> Result<Collected> {
     let mut prepared = prepare(arguments, purpose)?;
     let collected = execute(&mut prepared)?;
