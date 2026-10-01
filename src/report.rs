@@ -1018,14 +1018,17 @@ fn scan_window(
     }
     resolver.validate_project_aliases()?;
     // Branches the providers did not record, filled from Git while every
-    // checkout is still known by its own path.
-    branches::enrich(
-        &mut sessions,
-        &mut commits,
-        &mut agent_commits,
-        scan.config.branches.as_ref(),
-        diagnostics,
-    );
+    // checkout is still known by its own path. `--no-git` means no `git`
+    // process at all, so branches stay as the providers recorded them.
+    if !arguments.no_git {
+        branches::enrich(
+            &mut sessions,
+            &mut commits,
+            &mut agent_commits,
+            scan.config.branches.as_ref(),
+            diagnostics,
+        );
+    }
     // Imported bundles join before labels are made unique, so a repository
     // that arrives from another machine is labelled with the rest.
     bundle::merge_imports(
