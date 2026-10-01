@@ -165,8 +165,10 @@ report does not show them.
 Deleting the cache (`--rebuild-cache`) removes the stored names; the history
 files they came from are never altered.
 
-**From Git.** To say which branch a commit or a session belongs to,
-`workstats` reads local ref names and nothing else, with no network call and
+**From Git.** Only when a run shows a branch (a branch, issue or feature
+grouping, branch-matched engagements, or a command built on branches; a plain
+report asks Git nothing for this), to say which branch a commit or a session
+belongs to, `workstats` reads local ref names and nothing else, with no network call and
 no fetch:
 
 - the names of the local branches, which branch is checked out, and the *name*
@@ -339,7 +341,8 @@ and for how long; share it the way you would share the report it belongs to.
 `workstats export` writes a `workstats-bundle` so another machine can merge your
 history (see [Merging machines](merge.md)). It holds the same structural fields
 the transcript cache holds — activity timestamps, model names, token counts,
-session ids, branch names and pull-request numbers — plus:
+opaque session ids (a hash of the provider and the id, never the raw id, which
+can hold a path), branch names and pull-request numbers — plus:
 
 - repository identity keys: the normalised fetch remote (`remote:github.com/acme/api`),
   a project alias key, or, for a repository with no shareable remote, an opaque

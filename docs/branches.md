@@ -28,7 +28,9 @@ printed in reports; review a report before sharing it
    time is split at the moment of the switch.
 2. Otherwise the checkout's HEAD reflog (`reflog`): the branch it was on at the
    moment, read from the `checkout: moving from X to Y` entries. Before the
-   first entry on record, it was on the branch that entry left.
+   first entry on record, it was on the branch that entry left, for up to 90
+   days before it (Git's default reflog expiry); work older than that reads as
+   unknown.
 3. Otherwise, for a session after the checkout's last switch (or one whose
    checkout never switched), the branch that is checked out now (`head`).
 4. Otherwise nothing: the session shows `—`.
@@ -54,7 +56,10 @@ worktree's branch.
    branch is recovered.
 4. If several were, or none was, the commit is on the integration branch
    (`integration`). Parallel worktrees on different branches make a commit
-   ambiguous, and `integration` is the honest answer.
+   ambiguous, and `integration` is the honest answer. So is a commit made
+   while the checkout it was found in was itself on the integration branch: a
+   hotfix made on `main` while a worktree had a feature branch out stays on
+   `main`. The other checkouts vote only when that checkout cannot say.
 5. A commit only a detached HEAD holds has no branch.
 
 ## Configuration
@@ -112,14 +117,26 @@ Only the branch name is read for issue keys. Commit subjects are not.
   squash commit, which is attributed like any commit on the integration
   branch, and the reflog, which can recover the branch if it has not expired.
 - **Reflogs expire** (about 90 days by default), so old work on a deleted
-  branch reads as the integration branch.
+  branch reads as the integration branch, and a session older than the
+  oldest switch the reflog kept (by more than 90 days) has no branch from it.
+- **Which checkout made a commit is not recorded.** The checkout the commit
+  was found in stands for it. A commit made in a feature worktree but found
+  through the main checkout, which was on `main` at the time, reads as `main`.
+- **A provider that records `HEAD`** (or a bare commit id) for a detached
+  checkout is read as having recorded no branch, so the checkout's reflog can
+  still fill it in.
 - **Tags checked out by name** look like branches in the reflog. Bare commit
   ids and `HEAD~n` are recognised as a detached HEAD.
 - **The integration branch is one branch.** A repository with separate long-lived
   `develop` and `main` branches names only one of them as the integration branch.
 - **Process cost.** Per checkout, at most three `git` processes: refs, the
   `--source` pass and the reflog. Nothing is run for a session that recorded
-  its branch or whose working directory is no longer a checkout.
+  its branch or whose working directory is no longer a checkout. Nothing is
+  run at all unless something shows a branch: `--group-by branch`, `issue` or
+  `feature`, engagements with `branches` or `issue_prefixes`, and the
+  `timesheet`, `branch`, `pr`, `insights`, `digest` and `export` commands (and
+  `now`, when its template or `--json` shows the active branch). A plain
+  `workstats` report starts no extra `git` process.
 
 ## The `branch` and `pr` commands
 

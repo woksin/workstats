@@ -26,8 +26,10 @@ Format `workstats-bundle`, version 1, one JSON file:
 - `person.authors`: the Git author patterns the export used;
 - the window it was exported for, and the exporter's `human_idle`, `review_credit` and `gap_cap` (informational);
 - the repositories, by key (below);
-- per session: provider, session id, repository, the subdirectory relative to the repository root, whether it is a subagent, branch marks, pull-request numbers, and the same timestamps, models and token counts the transcript cache holds;
+- per session: provider, an opaque session id (below), repository, the subdirectory relative to the repository root, whether it is a subagent, branch marks, pull-request numbers, and the same timestamps, models and token counts the transcript cache holds;
 - per commit: repository, SHA, author time, line counts, per-category line tallies, whether an agent authored or assisted it, and its branch.
+
+A session id is exported as a hash, never as the provider wrote it: the first 128 bits of the SHA-256 of the provider and the id, in hex. Providers build their ids from the history layout (Claude's include the project folder, which is the dash-encoded working directory; the events format and a Codex session that changed directory include the directory), so the raw id can hold a username or a client's name. The hash is the same on every machine, so a session in a synced history folder still matches; this machine's own sessions are hashed the same way when they are compared with a bundle's.
 
 It never contains prompts, responses, commit subjects, session titles or absolute paths. Changed file paths are left out unless you pass `--include-paths`. See [Privacy](privacy.md#bundles). Bundles are plain JSON and are **not encrypted**; treat one like the history it came from.
 
@@ -43,7 +45,8 @@ The importing machine's own `project_aliases` are applied to `remote:` keys exac
 
 ## What merging does
 
-- **Sessions** are matched by `(provider, session id)`, against this machine's sessions and across bundles. A session seen twice keeps one identity and gains the union of its activity points, human prompts, exact intervals and token events (an event on both sides counts once; a genuinely repeated event on one side counts as often as it occurred). This is what makes a synced history folder merge cleanly.
+- **Sessions** are matched by `(provider, session id)` (the hashed id, for this machine's own sessions too), against this machine's sessions and across bundles. A session seen twice keeps one identity and gains the union of its activity points, human prompts, exact intervals and token events (an event on both sides counts once; a genuinely repeated event on one side counts as often as it occurred). This is what makes a synced history folder merge cleanly.
+- **Branch marks** from a bundle are sorted by time, with the one mark that starts the session first; a second start or a mark that repeats the branch before it is dropped, and the run says how many.
 - **Commits** are matched by `(repository key, SHA)`. The local copy wins, so a commit this machine read from Git itself is never replaced by an exported one.
 - **`local:` repositories are never matched across machines**, because nothing says that two `scratch` folders are the same repository. Each is reported separately and the run warns, naming them. If you merge a bundle that this very machine exported (`--import` of your own bundle), sessions still match, but commits in `local:` repositories cannot, and are counted twice; the same warning applies. Give those repositories a remote, or leave them out of one side.
 - **Categories** a bundle uses that this configuration does not define are counted as `other`, with a note.

@@ -310,8 +310,10 @@ instead.
 
 ### Storage and safety
 
-The ledger is written atomically (a temporary file in the same directory, then
-a rename). **A ledger that cannot be read is a hard error** naming the file,
+The ledger is written atomically: a temporary file in the same directory is
+synced to disk, renamed over the ledger, and (on Unix) the directory is synced
+too, so a crash or power loss leaves the old ledger or the new one, not an empty
+file. Machine labels and saved views are written the same way. **A ledger that cannot be read is a hard error** naming the file,
 for every command that would use it, and the file is left untouched:
 ignoring it would silently change hours that may already have been submitted.
 The same goes for a file written by a newer version. There is no locking
@@ -322,6 +324,13 @@ separate ledger, for instance per client.
 
 Back it up like any other record of submitted hours. What it contains is
 described in [privacy](privacy.md).
+
+## Warnings
+
+A timesheet does not show [goals](configuration.md), so it does not evaluate
+them. The line `N warning(s) while reading history` counts only what reading
+the history raised (an unreadable transcript, a skipped file); run `workstats`
+for the details. Goal and cap warnings stay in the ordinary report.
 
 ## Descriptions
 
