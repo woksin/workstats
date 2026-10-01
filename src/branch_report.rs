@@ -29,11 +29,12 @@ use serde::Serialize;
 
 use crate::branches;
 use crate::cli::{OutputFormat, ReportArguments, report_window, scan_directory};
+use crate::describe;
 use crate::document::{
     Block, Column, Document, Table, escape_markdown, render_html, render_markdown,
 };
 use crate::git::git_executable;
-use crate::model::{Diagnostics, Interval, TokenUsage};
+use crate::model::{Diagnostics, GitCommit, Interval, Session, TokenUsage};
 use crate::output::{compact_tokens, hours, number, safe_text};
 use crate::paths::{PathResolver, home_dir, load_config};
 use crate::pricing::{self, RATES_AS_OF, RateSource};
@@ -89,6 +90,13 @@ pub(crate) struct PrArguments {
         help = "Branch it was cut from (default: the integration branch)"
     )]
     pub(crate) base: Option<String>,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_name = "SOURCES",
+        help = "Add descriptions from commits and/or sessions[=PROVIDERS]; read only when asked"
+    )]
+    pub(crate) describe: Vec<String>,
 }
 
 pub(crate) fn run_branch(arguments: BranchArguments) -> Result<()> {
@@ -117,7 +125,7 @@ pub(crate) fn run_pr(arguments: PrArguments) -> Result<()> {
         command: Kind::Pr,
         scope,
         base: arguments.base,
-        describe: Vec::new(),
+        describe: arguments.describe,
         report: arguments.report,
     })
 }
@@ -488,6 +496,8 @@ fn run(request: Request) -> Result<()> {
     if arguments.agent_commits.is_none() {
         arguments.agent_commits = Some(String::new());
     }
+    let plan = describe::Plan::parse(&describe, None, None, false)?;
+    let describe_context = describe::Context::from_report(&arguments);
     let collected = collect(arguments, Purpose::Query)?;
 
     let aliases = collected
@@ -583,7 +593,14 @@ fn run(request: Request) -> Result<()> {
                 since_source: target.since_source,
             },
             figures,
-            description: None,
+            description: describe_target(
+                &plan,
+                &describe_context,
+                &collected,
+                &repo_id,
+                target,
+                &mut warnings,
+            ),
         });
     }
     let combined = (entries.len() > 1 && !matches!(scope, Scope::All)).then(|| {
@@ -593,7 +610,6 @@ fn run(request: Request) -> Result<()> {
             figures: figures(&collected, &repo_id, &refs),
         }
     });
-    add_descriptions(&describe, &mut entries)?;
 
     if let Some(stale) = stale_rates(&collected, &entries, combined.as_ref()) {
         warnings.push(stale);
@@ -628,15 +644,77 @@ fn run(request: Request) -> Result<()> {
     print_output(&output, command, format, matches!(scope, Scope::All))
 }
 
-/// HOOK(P10): `--describe` lands here. The descriptions come from
-/// `describe.rs` (commit subjects, session titles) and are set on
-/// `Entry::description`, one per entry; until that reader exists the flag is
-/// refused rather than ignored.
-fn add_descriptions(sources: &[String], _entries: &mut [Entry]) -> Result<()> {
-    if !sources.is_empty() {
-        bail!("--describe is not yet implemented");
+/// The opt-in description of one branch: the subjects of its own commits and
+/// the titles of the sessions that were on it, read only for what `plan` asks
+/// for. Commits an agent authored are never asked about (`describe` checks).
+fn describe_target(
+    plan: &describe::Plan,
+    context: &describe::Context,
+    collected: &Collected,
+    repo_id: &str,
+    target: &Target,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    if !plan.is_active() {
+        return None;
     }
-    Ok(())
+    let (commits, sessions) = target_pieces(collected, repo_id, target);
+    describe::for_branch(plan, context, &commits, &sessions, warnings).text()
+}
+
+/// The user's own commits on the branch and the sessions with work on it
+/// inside its window, each oldest first so a description reads in the order
+/// things happened.
+fn target_pieces<'a>(
+    collected: &'a Collected,
+    repo_id: &str,
+    target: &Target,
+) -> (Vec<&'a GitCommit>, Vec<&'a Session>) {
+    let listed: HashSet<&str> = target
+        .history
+        .commits
+        .iter()
+        .map(|(sha, _)| sha.as_str())
+        .collect();
+    let mut commits: Vec<&GitCommit> = collected
+        .commits
+        .iter()
+        .filter(|commit| commit.repo_id == repo_id && listed.contains(commit.sha.as_str()))
+        .collect();
+    commits.sort_by_key(|commit| commit.timestamp);
+
+    let mut on_branch: HashSet<(&str, &str)> = collected
+        .timeline
+        .ai_intervals
+        .iter()
+        .filter(|piece| piece.repo_id == repo_id && piece.branch.as_deref() == Some(&target.name))
+        .filter(|piece| clip_interval(piece, target.since, target.until).is_some())
+        .map(|piece| (piece.provider.as_str(), piece.session_id.as_str()))
+        .collect();
+    for session in collected
+        .sessions
+        .iter()
+        .filter(|session| session.repo_id == repo_id)
+    {
+        let tokens_on_branch = session.token_events.iter().any(|event| {
+            session.branch_at(event.timestamp) == Some(&target.name)
+                && target.since.is_none_or(|since| event.timestamp >= since)
+                && target.until.is_none_or(|until| event.timestamp < until)
+        });
+        if tokens_on_branch {
+            on_branch.insert((session.provider.as_str(), session.session_id.as_str()));
+        }
+    }
+    let mut sessions: Vec<&Session> = collected
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.repo_id == repo_id
+                && on_branch.contains(&(session.provider.as_str(), session.session_id.as_str()))
+        })
+        .collect();
+    sessions.sort_by_key(|session| session.first_seen());
+    (commits, sessions)
 }
 
 /// The window and starting point for `name`: the user's `--since` if given,

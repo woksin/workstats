@@ -290,11 +290,39 @@ fn pr_number_is_resolved_through_the_sessions_that_linked_it() {
 }
 
 #[test]
-fn describe_is_refused_until_it_is_wired() {
+fn describe_adds_commit_subjects_and_session_titles_only_when_asked() {
     let fixture = fixture(FEATURE, None);
-    let output = fixture.command(&["branch", FEATURE], &["--describe", "commits"]);
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not yet implemented"));
+    // A tool-generated title on the feature session, and a prompt-bearing
+    // record that must never be read as a title.
+    let path = fixture.history.trim_start_matches("claude=").to_string() + "/project/feature.jsonl";
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n");
+    text.push_str(
+        &serde_json::json!({"type": "ai-title", "sessionId": "feat1", "aiTitle": "Add the ACME widget"})
+            .to_string(),
+    );
+    text.push_str("\n");
+    text.push_str(
+        &serde_json::json!({"type": "last-prompt", "sessionId": "feat1", "lastPrompt": "SECRET PROMPT TEXT"})
+            .to_string(),
+    );
+    fs::write(&path, text).unwrap();
+
+    let plain = fixture.json(&["branch", FEATURE], &[]);
+    assert!(entry(&plain, FEATURE).get("description").is_none());
+
+    let commits = fixture.json(&["branch", FEATURE], &["--describe", "commits"]);
+    let description = entry(&commits, FEATURE)["description"].as_str().unwrap();
+    assert_eq!(description, "a.txt; b.txt", "{commits}");
+
+    let both = fixture.json(&["pr", FEATURE], &["--describe", "commits,sessions"]);
+    let description = entry(&both, FEATURE)["description"].as_str().unwrap();
+    assert_eq!(description, "Add the ACME widget; a.txt; b.txt", "{both}");
+    assert!(!both.to_string().contains("SECRET PROMPT TEXT"));
+
+    let refused = fixture.command(&["branch", FEATURE], &["--describe", "prompts"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("unknown --describe source"));
 }
 
 #[test]

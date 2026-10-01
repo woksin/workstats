@@ -369,9 +369,6 @@ fn read_subjects(
 /// commits and the titles of its sessions. This is the call `branch` and `pr`
 /// make; they pass the human commits and the sessions that fall on the branch,
 /// in the order they want them listed. Reads nothing the plan did not ask for.
-// Called by `branch` / `pr` once they describe; the timesheet goes through
-// `for_timesheet`.
-#[allow(dead_code)]
 pub(crate) fn for_branch(
     plan: &Plan,
     context: &Context,

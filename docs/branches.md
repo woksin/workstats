@@ -180,5 +180,8 @@ that number to it.
 the same escaping as the other Markdown reports, so `fix/#123` does not turn
 into a link to issue 123 and `@name` does not mention anyone.
 
-`--describe` (commit subjects and session titles per branch) is not available
-yet; passing it is an error.
+`--describe commits,sessions[=PROVIDERS]` adds a description per branch: the
+subjects of your own commits on it and the tool-generated titles of the sessions
+that were on it. It is opt-in, read only when asked, never cached, and agent
+commits are never asked about; see [opt-in descriptions](privacy.md#opt-in-descriptions).
+`branch` and `pr` do not take `--summarize-with`; that is a timesheet option.
