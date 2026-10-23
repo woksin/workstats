@@ -8,6 +8,7 @@
 [![Release](https://img.shields.io/github/v/release/woksin/workstats?color=86efac)](https://github.com/woksin/workstats/releases/latest)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-67e8f9)](docs/install.md#platforms)
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-b7410e?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Homebrew](https://img.shields.io/badge/homebrew-woksin%2Fworkstats-fbb040?logo=homebrew&logoColor=white)](https://github.com/woksin/homebrew-workstats)
 [![License](https://img.shields.io/badge/license-MIT-86efac)](LICENSE)
 
 **See where the work happened—without sending your work anywhere.**
@@ -282,6 +283,11 @@ repositories) and every flag in detail.
 
 See the [changelog](CHANGELOG.md) for what changed in each release and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
+## Related projects
+
+- [homebrew-workstats](https://github.com/woksin/homebrew-workstats) — the Homebrew tap that installs workstats.
+- [gearprice](https://github.com/woksin/gearprice) and [reap](https://github.com/woksin/reap) — other Rust CLIs by the same author.
 
 ## License
 
